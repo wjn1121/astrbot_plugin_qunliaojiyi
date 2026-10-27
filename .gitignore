@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+runtime.json
+# 备份里含群号、昵称与聊天原文，属于用户数据，默认不入库
+backup/
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.log

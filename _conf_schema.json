@@ -1,0 +1,158 @@
+{
+  "enabled": {
+    "description": "启用群聊记忆",
+    "type": "bool",
+    "default": true,
+    "hint": "总开关。关闭后不再收集聊天记录、不再学习、不再注入。"
+  },
+  "inject_enabled": {
+    "description": "启用风格注入",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后把学到的风格作为临时内容注入 LLM 请求；关闭则只学习不注入。"
+  },
+  "analysis_interval_seconds": {
+    "description": "学习分析间隔（秒）",
+    "type": "int",
+    "default": 21600,
+    "hint": "每隔多少秒对攒下的聊天记录做一次批量提炼。默认 21600（6 小时），这也是旧版几乎零消耗的关键：一天最多 4 次。"
+  },
+  "min_history_for_analysis": {
+    "description": "触发学习的最少消息数",
+    "type": "int",
+    "default": 10,
+    "hint": "某个会话攒够这么多条新消息才会送去提炼，消息少的群不会浪费请求。"
+  },
+  "max_messages_per_learn": {
+    "description": "单次提炼最多带入的消息数",
+    "type": "int",
+    "default": 80,
+    "hint": "从最近的聊天记录里最多取多少条交给 LLM，避免长历史把单次请求撑大。"
+  },
+  "max_stable_inject": {
+    "description": "最多注入稳定风格条数",
+    "type": "int",
+    "default": 5,
+    "hint": "按熟练度排序取前 N 条注入。设为 0 表示不注入稳定风格。"
+  },
+  "enable_situational_inject": {
+    "description": "启用场景化表达注入",
+    "type": "bool",
+    "default": true,
+    "hint": "数字梗、刷屏用语等只在当前消息语境匹配时才注入，避免每条回复都强行玩梗。"
+  },
+  "max_situational_inject": {
+    "description": "最多注入场景化表达条数",
+    "type": "int",
+    "default": 2,
+    "hint": "每轮最多带入多少条语境匹配的场景化表达。"
+  },
+  "max_stable_traits": {
+    "description": "每个会话稳定风格存储上限",
+    "type": "int",
+    "default": 40,
+    "hint": "超出后按熟练度淘汰最弱的，防止长期运行后特征越攒越多、把学习 prompt 撑大。"
+  },
+  "max_situational_traits": {
+    "description": "每个会话场景化表达存储上限",
+    "type": "int",
+    "default": 20,
+    "hint": "同上，针对场景化表达；设为 0 表示不保留这类特征。"
+  },
+  "situational_similarity_threshold": {
+    "description": "场景化表达相似度阈值",
+    "type": "float",
+    "slider": {
+      "min": 0,
+      "max": 1,
+      "step": 0.05
+    },
+    "default": 0.4,
+    "hint": "使用嵌入向量判断当前消息与场景的关联度，高于该阈值才注入（0-1，建议 0.3-0.5）。没有 Embedding Provider 时自动退化为关键词匹配。"
+  },
+  "enable_cross_group": {
+    "description": "启用跨群风格参考",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后可以把其他群的稳定风格作为「全局风格」参考注入；只参考稳定风格，不引用别群的梗。"
+  },
+  "max_global_styles": {
+    "description": "最多注入全局风格条数",
+    "type": "int",
+    "default": 3,
+    "hint": "跨群开启时，最多注入多少条其他群的稳定风格。"
+  },
+  "enable_emb_selection": {
+    "description": "启用嵌入向量辅助匹配",
+    "type": "bool",
+    "default": true,
+    "hint": "场景化表达优先用向量相似度匹配；Provider 不支持时自动回退到关键词包含判断。"
+  },
+  "enable_trigger_matching": {
+    "description": "启用触发词匹配",
+    "type": "bool",
+    "default": true,
+    "hint": "学习时会给每条场景化表达提炼触发词，注入时先做纯本地字符串匹配——命中就不发任何向量请求，这是零成本匹配的关键。"
+  },
+  "embedding_timeout_seconds": {
+    "description": "嵌入请求超时（秒）",
+    "type": "float",
+    "slider": {
+      "min": 0.5,
+      "max": 30,
+      "step": 0.5
+    },
+    "default": 2,
+    "hint": "向量请求跑在回复链路上，超时后直接降级关键词匹配，避免 embedding 服务变慢时拖住回复。"
+  },
+  "embedding_provider_id": {
+    "description": "嵌入向量 Provider ID",
+    "type": "string",
+    "_special": "select_provider:embedding",
+    "default": "",
+    "hint": "留空则自动使用第一个可用的 Embedding Provider。"
+  },
+  "analysis_provider_id": {
+    "description": "学习分析使用的 Provider ID",
+    "type": "string",
+    "_special": "select_provider",
+    "default": "",
+    "hint": "留空则使用当前会话默认 Provider。建议选便宜的非推理模型，学习任务不需要强模型。"
+  },
+  "history_limit_per_session": {
+    "description": "每会话聊天缓冲上限",
+    "type": "int",
+    "default": 200,
+    "hint": "内存里最多保留多少条未学习消息，超出丢弃最旧的，防止内存膨胀。"
+  },
+  "session_whitelist": {
+    "description": "只在这些会话学习",
+    "type": "list",
+    "default": [],
+    "hint": "填 unified_msg_origin（如 bot1:GroupMessage:123456），留空表示全部会话。"
+  },
+  "session_blacklist": {
+    "description": "这些会话不学习",
+    "type": "list",
+    "default": [],
+    "hint": "填 unified_msg_origin，命中则不收集、不注入。"
+  },
+  "blocked_users": {
+    "description": "不学习的用户",
+    "type": "list",
+    "default": [],
+    "hint": "填发送者 ID，命中则该用户的消息不进入学习素材。"
+  },
+  "debug_mode": {
+    "description": "调试模式",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后在日志里输出每次注入的完整内容与学习结果，排查完请关闭。"
+  },
+  "startup_learn_delay_seconds": {
+    "description": "启动后首次学习延迟（秒）",
+    "type": "int",
+    "default": 600,
+    "hint": "插件启动后等待多久再做第一轮分析，避免和 AstrBot 启动阶段抢资源。默认 600。"
+  }
+}

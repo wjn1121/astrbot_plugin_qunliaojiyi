@@ -1,0 +1,24 @@
+name: astrbot_plugin_qunliaojiyi
+display_name: 群聊记忆
+short_desc: 只做低成本的群聊长期记忆：低频批量学习群聊风格，回复时零网络注入
+desc: >-
+  把群聊记录攒起来，定时（默认 6 小时）交给一次 LLM 提炼成「稳定风格」和「场景化表达」，
+  回复时以临时内容注入，不改 system prompt、不写会话历史，LLM 前缀缓存仍能命中。
+  场景化表达优先用触发词本地匹配，命中即不发起任何向量请求；向量请求带硬超时，
+  超时自动降级，不会拖慢回复。自带设置与调试面板，可查看每群学到的特征、手动学习、
+  预览注入效果、热调参数，并展示累计成本。
+version: 1.0.0
+author: wjn1121
+repo: https://github.com/wjn1121/astrbot_plugin_qunliaojiyi
+astrbot_version: ">=4.29.1,<5"
+category: ai_tools
+tags:
+  - 群聊学习
+  - 风格
+  - 人格
+  - 记忆
+support_platforms:
+  - aiocqhttp
+views:
+  - name: panel
+    title: 群聊记忆
