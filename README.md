@@ -4,7 +4,7 @@
 
 [![AstrBot](https://img.shields.io/badge/AstrBot-%3E%3D4.29.1-blue)](https://github.com/AstrBotDevs/AstrBot)
 [![Platform](https://img.shields.io/badge/platform-QQ_(aiocqhttp)-green)](#)
-[![Version](https://img.shields.io/badge/version-1.1.0-orange)](metadata.yaml)
+[![Version](https://img.shields.io/badge/version-1.1.1-orange)](metadata.yaml)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-9cf)](LICENSE)
 [![Author](https://img.shields.io/badge/author-wjn1121-lightgrey)](https://github.com/wjn1121)
 
@@ -160,6 +160,35 @@ git clone https://github.com/wjn1121/astrbot_plugin_qunliaojiyi.git
 
 > 💡 面板里还能热调 16 个常用参数，写入 `runtime.json`，不改动配置文件，可一键恢复。
 
+### 💰 哪些调整会改变 token 消耗
+
+配置页里每一项的提示都标了影响方向，这里汇总成一张表：
+
+**减少消耗**
+
+| 调整 | 效果 |
+|---|---|
+| 关闭 `enabled` | 归零：不收集、不学习、不注入 |
+| 关闭 `inject_enabled` | 每条回复少带几十字风格文本，学习能力保留 |
+| `analysis_interval_seconds` 调大 | 21600 → 43200，一天 4 次变 2 次 |
+| `min_history_for_analysis` 调大 | 触发学习的会话变少，但样本也更少 |
+| `max_messages_per_learn` 调小 | 80 → 40，单次学习 prompt 大致减半 |
+| `max_stable_traits` / `max_situational_traits` 调小 | 学习时带入的「已有特征」变短 |
+| 关闭 `enable_emb_selection` | 完全不再发 embedding 请求，纯靠触发词和关键词 |
+| 保持 `enable_trigger_matching` 开启 | 命中触发词就跳过向量请求，这是省钱关键 |
+| `analysis_provider_id` 换成便宜模型 | 学习任务不需要强模型，flash 比 pro 便宜一个量级 |
+
+**增加消耗**
+
+| 调整 | 效果 |
+|---|---|
+| `max_stable_inject` 调大 | 每条回复多带几条风格，每条 10–30 字 |
+| `max_situational_inject` 调大 | 命中时多带几条梗，每条 5–20 字 |
+| 开启 `enable_cross_group` | 每条回复都额外带上其他群的风格 |
+| `situational_similarity_threshold` 调低 | 更容易注入，token 略增且容易乱接梗 |
+
+**不影响 token**：`embedding_timeout_seconds`（只影响延迟）、`history_limit_per_session`（只影响内存）、`debug_mode`（只影响日志）、`startup_learn_delay_seconds`（只影响首轮时间）。
+
 ---
 
 ## 💡 为什么它几乎不花钱
@@ -223,6 +252,12 @@ astrbot_plugin_qunliaojiyi/
 ---
 
 ## 🆕 更新日志
+
+### v1.1.1
+
+- 📝 配置项说明全面细化：每项都标明对 token 的增减方向
+- 📊 README 新增「哪些调整会改变 token 消耗」速查表
+- 无功能变更，纯文档与提示文案
 
 ### v1.1.0
 

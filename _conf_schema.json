@@ -3,61 +3,61 @@
     "description": "启用群聊记忆",
     "type": "bool",
     "default": true,
-    "hint": "总开关。关闭后不再收集聊天记录、不再学习、不再注入。"
+    "hint": "总开关。关闭后不收集消息、不学习、不注入，插件完全静默。影响：token ↓↓（归零）。"
   },
   "inject_enabled": {
     "description": "启用风格注入",
     "type": "bool",
     "default": true,
-    "hint": "开启后把学到的风格作为临时内容注入 LLM 请求；关闭则只学习不注入。"
+    "hint": "开启后每条回复都会带上风格参考文本。关闭后仍会按间隔学习（学习本身有消耗），只是不再注入。影响：token ↓（每条回复少几十字）。只想省钱不想丢学习能力，优先考虑关这个。"
   },
   "analysis_interval_seconds": {
     "description": "学习分析间隔（秒）",
     "type": "int",
     "default": 21600,
-    "hint": "每隔多少秒对攒下的聊天记录做一次批量提炼。默认 21600（6 小时），这也是旧版几乎零消耗的关键：一天最多 4 次。"
+    "hint": "每隔多少秒对攒下的聊天做一次批量提炼。默认 21600（6 小时）≈ 一天最多 4 次，这是「几乎零消耗」的核心。影响：token ↑（调小，学得更勤）/ ↓（调大，如 43200 = 12 小时可再减半）。"
   },
   "min_history_for_analysis": {
     "description": "触发学习的最少消息数",
     "type": "int",
     "default": 10,
-    "hint": "某个会话攒够这么多条新消息才会送去提炼，消息少的群不会浪费请求。"
+    "hint": "某个会话攒够这么多条新消息才送去提炼，消息少的群直接跳过不发请求。影响：token ↓（调大，触发次数变少，但样本也更少）/ ↑（调小，如 5 会更频繁学习）。"
   },
   "max_messages_per_learn": {
     "description": "单次提炼最多带入的消息数",
     "type": "int",
     "default": 80,
-    "hint": "从最近的聊天记录里最多取多少条交给 LLM，避免长历史把单次请求撑大。"
+    "hint": "从最近记录里最多取多少条交给 LLM，避免长历史把单次请求撑大。影响：token ↑（调大，单次 prompt 更长）/ ↓（调小，如 40 可让单次成本减半，但可用素材变少）。"
   },
   "max_stable_inject": {
     "description": "最多注入稳定风格条数",
     "type": "int",
     "default": 5,
-    "hint": "按熟练度排序取前 N 条注入。设为 0 表示不注入稳定风格。"
+    "hint": "按熟练度取前 N 条写进每次回复的提示里，每条约 10-30 字。影响：token ↑（调大，每条回复都多带一些）/ ↓（调小或设 0，完全不注入稳定风格）。"
   },
   "enable_situational_inject": {
     "description": "启用场景化表达注入",
     "type": "bool",
     "default": true,
-    "hint": "数字梗、刷屏用语等只在当前消息语境匹配时才注入，避免每条回复都强行玩梗。"
+    "hint": "数字梗、刷屏用语等只在当前消息语境匹配时才注入，不会每条都出现。影响：token 影响很小（命中时才多几十字），关掉主要影响接梗效果而非省钱。"
   },
   "max_situational_inject": {
     "description": "最多注入场景化表达条数",
     "type": "int",
     "default": 2,
-    "hint": "每轮最多带入多少条语境匹配的场景化表达。"
+    "hint": "每轮最多带入几条语境匹配的场景化表达，每条约 5-20 字。影响：token ↑（调大）/ ↓（调小或设 0）。"
   },
   "max_stable_traits": {
     "description": "每个会话稳定风格存储上限",
     "type": "int",
     "default": 40,
-    "hint": "超出后按熟练度淘汰最弱的，防止长期运行后特征越攒越多、把学习 prompt 撑大。"
+    "hint": "超出后按熟练度淘汰最弱的。它不只影响存储：每次学习时会把「已有特征」一并放进 prompt，所以特征越多、学习请求越大。影响：token ↑（调大，学习 prompt 变长）/ ↓（调小，如 20）。"
   },
   "max_situational_traits": {
     "description": "每个会话场景化表达存储上限",
     "type": "int",
     "default": 20,
-    "hint": "同上，针对场景化表达；设为 0 表示不保留这类特征。"
+    "hint": "同上，针对场景化表达。设为 0 表示不再保留这类特征（学习 prompt 更短，但接梗能力下降）。影响：token ↑（调大）/ ↓（调小）。"
   },
   "situational_similarity_threshold": {
     "description": "场景化表达相似度阈值",
@@ -68,31 +68,19 @@
       "step": 0.05
     },
     "default": 0.4,
-    "hint": "使用嵌入向量判断当前消息与场景的关联度，高于该阈值才注入（0-1，建议 0.3-0.5）。没有 Embedding Provider 时自动退化为关键词匹配。"
-  },
-  "enable_cross_group": {
-    "description": "启用跨群风格参考",
-    "type": "bool",
-    "default": false,
-    "hint": "开启后可以把其他群的稳定风格作为「全局风格」参考注入；只参考稳定风格，不引用别群的梗。"
-  },
-  "max_global_styles": {
-    "description": "最多注入全局风格条数",
-    "type": "int",
-    "default": 3,
-    "hint": "跨群开启时，最多注入多少条其他群的稳定风格。"
-  },
-  "enable_emb_selection": {
-    "description": "启用嵌入向量辅助匹配",
-    "type": "bool",
-    "default": true,
-    "hint": "场景化表达优先用向量相似度匹配；Provider 不支持时自动回退到关键词包含判断。"
+    "hint": "用向量判断当前消息和场景的相关度，高于阈值才注入。阈值越低越容易注入（注入的 token 略增，也更容易乱接梗）；越高越保守。影响：token 轻微 ↑（调低）/ ↓（调高）。"
   },
   "enable_trigger_matching": {
     "description": "启用触发词匹配",
     "type": "bool",
     "default": true,
-    "hint": "学习时会给每条场景化表达提炼触发词，注入时先做纯本地字符串匹配——命中就不发任何向量请求，这是零成本匹配的关键。"
+    "hint": "学习时给每条梗提炼 1-3 个触发词，注入时先做纯本地字符串匹配，命中就不再请求向量。这是省钱的关键开关：守住它，大部分回复不会产生任何 embedding 请求。影响：token ↓（保持开启）/ ↑（关闭后每次都走向量）。"
+  },
+  "enable_emb_selection": {
+    "description": "启用嵌入向量辅助匹配",
+    "type": "bool",
+    "default": true,
+    "hint": "场景化表达用向量相似度匹配，比关键词更准但会发 embedding 请求。影响：token ↓（关闭后不再有任何向量请求，完全靠触发词和关键词）/ ↑（开启且 provider 按量计费时）。"
   },
   "embedding_timeout_seconds": {
     "description": "嵌入请求超时（秒）",
@@ -103,56 +91,68 @@
       "step": 0.5
     },
     "default": 2,
-    "hint": "向量请求跑在回复链路上，超时后直接降级关键词匹配，避免 embedding 服务变慢时拖住回复。"
+    "hint": "向量请求跑在回复链路上，超时直接降级关键词匹配。影响：token 不变，只影响回复延迟——调小更稳（不会拖住回复），但更容易降级为关键词匹配。"
   },
   "embedding_provider_id": {
     "description": "嵌入向量 Provider ID",
     "type": "string",
     "_special": "select_provider:embedding",
     "default": "",
-    "hint": "留空则自动使用第一个可用的 Embedding Provider。"
+    "hint": "留空自动使用第一个可用的 Embedding Provider。影响：token 取决于该 Provider 的计费方式（多数嵌入服务按 token 计费，但单价远低于对话模型）。"
+  },
+  "enable_cross_group": {
+    "description": "启用跨群风格参考",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后把其他群的稳定风格也注入进来，相当于多带几条特征。影响：token ↑（每条回复都多带别群风格），收益有限，默认关闭。"
+  },
+  "max_global_styles": {
+    "description": "最多注入全局风格条数",
+    "type": "int",
+    "default": 3,
+    "hint": "跨群开启时最多注入几条其他群风格。影响：token ↑（调大）/ ↓（调小），仅在跨群开启时生效。"
   },
   "analysis_provider_id": {
     "description": "学习分析使用的 Provider ID",
     "type": "string",
     "_special": "select_provider",
     "default": "",
-    "hint": "留空则使用当前会话默认 Provider。建议选便宜的非推理模型，学习任务不需要强模型。"
+    "hint": "留空使用当前会话默认 Provider。影响：token 单价取决于这里选的模型——学习任务不需要强模型，换成更便宜的 flash 而非 pro 可直接降低单次学习成本。"
   },
   "history_limit_per_session": {
     "description": "每会话聊天缓冲上限",
     "type": "int",
     "default": 200,
-    "hint": "内存里最多保留多少条未学习消息，超出丢弃最旧的，防止内存膨胀。"
+    "hint": "内存里最多保留多少条未学习消息，超出丢最旧的。影响：token 基本不变（只影响内存和单次最多可取的消息数，实际取多少由「单次提炼最多带入的消息数」决定）。"
   },
   "session_whitelist": {
     "description": "只在这些会话学习",
     "type": "list",
     "default": [],
-    "hint": "填 unified_msg_origin（如 bot1:GroupMessage:123456），留空表示全部会话。"
+    "hint": "填 unified_msg_origin（如 bot1:GroupMessage:123456），留空表示全部会话。影响：token ↓（限制范围后，未列入的会话完全不产生学习和注入消耗）。"
   },
   "session_blacklist": {
     "description": "这些会话不学习",
     "type": "list",
     "default": [],
-    "hint": "填 unified_msg_origin，命中则不收集、不注入。"
+    "hint": "填 unified_msg_origin，命中则不收集、不注入。影响：token ↓（每个被排除的活跃群都能省下学习请求）。面板里也能逐群关闭，不用改这里。"
   },
   "blocked_users": {
     "description": "不学习的用户",
     "type": "list",
     "default": [],
-    "hint": "填发送者 ID，命中则该用户的消息不进入学习素材。"
+    "hint": "填发送者 ID，命中则该用户的消息不进入学习素材。影响：token ↓（减少素材量，可能让某些会话达不到学习门槛从而跳过）。"
   },
   "debug_mode": {
     "description": "调试模式",
     "type": "bool",
     "default": false,
-    "hint": "开启后在日志里输出每次注入的完整内容与学习结果，排查完请关闭。"
+    "hint": "开启后在日志里输出每次注入的完整内容和学习结果。影响：token 不变，只增加日志量，排查完请关闭。"
   },
   "startup_learn_delay_seconds": {
     "description": "启动后首次学习延迟（秒）",
     "type": "int",
     "default": 600,
-    "hint": "插件启动后等待多久再做第一轮分析，避免和 AstrBot 启动阶段抢资源。默认 600。"
+    "hint": "插件启动后等多久做第一轮分析，避免和 AstrBot 启动阶段抢资源。影响：token 不变，只影响第一轮学习的时间点。"
   }
 }
