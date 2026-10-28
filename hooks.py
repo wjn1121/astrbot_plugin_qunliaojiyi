@@ -15,7 +15,7 @@ from .utils import clean_system_prompt
 
 
 def session_allowed(plugin, session_id: str, sender_id: str = "") -> bool:
-    """会话/用户级过滤：白名单优先，其次是黑名单。"""
+    """会话/用户级过滤：全局白名单 → 全局黑名单 → 用户黑名单。"""
     settings = plugin.settings
     whitelist = settings.get("session_whitelist") or []
     blacklist = settings.get("session_blacklist") or []
@@ -29,6 +29,20 @@ def session_allowed(plugin, session_id: str, sender_id: str = "") -> bool:
     return True
 
 
+def learn_allowed(plugin, session_id: str, sender_id: str = "") -> bool:
+    """是否收集这个会话的消息用于学习（全局过滤 + 会话级开关）。"""
+    return session_allowed(plugin, session_id, sender_id) and plugin.storage.learn_allowed(
+        session_id
+    )
+
+
+def inject_allowed(plugin, session_id: str, sender_id: str = "") -> bool:
+    """是否向这个会话注入风格（全局过滤 + 会话级开关）。"""
+    return session_allowed(plugin, session_id, sender_id) and plugin.storage.inject_allowed(
+        session_id
+    )
+
+
 async def collect_message(plugin, event: AstrMessageEvent) -> None:
     """收集一条待学习消息。"""
     if not plugin.settings.get("enabled"):
@@ -37,7 +51,7 @@ async def collect_message(plugin, event: AstrMessageEvent) -> None:
         return
 
     session_id = event.unified_msg_origin
-    if not session_allowed(plugin, session_id, event.get_sender_id()):
+    if not learn_allowed(plugin, session_id, event.get_sender_id()):
         return
 
     content = (event.get_message_str() or "").strip()
@@ -66,7 +80,7 @@ async def inject_style(plugin, event: AstrMessageEvent, req) -> None:
         req.system_prompt = cleaned
 
     session_id = event.unified_msg_origin
-    if not session_allowed(plugin, session_id, event.get_sender_id()):
+    if not inject_allowed(plugin, session_id, event.get_sender_id()):
         return
     if not plugin.settings.get("inject_enabled"):
         return

@@ -4,7 +4,7 @@
 
 [![AstrBot](https://img.shields.io/badge/AstrBot-%3E%3D4.29.1-blue)](https://github.com/AstrBotDevs/AstrBot)
 [![Platform](https://img.shields.io/badge/platform-QQ_(aiocqhttp)-green)](#)
-[![Version](https://img.shields.io/badge/version-1.0.0-orange)](metadata.yaml)
+[![Version](https://img.shields.io/badge/version-1.1.0-orange)](metadata.yaml)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-9cf)](LICENSE)
 [![Author](https://img.shields.io/badge/author-wjn1121-lightgrey)](https://github.com/wjn1121)
 
@@ -30,9 +30,12 @@
 - 📉 **特征数量上限**：稳定 40 条 / 场景化 20 条，超出按熟练度淘汰，防 prompt 膨胀
 - ⏱️ **向量请求硬超时**：默认 2 秒，超时直接降级关键词匹配，embedding 慢不会拖住回复
 - 📊 **累计成本可见**：学习次数、成功/失败、分析消息数、字符数、耗时，面板上一目了然
+- 🎚️ **会话级开关**：面板里单独关掉某个群的学习或注入，不用去改配置里的会话列表
+- ✏️ **特征可编辑**：学到不准的表达可以直接在面板改内容、场景和触发词
+- 🕒 **学习记录时间线**：每个群保留最近 20 次学习记录，排查"为什么没学到"更直接
 - 🖥️ **可视化面板**：搜索、分页、注入预览、16 项参数热调，改完即时生效
-- 🔌 **数据迁移**：支持导入旧格式的 `universal.json` / `chat_history.json`
-- 📦 **纯本地存储**：4 个 JSON 文件，随时可备份、可清空、可删除
+- 🔌 **数据迁移**：支持导入旧格式的 `universal.json` / `chat_history.json`，也能一键导出全部数据
+- 📦 **纯本地存储**：5 个 JSON 文件，随时可备份、可清空、可删除
 
 ---
 
@@ -74,7 +77,10 @@ Bot:  当前会话风格：
 | 运行状态 | 会话数 / 特征数 / 待学习消息 / 下次学习时间 |
 | 累计成本 | 学习次数 / 成功失败 / 分析消息数 / 字符数 / 耗时 |
 | 注入预览 | 选会话 + 输入消息 → 直接看注入文本 |
-| 会话与特征 | 搜索、分页、逐条删除、清空、立即学习 |
+| 会话与特征 | 搜索、分页、逐条编辑/删除、清空、立即学习 |
+| 会话开关 | 单独关掉某个群的学习或注入 |
+| 学习记录 | 每会话最近 20 次学习结果与耗时 |
+| 数据导出 | 一键下载全部数据为 JSON |
 
 ---
 
@@ -203,8 +209,9 @@ astrbot_plugin_qunliaojiyi/
 |------|------|
 | `universal.json` | 每个会话学到的特征（纯文本，不含原文） |
 | `chat_history.json` | 待学习的聊天缓冲（含原文，学完即清空） |
-| `learn_state.json` | 每会话学习元信息，删掉可自动重建 |
+| `learn_state.json` | 每会话学习元信息与最近 20 次记录，删掉可自动重建 |
 | `metrics.json` | 全局累计统计 |
+| `overrides.json` | 会话级开关（单独关闭的群） |
 | `runtime.json` | 面板热调的参数覆盖 |
 
 > ⚠️ `chat_history.json` 会保留未学习的聊天原文，`learn_state.json` 含群号。
@@ -216,6 +223,14 @@ astrbot_plugin_qunliaojiyi/
 ---
 
 ## 🆕 更新日志
+
+### v1.1.0
+
+- 🎚️ **会话级开关**：每个群可单独关闭「学习」或「注入」，状态存 `overrides.json`
+- ✏️ **特征可编辑**：面板直接改内容、场景描述、触发词（改名时自动查重）
+- 🕒 **学习记录时间线**：每会话保留最近 20 次学习结果、消息量、耗时
+- 📤 **数据导出**：面板一键下载全部数据为 JSON，和导入对称
+- 🗂️ 导出接口 `GET /export`，管理接口新增 `set_session_override` / `clear_override` / `update_trait`
 
 ### v1.0.0
 

@@ -7,7 +7,7 @@ desc: >-
   场景化表达优先用触发词本地匹配，命中即不发起任何向量请求；向量请求带硬超时，
   超时自动降级，不会拖慢回复。自带设置与调试面板，可查看每群学到的特征、手动学习、
   预览注入效果、热调参数，并展示累计成本。
-version: 1.0.0
+version: 1.1.0
 author: wjn1121
 repo: https://github.com/wjn1121/astrbot_plugin_qunliaojiyi
 astrbot_version: ">=4.29.1,<5"

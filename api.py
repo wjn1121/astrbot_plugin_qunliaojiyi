@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import time
 
 from quart import jsonify, request
 
@@ -23,6 +24,7 @@ def register(plugin) -> None:
         (f"/{plugin.plugin_name}/manage", api_manage, ["POST"], "群聊记忆管理"),
         (f"/{plugin.plugin_name}/preview", api_preview, ["POST"], "注入效果预览"),
         (f"/{plugin.plugin_name}/import", api_import, ["POST"], "导入旧版备份"),
+        (f"/{plugin.plugin_name}/export", api_export, ["GET"], "导出全部数据"),
     )
     for route, func, methods, desc in routes:
         try:
@@ -45,6 +47,7 @@ def _bind(plugin, func):
 
 def _serialize_session(plugin, session_id: str, traits, msgs) -> dict:
     stable, situational = plugin.storage.split(session_id)
+    override = plugin.storage.session_override(session_id)
     return {
         "session_id": session_id,
         "display_name": display_name(session_id),
@@ -53,6 +56,9 @@ def _serialize_session(plugin, session_id: str, traits, msgs) -> dict:
         "history": msgs[-30:],
         "history_count": len(msgs),
         "learn_state": plugin.storage.learn_state.get(session_id, {}),
+        "override": override,
+        "learn_enabled": override.get("learn", True),
+        "inject_enabled": override.get("inject", True),
     }
 
 
@@ -161,6 +167,30 @@ async def api_manage(plugin):
         if action == "clear_all":
             count = await plugin.storage.clear_all()
             return jsonify({"success": True, "message": f"已清空 {count} 个会话"})
+        if action == "set_session_override":
+            override = await plugin.storage.set_override(
+                session_id,
+                learn=body.get("learn"),
+                inject=body.get("inject"),
+            )
+            return jsonify({"success": True, "data": {"session_id": session_id, "override": override}})
+        if action == "clear_override":
+            removed = await plugin.storage.clear_override(session_id)
+            return jsonify(
+                {"success": True, "message": "已恢复默认" if removed else "本来就没有单独设置"}
+            )
+        if action == "update_trait":
+            old_content = str(body.get("content") or "")
+            updated = await plugin.storage.update_trait(
+                session_id,
+                old_content,
+                new_content=body.get("new_content"),
+                context=body.get("context"),
+                triggers=body.get("triggers"),
+            )
+            if updated is None:
+                return jsonify({"success": False, "message": "未找到该特征"})
+            return jsonify({"success": True, "data": updated})
         if action == "set_setting":
             key = str(body.get("key") or "")
             value = await plugin.settings.set_runtime(key, body.get("value"))
@@ -248,3 +278,24 @@ async def api_import(plugin):
     except Exception as e:  # noqa: BLE001
         logger.error(f"[群聊记忆] 导入备份失败: {e}")
         return jsonify({"success": False, "message": str(e)})
+
+
+# ── GET /export ─────────────────────────────────────────────────────────
+
+
+async def api_export(plugin):
+    """导出全部数据，供面板下载为 JSON 备份。"""
+    return jsonify(
+        {
+            "success": True,
+            "data": {
+                "version": PLUGIN_VERSION,
+                "exported_at": time.time(),
+                "universal": plugin.storage.universal,
+                "chat_history": plugin.storage.chat_history,
+                "learn_state": plugin.storage.learn_state,
+                "overrides": plugin.storage.overrides,
+                "metrics": plugin.storage.metrics,
+            },
+        }
+    )

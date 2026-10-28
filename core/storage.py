@@ -35,6 +35,8 @@ class Storage:
         self.chat_history: dict[str, list[ChatMessage]] = self._load("chat_history.json")
         self.learn_state: dict[str, LearnState] = self._load("learn_state.json")
         self.metrics: Metrics = self._load("metrics.json")
+        # 会话级开关：{"bot1:GroupMessage:123": {"learn": false, "inject": true}}
+        self.overrides: dict[str, dict[str, bool]] = self._load("overrides.json")
 
         self._lock = asyncio.Lock()
         self._version = 0
@@ -43,6 +45,7 @@ class Storage:
             "chat_history": False,
             "learn_state": False,
             "metrics": False,
+            "overrides": False,
         }
         self._save_task: asyncio.Task | None = None
         self._save_delay = 5.0
@@ -90,6 +93,9 @@ class Storage:
             if self._dirty["metrics"]:
                 await self._write("metrics.json", self.metrics)
                 self._dirty["metrics"] = False
+            if self._dirty["overrides"]:
+                await self._write("overrides.json", self.overrides)
+                self._dirty["overrides"] = False
 
     async def _write(self, filename: str, data: dict) -> None:
         try:
@@ -98,6 +104,40 @@ class Storage:
             )
         except OSError as e:
             logger.error(f"[群聊记忆] 保存 {filename} 失败: {e}")
+
+    # ── 会话级开关 ──────────────────────────────────────────────────────
+
+    def session_override(self, session_id: str) -> dict[str, bool]:
+        return self.overrides.get(session_id, {})
+
+    def learn_allowed(self, session_id: str) -> bool:
+        return self.session_override(session_id).get("learn", True)
+
+    def inject_allowed(self, session_id: str) -> bool:
+        return self.session_override(session_id).get("inject", True)
+
+    async def set_override(
+        self, session_id: str, *, learn: bool | None = None, inject: bool | None = None
+    ) -> dict[str, bool]:
+        current = dict(self.overrides.get(session_id, {}))
+        if learn is not None:
+            current["learn"] = bool(learn)
+        if inject is not None:
+            current["inject"] = bool(inject)
+        if current.get("learn", True) and current.get("inject", True):
+            # 两项都恢复默认时不留冗余记录
+            self.overrides.pop(session_id, None)
+        else:
+            self.overrides[session_id] = current
+        self._mark("overrides")
+        # 返回落库后的真实状态：两项都恢复默认时这里是空 dict
+        return self.overrides.get(session_id, {})
+
+    async def clear_override(self, session_id: str) -> bool:
+        removed = self.overrides.pop(session_id, None) is not None
+        if removed:
+            self._mark("overrides")
+        return removed
 
     # ── 风格特征 ────────────────────────────────────────────────────────
 
@@ -209,6 +249,47 @@ class Storage:
         self._mark("universal")
         return True
 
+    async def update_trait(
+        self,
+        session_id: str,
+        old_content: str,
+        *,
+        new_content: str | None = None,
+        context: str | None = None,
+        triggers: list[str] | None = None,
+    ) -> Trait | None:
+        """按内容定位并修改一条特征。改名时若与同会话其他特征重名则拒绝。"""
+        traits = self.universal.get(session_id, [])
+        target = next((t for t in traits if t.get("content") == old_content), None)
+        if target is None:
+            return None
+
+        if new_content is not None:
+            renamed = str(new_content).strip()
+            if not renamed:
+                return None
+            if any(
+                t is not target and t.get("content") == renamed for t in traits
+            ):
+                return None
+            target["content"] = renamed
+        if context is not None:
+            target["context"] = str(context).strip()
+        if triggers is not None:
+            cleaned: list[str] = []
+            for item in triggers if isinstance(triggers, list) else []:
+                text = str(item or "").strip()
+                if text and text not in cleaned and len(text) <= 12:
+                    cleaned.append(text)
+                if len(cleaned) >= 3:
+                    break
+            target["triggers"] = cleaned
+        target["last_updated"] = time.time()
+
+        self._version += 1
+        self._mark("universal")
+        return target
+
     async def clear_session(self, session_id: str) -> bool:
         changed = self.universal.pop(session_id, None) is not None
         self.chat_history.pop(session_id, None)
@@ -260,8 +341,23 @@ class Storage:
         chars: int = 0,
     ) -> None:
         prev = self.learn_state.get(session_id, {})
+        now = time.time()
+        # 保留最近 20 次学习记录，供面板做时间线（只用于展示，不参与逻辑）
+        history = list(prev.get("history") or [])
+        history.append(
+            {
+                "at": now,
+                "ok": ok,
+                "stable": stable,
+                "situational": situational,
+                "messages": message_count,
+                "chars": chars,
+                "elapsed": round(elapsed, 2),
+                "message": message[:120],
+            }
+        )
         self.learn_state[session_id] = {
-            "last_learn_at": time.time(),
+            "last_learn_at": now,
             "last_ok": ok,
             "last_stable": stable,
             "last_situational": situational,
@@ -271,6 +367,7 @@ class Storage:
             "last_chars": chars,
             "total_learns": int(prev.get("total_learns", 0)) + (1 if ok else 0),
             "fail_count": int(prev.get("fail_count", 0)) + (0 if ok else 1),
+            "history": history[-20:],
         }
 
         # 全局累计：只用于面板展示「这套机制一共花了多少」，不参与任何逻辑

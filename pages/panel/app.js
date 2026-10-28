@@ -217,6 +217,17 @@ function renderSessions(sessions) {
     const history = (s.history || []).map(
       (m) => `<li><i>${esc(m.sender || "?")}</i>${esc(m.content || "")}</li>`,
     ).join("");
+    // 学习历史时间线（最近 20 次）
+    const timeline = (state.history || []).slice(-8).reverse().map((h) => {
+      const tag = h.ok ? "成功" : "失败";
+      const detail = h.ok
+        ? `稳定 ${h.stable} · 场景 ${h.situational}`
+        : esc(h.message || "未知原因");
+      return `<li><i>${fmtTime(h.at)}</i>${tag} · ${detail}
+        <i>${h.messages || 0} 条 / ${h.chars || 0} 字 / ${h.elapsed || 0}s</i></li>`;
+    }).join("");
+    const learnOn = s.learn_enabled !== false;
+    const injectOn = s.inject_enabled !== false;
     return `<details class="session">
       <summary>
         <b>${esc(s.display_name)}</b>
@@ -224,6 +235,11 @@ function renderSessions(sessions) {
       </summary>
       <div class="body">
         <p class="hint">${esc(stateLine)}</p>
+        <div class="session-switches">
+          <label><input type="checkbox" data-act="toggle_learn" data-sid="${escAttr(s.session_id)}" ${learnOn ? "checked" : ""}/> 学习</label>
+          <label><input type="checkbox" data-act="toggle_inject" data-sid="${escAttr(s.session_id)}" ${injectOn ? "checked" : ""}/> 注入</label>
+          ${learnOn && injectOn ? "" : '<i class="hot">已单独调整</i>'}
+        </div>
         <div class="session-actions">
           <button data-act="learn" data-sid="${escAttr(s.session_id)}">立即学习</button>
           <button class="ghost" data-act="clear_history" data-sid="${escAttr(s.session_id)}">清空待学习</button>
@@ -231,6 +247,7 @@ function renderSessions(sessions) {
         </div>
         ${stable ? `<h3>稳定风格（${(s.stable || []).length}）</h3><ul class="sublist">${stable}</ul>` : ""}
         ${situational ? `<h3>场景化表达（${(s.situational || []).length}）</h3><ul class="sublist">${situational}</ul>` : ""}
+        ${timeline ? `<h3>学习记录（最近 ${(state.history || []).length} 次）</h3><ul class="sublist">${timeline}</ul>` : ""}
         ${history ? `<h3>最近待学习消息（${s.history_count ?? 0}）</h3><ul class="sublist">${history}</ul>` : ""}
       </div>
     </details>`;
@@ -246,6 +263,7 @@ function traitRow(sessionId, trait, situational) {
       : "";
   const prof = trait.proficiency !== undefined ? `<i>熟练度 ${esc(trait.proficiency)}</i>` : "";
   return `<li>${esc(content)}${ctx}${triggers}${prof}
+    <button class="edit" data-act="edit_trait" data-sid="${escAttr(sessionId)}" data-content="${escAttr(content)}" title="编辑">✎</button>
     <button class="del" data-act="delete_trait" data-sid="${escAttr(sessionId)}" data-content="${escAttr(content)}" title="删除该条">×</button>
   </li>`;
 }
@@ -304,12 +322,80 @@ async function importBackup() {
   }
 }
 
+async function exportData() {
+  try {
+    const data = unwrap(await Bridge.apiGet("export"));
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `qunliaojiyi-backup-${new Date().toISOString().slice(0, 10)}.json`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    showToast("已导出数据");
+  } catch (err) {
+    console.error("导出失败:", err);
+    showToast("导出失败，请查看日志");
+  }
+}
+
+// ── 特征编辑 ────────────────────────────────────────────────────────
+
+let pendingEdit = null;
+
+function openEdit(sessionId, trait) {
+  pendingEdit = { sessionId, oldContent: trait.content || "" };
+  $("editContent").value = trait.content || "";
+  $("editContext").value = trait.context || "";
+  $("editTriggers").value = Array.isArray(trait.triggers) ? trait.triggers.join(",") : "";
+  $("editModal").hidden = false;
+  $("editContent").focus();
+}
+
+function closeEdit() {
+  $("editModal").hidden = true;
+  pendingEdit = null;
+}
+
+async function saveEdit() {
+  if (!pendingEdit) return;
+  const content = $("editContent").value.trim();
+  if (!content) { showToast("内容不能为空"); return; }
+  const triggers = $("editTriggers").value
+    .split(/[,，\s]+/)
+    .map((x) => x.trim())
+    .filter(Boolean);
+  const payload = unwrap(await Bridge.apiPost("manage", {
+    action: "update_trait",
+    session_id: pendingEdit.sessionId,
+    content: pendingEdit.oldContent,
+    new_content: content,
+    context: $("editContext").value.trim(),
+    triggers,
+  }));
+  if (payload && payload.success === false) {
+    showToast(payload.message || "保存失败");
+    return;
+  }
+  closeEdit();
+  showToast("已保存");
+  await load();
+}
+
 // ── 启动 ────────────────────────────────────────────────────────────
 
 Bridge.ready().then(() => {
   $("refresh").addEventListener("click", load);
   $("importBtn").addEventListener("click", importBackup);
+  $("exportBtn").addEventListener("click", exportData);
   $("previewBtn").addEventListener("click", preview);
+  $("editSave").addEventListener("click", saveEdit);
+  $("editCancel").addEventListener("click", closeEdit);
+  $("editModal").addEventListener("click", (e) => {
+    if (e.target === $("editModal")) closeEdit();
+  });
 
   // 搜索：输入防抖 300ms，回到第一页
   let searchTimer = null;
@@ -357,7 +443,7 @@ Bridge.ready().then(() => {
   // 会话操作（事件委托）
   $("sessions").addEventListener("click", async (e) => {
     const btn = e.target.closest("[data-act]");
-    if (!btn) return;
+    if (!btn || btn.tagName === "INPUT") return;
     e.stopPropagation();
     const act = btn.dataset.act;
     const sid = btn.dataset.sid;
@@ -373,6 +459,30 @@ Bridge.ready().then(() => {
     }
     if (act === "delete_trait") {
       if (await manage({ action: "delete_trait", session_id: sid, content: btn.dataset.content })) await load();
+      return;
+    }
+    if (act === "edit_trait") {
+      const session = (lastStatus?.sessions || []).find((s) => s.session_id === sid);
+      const trait = [...(session?.stable || []), ...(session?.situational || [])]
+        .find((t) => (t.content || "") === btn.dataset.content);
+      if (trait) openEdit(sid, trait);
+      else showToast("没找到这条特征，刷新后再试");
+    }
+  });
+
+  // 会话级开关：学习 / 注入
+  $("sessions").addEventListener("change", async (e) => {
+    const el = e.target;
+    if (!el.dataset || !el.dataset.act) return;
+    const sid = el.dataset.sid;
+    if (el.dataset.act === "toggle_learn") {
+      await manage({ action: "set_session_override", session_id: sid, learn: el.checked });
+      showToast(el.checked ? "已恢复该群学习" : "已暂停该群学习");
+      await load();
+    } else if (el.dataset.act === "toggle_inject") {
+      await manage({ action: "set_session_override", session_id: sid, inject: el.checked });
+      showToast(el.checked ? "已恢复该群注入" : "已关闭该群注入");
+      await load();
     }
   });
 

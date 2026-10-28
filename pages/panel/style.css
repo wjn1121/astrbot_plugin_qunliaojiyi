@@ -231,3 +231,55 @@ button.del {
   z-index: 60;
 }
 .toast[hidden] { display: none; }
+
+/* 会话级开关（学习 / 注入） */
+.session-switches {
+  display: flex;
+  gap: 16px;
+  align-items: center;
+  margin: 8px 0 4px;
+  font-size: 13px;
+}
+.session-switches label {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  cursor: pointer;
+}
+.session-switches i.hot {
+  color: var(--accent);
+  font-style: normal;
+  font-size: 11px;
+}
+
+/* 特征编辑按钮 */
+button.edit {
+  float: right;
+  padding: 0 8px;
+  line-height: 20px;
+  color: var(--accent);
+  background: transparent;
+  border-color: transparent;
+}
+
+/* 编辑弹窗表单 */
+.modal-box h3 {
+  margin: 0 0 14px;
+  font-size: 15px;
+}
+.field {
+  display: block;
+  margin-bottom: 10px;
+  font-size: 13px;
+  color: var(--muted);
+}
+.field input {
+  display: block;
+  width: 100%;
+  margin-top: 4px;
+  background: #0d1016;
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 7px 10px;
+}
