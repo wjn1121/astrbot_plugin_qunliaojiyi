@@ -2,9 +2,16 @@
 
 沿用旧版 ``universal.json`` / ``chat_history.json`` 的结构，方便直接导入历史备份：
 - ``universal.json``   ``{unified_msg_origin: [trait, ...]}``
-- ``chat_history.json`` ``{unified_msg_origin: [message, ...]}``
 
-额外新增 ``learn_state.json`` 记录每个会话的学习元信息（上次学习时间、累计次数、
+特征按来源分两个文件存，互不干扰：
+- ``universal.json``      定时学习产出，会被下一轮学习整表替换
+- ``manual_traits.json``  面板手动添加，学习流程永远不读取、不写入
+
+分开存的原因：学习是「整表替换」语义，手动加的东西如果混在同一张表里，
+下一轮提炼没复述到就会被静默删掉。分文件后两者在物理上就不可能互相覆盖，
+上限裁剪、备份导入也各管各的。注入时才合并成一份。
+
+额外还有 ``learn_state.json`` 记录每个会话的学习元信息（上次学习时间、累计次数、
 最后一次结果），只供面板展示，不参与注入逻辑，删掉也能自动重建。
 """
 
@@ -23,6 +30,19 @@ from .types import ChatMessage, LearnState, Metrics, Trait
 CATEGORY_STABLE = "stable"
 CATEGORY_SITUATIONAL = "situational"
 
+SOURCE_LEARNED = "learned"
+SOURCE_MANUAL = "manual"
+
+# 手动添加的硬性边界：面板会校验，这里再拦一道，防止外部接口绕过
+MANUAL_CONTENT_MAX = 100
+MANUAL_TRIGGER_MAX = 3
+MANUAL_TRIGGER_LEN = 12
+# 单会话手动记忆条数上限。它不占 max_stable_traits / max_situational_traits 的名额，
+# 但完全不限制的话，一次批量粘贴几百条会把注入 prompt 直接撑爆。
+MANUAL_MAX_PER_SESSION = 50
+# 手动添加时的默认熟练度：略高于学习产出的起步值 5，让新加的条目在注入里能排上号
+DEFAULT_MANUAL_PROFICIENCY = 60
+
 
 class Storage:
     """JSON 存储，写盘做 5 秒合并，避免高频小写入。"""
@@ -32,6 +52,7 @@ class Storage:
         self.data_dir.mkdir(parents=True, exist_ok=True)
 
         self.universal: dict[str, list[Trait]] = self._load("universal.json")
+        self.manual: dict[str, list[Trait]] = self._load("manual_traits.json")
         self.chat_history: dict[str, list[ChatMessage]] = self._load("chat_history.json")
         self.learn_state: dict[str, LearnState] = self._load("learn_state.json")
         self.metrics: Metrics = self._load("metrics.json")
@@ -42,6 +63,7 @@ class Storage:
         self._version = 0
         self._dirty = {
             "universal": False,
+            "manual": False,
             "chat_history": False,
             "learn_state": False,
             "metrics": False,
@@ -84,6 +106,9 @@ class Storage:
             if self._dirty["universal"]:
                 await self._write("universal.json", self.universal)
                 self._dirty["universal"] = False
+            if self._dirty["manual"]:
+                await self._write("manual_traits.json", self.manual)
+                self._dirty["manual"] = False
             if self._dirty["chat_history"]:
                 await self._write("chat_history.json", self.chat_history)
                 self._dirty["chat_history"] = False
@@ -145,16 +170,43 @@ class Storage:
         """数据版本号，特征变更时递增，供注入缓存失效。"""
         return self._version
 
-    def traits_of(self, session_id: str) -> list[Trait]:
-        return self.universal.get(session_id, [])
+    def traits_of(self, session_id: str, include_manual: bool = True) -> list[Trait]:
+        """会话的生效特征。默认合并手动记忆，注入与学习 prompt 都读这里。
 
-    def split(self, session_id: str) -> tuple[list[Trait], list[Trait]]:
-        traits = self.traits_of(session_id)
+        手动条目返回的是加了 ``source`` 标记的副本，调用方据此区分来源；
+        要改数据请走 update_trait / delete_trait，它们会定位到真实所在的那张表。
+        """
+        learned = self.universal.get(session_id, [])
+        if not include_manual:
+            return learned
+        manual = self.manual.get(session_id)
+        if not manual:
+            return learned
+        return learned + [{**t, "source": SOURCE_MANUAL} for t in manual]
+
+    def manual_of(self, session_id: str) -> list[Trait]:
+        """只看面板手动添加的记忆（带 source 标记副本）。"""
+        return [{**t, "source": SOURCE_MANUAL} for t in self.manual.get(session_id, [])]
+
+    @staticmethod
+    def _partition(traits: list[Trait]) -> tuple[list[Trait], list[Trait]]:
         stable = [t for t in traits if t.get("category", CATEGORY_STABLE) == CATEGORY_STABLE]
         situational = [t for t in traits if t.get("category") == CATEGORY_SITUATIONAL]
         return stable, situational
 
+    def split(self, session_id: str, include_manual: bool = True) -> tuple[list[Trait], list[Trait]]:
+        return self._partition(self.traits_of(session_id, include_manual=include_manual))
+
+    def learned_split(self, session_id: str) -> tuple[list[Trait], list[Trait]]:
+        """只看学习产出的特征，面板分组展示用。"""
+        return self._partition(self.universal.get(session_id, []))
+
     def other_stable_except(self, session_id: str) -> list[Trait]:
+        """跨群参考用的稳定风格。
+
+        只取学习产出：手动记忆是针对具体群的人工指定，跨群扩散会串味，
+        比如给 A 群加的黑话被注入到 B 群，属于明显的负收益。
+        """
         out: list[Trait] = []
         for sid, traits in self.universal.items():
             if sid == session_id:
@@ -174,9 +226,14 @@ class Storage:
 
         limits=(稳定上限, 场景上限)，超出的按熟练度从低到高淘汰；
         这样长期运行也不会让特征越攒越多、把学习 prompt 撑大。
+
+        注意这里**只动 universal.json**：手动添加的记忆在另一个文件里，
+        学习流程读不到也写不到，天然不会被覆盖。如果提炼结果里出现与手动记忆
+        同名的内容，直接丢弃——以人工指定为准，避免同一条内容在面板和注入里出现两次。
         """
         now = time.time()
         old = {t.get("content"): t for t in self.universal.get(session_id, [])}
+        manual_contents = {t.get("content") for t in self.manual.get(session_id, [])}
 
         def make(
             content: str, category: str, context: str = "", triggers: list[str] | None = None
@@ -205,6 +262,8 @@ class Storage:
                         item.get("triggers"),
                     )
                 )
+        if manual_contents:
+            traits = [t for t in traits if t.get("content") not in manual_contents]
         if traits:
             self.universal[session_id] = traits
         else:
@@ -215,7 +274,11 @@ class Storage:
         self._mark("universal")
 
     def trim_traits(self, session_id: str, limits: tuple[int, int]) -> int:
-        """按类别裁剪特征数量，返回被删除的条数。"""
+        """按类别裁剪学习特征数量，返回被删除的条数。
+
+        只裁 universal。手动记忆不占 max_stable_traits / max_situational_traits 的名额，
+        由 MANUAL_MAX_PER_SESSION 单独约束，否则手工加几条就会把学到的一路挤掉。
+        """
         traits = self.universal.get(session_id, [])
         if not traits:
             return 0
@@ -236,18 +299,118 @@ class Storage:
             self._mark("universal")
         return dropped
 
-    async def delete_trait(self, session_id: str, content: str) -> bool:
-        traits = self.universal.get(session_id, [])
-        remaining = [t for t in traits if t.get("content") != content]
-        if len(remaining) == len(traits):
-            return False
-        if remaining:
-            self.universal[session_id] = remaining
-        else:
-            self.universal.pop(session_id, None)
+    # ── 手动记忆（独立文件，学习流程不读不写）──────────────────────────
+
+    def manual_count(self, session_id: str) -> int:
+        return len(self.manual.get(session_id, []))
+
+    @staticmethod
+    def clamp_proficiency(value: Any, default: int = DEFAULT_MANUAL_PROFICIENCY) -> int:
+        """熟练度归一化到 0-100 的整数，非法值回退到默认值。"""
+        try:
+            number = int(round(float(value)))
+        except (TypeError, ValueError):
+            return default
+        return max(0, min(100, number))
+
+    @staticmethod
+    def clean_triggers(raw: Any) -> list[str]:
+        """规范化触发词：去空、去超长、去重，最多 3 个。"""
+        out: list[str] = []
+        for item in raw if isinstance(raw, list) else []:
+            text = str(item or "").strip()
+            if text and text not in out and len(text) <= MANUAL_TRIGGER_LEN:
+                out.append(text)
+            if len(out) >= MANUAL_TRIGGER_MAX:
+                break
+        return out
+
+    def _table_pairs(self, source: str | None) -> list[tuple[dict, str]]:
+        """按来源定位要操作的表；不指定时两表都找，手动优先（人工指定更权威）。"""
+        if source == SOURCE_MANUAL:
+            return [(self.manual, "manual")]
+        if source == SOURCE_LEARNED:
+            return [(self.universal, "universal")]
+        return [(self.manual, "manual"), (self.universal, "universal")]
+
+    def has_content(self, session_id: str, content: str) -> bool:
+        """同名内容跨表查重。
+
+        update_trait / delete_trait 都按内容定位，允许两张表存在同名条目会让
+        「到底改的是哪一条」出现歧义，所以从头就禁止。
+        """
+        return any(
+            t.get("content") == content
+            for t in self.manual.get(session_id, []) + self.universal.get(session_id, [])
+        )
+
+    async def add_manual_trait(
+        self,
+        session_id: str,
+        content: str,
+        *,
+        category: str = CATEGORY_STABLE,
+        context: str = "",
+        triggers: Any = None,
+        proficiency: Any = None,
+    ) -> tuple[Trait | None, str]:
+        """往手动记忆表里加一条，返回 (条目, 错误原因)。
+
+        和自动学习完全隔离：不参与 replace_traits、不占 max_*_traits 名额、
+        不会被 trim_traits 淘汰。上限由 MANUAL_MAX_PER_SESSION 单独约束。
+        """
+        session_id = str(session_id or "").strip()
+        if not session_id:
+            return None, "会话 ID 不能为空"
+        text = str(content or "").strip()
+        if not text:
+            return None, "内容不能为空"
+        if len(text) > MANUAL_CONTENT_MAX:
+            return None, f"内容最多 {MANUAL_CONTENT_MAX} 字"
+        if category not in (CATEGORY_STABLE, CATEGORY_SITUATIONAL):
+            return None, "类型只能是 stable 或 situational"
+
+        bucket = self.manual.setdefault(session_id, [])
+        if len(bucket) >= MANUAL_MAX_PER_SESSION:
+            return None, f"该会话手动记忆已达上限 {MANUAL_MAX_PER_SESSION} 条"
+        if self.has_content(session_id, text):
+            return None, "该会话已有相同内容"
+
+        now = time.time()
+        trait: Trait = {
+            "content": text,
+            "category": category,
+            "context": str(context or "").strip(),
+            "triggers": self.clean_triggers(triggers),
+            # confirmed_rounds 保持 0：它是学习确认次数的计数器，手动添加不该伪造它
+            "confirmed_rounds": 0,
+            "proficiency": self.clamp_proficiency(proficiency),
+            "last_seen": now,
+            "last_updated": now,
+        }
+        bucket.append(trait)
         self._version += 1
-        self._mark("universal")
-        return True
+        self._mark("manual")
+        return {**trait, "source": SOURCE_MANUAL}, ""
+
+    async def delete_trait(
+        self, session_id: str, content: str, source: str | None = None
+    ) -> bool:
+        """按内容删除。source 指定在哪张表删，不指定就两表都删。"""
+        removed = False
+        for table, key in self._table_pairs(source):
+            traits = table.get(session_id, [])
+            remaining = [t for t in traits if t.get("content") != content]
+            if len(remaining) == len(traits):
+                continue
+            if remaining:
+                table[session_id] = remaining
+            else:
+                table.pop(session_id, None)
+            self._version += 1
+            self._mark(key)
+            removed = True
+        return removed
 
     async def update_trait(
         self,
@@ -257,55 +420,89 @@ class Storage:
         new_content: str | None = None,
         context: str | None = None,
         triggers: list[str] | None = None,
-    ) -> Trait | None:
-        """按内容定位并修改一条特征。改名时若与同会话其他特征重名则拒绝。"""
-        traits = self.universal.get(session_id, [])
-        target = next((t for t in traits if t.get("content") == old_content), None)
+        proficiency: Any = None,
+        category: str | None = None,
+        source: str | None = None,
+    ) -> tuple[Trait | None, str]:
+        """按内容定位并修改一条特征，先找手动表再找学习表。
+
+        改名或改类型时若与同会话其他特征重名则拒绝；返回 (条目, 错误原因)。
+        """
+        target: Trait | None = None
+        hit_key = ""
+        for table, key in self._table_pairs(source):
+            found = next(
+                (t for t in table.get(session_id, []) if t.get("content") == old_content), None
+            )
+            if found is not None:
+                target = found
+                hit_key = key
+                break
         if target is None:
-            return None
+            return None, "未找到该特征"
 
         if new_content is not None:
             renamed = str(new_content).strip()
             if not renamed:
-                return None
-            if any(
-                t is not target and t.get("content") == renamed for t in traits
-            ):
-                return None
+                return None, "内容不能为空"
+            if len(renamed) > MANUAL_CONTENT_MAX:
+                return None, f"内容最多 {MANUAL_CONTENT_MAX} 字"
+            if renamed != old_content and self.has_content(session_id, renamed):
+                return None, "该会话已有相同内容"
             target["content"] = renamed
+        if category is not None:
+            if category not in (CATEGORY_STABLE, CATEGORY_SITUATIONAL):
+                return None, "类型只能是 stable 或 situational"
+            target["category"] = category
         if context is not None:
             target["context"] = str(context).strip()
         if triggers is not None:
-            cleaned: list[str] = []
-            for item in triggers if isinstance(triggers, list) else []:
-                text = str(item or "").strip()
-                if text and text not in cleaned and len(text) <= 12:
-                    cleaned.append(text)
-                if len(cleaned) >= 3:
-                    break
-            target["triggers"] = cleaned
+            target["triggers"] = self.clean_triggers(triggers)
+        if proficiency is not None:
+            target["proficiency"] = self.clamp_proficiency(
+                proficiency, int(target.get("proficiency", 0) or 0)
+            )
         target["last_updated"] = time.time()
 
         self._version += 1
-        self._mark("universal")
-        return target
+        self._mark(hit_key)
+        return {**target, "source": SOURCE_MANUAL if hit_key == "manual" else SOURCE_LEARNED}, ""
 
-    async def clear_session(self, session_id: str) -> bool:
-        changed = self.universal.pop(session_id, None) is not None
-        self.chat_history.pop(session_id, None)
-        self.learn_state.pop(session_id, None)
-        self._version += 1
-        self._mark("universal", "chat_history", "learn_state")
+    async def clear_session(self, session_id: str, scope: str = "all") -> bool:
+        """清空会话。scope 控制清哪部分：learned / manual / all。
+
+        分开清是必要的：手动记忆删掉不可恢复，不该被「清空学习产出」顺手带走。
+        """
+        changed = False
+        if scope in ("all", "learned"):
+            changed = self.universal.pop(session_id, None) is not None
+            self.chat_history.pop(session_id, None)
+            self.learn_state.pop(session_id, None)
+            self._mark("universal", "chat_history", "learn_state")
+            self._version += 1
+        if scope in ("all", "manual"):
+            if self.manual.pop(session_id, None) is not None:
+                changed = True
+            self._mark("manual")
+            self._version += 1
         return changed
 
-    async def clear_all(self) -> int:
-        count = len(self.universal)
-        self.universal.clear()
-        self.chat_history.clear()
-        self.learn_state.clear()
-        self._version += 1
-        self._mark("universal", "chat_history", "learn_state")
-        return count
+    async def clear_all(self, scope: str = "all") -> dict[str, int]:
+        """清空所有会话，返回各部分被清掉的会话数。"""
+        result = {"learned": 0, "manual": 0}
+        if scope in ("all", "learned"):
+            result["learned"] = len(self.universal)
+            self.universal.clear()
+            self.chat_history.clear()
+            self.learn_state.clear()
+            self._mark("universal", "chat_history", "learn_state")
+            self._version += 1
+        if scope in ("all", "manual"):
+            result["manual"] = len(self.manual)
+            self.manual.clear()
+            self._mark("manual")
+            self._version += 1
+        return result
 
     # ── 聊天缓冲 ────────────────────────────────────────────────────────
 
@@ -382,39 +579,67 @@ class Storage:
 
     # ── 备份导入 ────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _clean_traits(traits: Any) -> list[Trait]:
+        """把备份里的原始列表规范成 Trait 列表，脏数据直接丢。"""
+        clean: list[Trait] = []
+        for t in traits if isinstance(traits, list) else []:
+            if not isinstance(t, dict):
+                continue
+            content = str(t.get("content") or "").strip()
+            if not content:
+                continue
+            triggers = t.get("triggers")
+            category = t.get("category", CATEGORY_STABLE)
+            clean.append(
+                {
+                    "content": content,
+                    "category": (
+                        category if category in (CATEGORY_STABLE, CATEGORY_SITUATIONAL) else CATEGORY_STABLE
+                    ),
+                    "context": str(t.get("context") or ""),
+                    "triggers": [str(x) for x in triggers] if isinstance(triggers, list) else [],
+                    "proficiency": max(0, min(100, int(t.get("proficiency", 0) or 0))),
+                    "confirmed_rounds": int(t.get("confirmed_rounds", 0) or 0),
+                    "last_seen": float(t.get("last_seen", time.time()) or time.time()),
+                    "last_updated": float(t.get("last_updated", time.time()) or time.time()),
+                }
+            )
+        return clean
+
     def import_backup(
         self,
         universal: dict,
         chat_history: dict | None,
         mode: str = "merge",
         limits: tuple[int, int] | None = None,
+        manual: dict | None = None,
     ) -> dict:
-        """从旧版备份导入。mode=merge 合并同名特征，mode=replace 直接覆盖。"""
+        """从备份导入。mode=merge 合并同名特征，mode=replace 直接覆盖。
+
+        manual 是 1.2.0 起的手动记忆表；老备份没有 manual_traits.json，
+        传 None 即可，行为跟以前一致。
+        """
         imported_sessions = 0
         imported_traits = 0
-        for session_id, traits in (universal or {}).items():
-            if not isinstance(traits, list):
+
+        # 先导手动记忆：后面导学习特征时要拿它做去重基准
+        imported_manual = 0
+        for session_id, traits in (manual or {}).items():
+            clean = self._clean_traits(traits)
+            if not clean:
                 continue
-            clean: list[Trait] = []
-            for t in traits:
-                if not isinstance(t, dict):
+            bucket = self.manual.setdefault(session_id, [])
+            existing = {t.get("content") for t in bucket}
+            for t in clean:
+                if t["content"] in existing or len(bucket) >= MANUAL_MAX_PER_SESSION:
                     continue
-                content = str(t.get("content") or "").strip()
-                if not content:
-                    continue
-                triggers = t.get("triggers")
-                clean.append(
-                    {
-                        "content": content,
-                        "category": t.get("category", CATEGORY_STABLE),
-                        "context": str(t.get("context") or ""),
-                        "triggers": [str(x) for x in triggers] if isinstance(triggers, list) else [],
-                        "proficiency": int(t.get("proficiency", 0) or 0),
-                        "confirmed_rounds": int(t.get("confirmed_rounds", 0) or 0),
-                        "last_seen": float(t.get("last_seen", time.time()) or time.time()),
-                        "last_updated": float(t.get("last_updated", time.time()) or time.time()),
-                    }
-                )
+                bucket.append(t)
+                existing.add(t["content"])
+                imported_manual += 1
+
+        for session_id, traits in (universal or {}).items():
+            clean = self._clean_traits(traits)
             if not clean:
                 continue
             if mode == "merge":
@@ -445,30 +670,56 @@ class Storage:
                         m for m in msgs if isinstance(m, dict)
                     )
 
+        # 两表同名时以手动为准，学习那条丢掉，否则面板和注入里会出现重复内容
+        for session_id, traits in self.manual.items():
+            names = {t.get("content") for t in traits}
+            learned = self.universal.get(session_id)
+            if not learned or not names:
+                continue
+            kept = [t for t in learned if t.get("content") not in names]
+            if kept:
+                self.universal[session_id] = kept
+            else:
+                self.universal.pop(session_id, None)
+
         if limits:
             for sid in (universal or {}):
                 self.trim_traits(sid, limits)
 
         self._version += 1
-        self._mark("universal", "chat_history")
-        return {"sessions": imported_sessions, "traits": imported_traits}
+        self._mark("universal", "chat_history", "manual")
+        return {
+            "sessions": imported_sessions,
+            "traits": imported_traits,
+            "manual": imported_manual,
+        }
 
     # ── 统计 ────────────────────────────────────────────────────────────
 
-    def stats(self) -> dict[str, Any]:
-        total_traits = sum(len(v) for v in self.universal.values())
+    @staticmethod
+    def _count_by_category(mapping: dict[str, list[Trait]]) -> tuple[int, int]:
         stable = situational = 0
-        for traits in self.universal.values():
+        for traits in mapping.values():
             for t in traits:
                 if t.get("category") == CATEGORY_SITUATIONAL:
                     situational += 1
                 else:
                     stable += 1
+        return stable, situational
+
+    def stats(self) -> dict[str, Any]:
+        learned_stable, learned_sit = self._count_by_category(self.universal)
+        manual_stable, manual_sit = self._count_by_category(self.manual)
+        learned_total = learned_stable + learned_sit
+        manual_total = manual_stable + manual_sit
         return {
-            "sessions": len(self.universal),
-            "traits": total_traits,
-            "stable": stable,
-            "situational": situational,
+            "sessions": len(set(self.universal) | set(self.manual)),
+            "traits": learned_total + manual_total,
+            "learned_traits": learned_total,
+            "manual_traits": manual_total,
+            "stable": learned_stable + manual_stable,
+            "situational": learned_sit + manual_sit,
+            "manual_sessions": len(self.manual),
             "pending_messages": sum(len(v) for v in self.chat_history.values()),
             "metrics": {
                 "learn_calls": int(self.metrics.get("learn_calls", 0)),

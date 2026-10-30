@@ -12,9 +12,13 @@ from typing import Literal, TypedDict
 
 Category = Literal["stable", "situational"]
 
+# 特征来源：learned 来自定时学习，manual 由面板手动添加（存在另一个文件里）
+# 该字段只做运行期标记，不落库——落库位置本身就是区分依据。
+Source = Literal["learned", "manual"]
+
 
 class Trait(TypedDict, total=False):
-    """一条学习到的风格特征。
+    """一条风格特征。
 
     total=False：旧版数据没有 triggers 字段，读取时按空列表处理。
     """
@@ -27,6 +31,7 @@ class Trait(TypedDict, total=False):
     confirmed_rounds: int
     last_seen: float
     last_updated: float
+    source: Source
 
 
 class ChatMessage(TypedDict, total=False):

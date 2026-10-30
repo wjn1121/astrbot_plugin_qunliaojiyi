@@ -88,8 +88,8 @@ class QunliaoJiyi(Star):
             return
         lines = [
             "当前会话风格：",
-            f"稳定风格 {summary['stable_count']} 条",
-            f"场景化表达 {summary['situational_count']} 条",
+            f"学习产出：稳定 {summary['stable_count']} 条 · 场景化 {summary['situational_count']} 条",
+            f"手动记忆：{summary['manual_count']} 条",
         ]
         for name in summary["stable_preview"]:
             lines.append(f"· {name}")
@@ -117,5 +117,5 @@ class QunliaoJiyi(Star):
 
     @filter.command("清空风格")
     async def cmd_clear(self, event: AstrMessageEvent):
-        await self.storage.clear_session(event.unified_msg_origin)
-        yield event.plain_result("已清空当前会话的风格特征与待学习记录。")
+        await self.storage.clear_session(event.unified_msg_origin, scope="all")
+        yield event.plain_result("已清空当前会话的学习风格、手动记忆与待学习记录。")

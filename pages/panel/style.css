@@ -262,18 +262,54 @@ button.edit {
   border-color: transparent;
 }
 
+/* 标题右侧多按钮组 */
+.title-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+
+/* 来源 / 注入状态标签 */
+.tag {
+  display: inline-block;
+  margin-right: 6px;
+  padding: 0 6px;
+  border-radius: 5px;
+  font-size: 11px;
+  font-weight: 400;
+  line-height: 17px;
+  vertical-align: 1px;
+}
+.tag.manual { color: #d9b46a; background: #2b2317; border: 1px solid #4a3a1e; }
+.tag.in { color: var(--ok); background: #14251c; border: 1px solid #244534; }
+.tag.out { color: var(--muted); background: transparent; border: 1px solid var(--line); }
+
+/* 熟练度进度条：点一下进编辑弹窗 */
+.prof-bar {
+  display: inline-block;
+  width: 54px;
+  height: 5px;
+  margin: 0 5px 0 8px;
+  border-radius: 3px;
+  background: #20242e;
+  overflow: hidden;
+  cursor: pointer;
+  vertical-align: 2px;
+}
+.prof-bar i { display: block; height: 100%; background: var(--accent); }
+.prof-num { color: var(--muted); font-size: 11px; font-style: normal; }
+
 /* 编辑弹窗表单 */
 .modal-box h3 {
   margin: 0 0 14px;
   font-size: 15px;
 }
+.modal-box.wide { max-width: 560px; }
 .field {
   display: block;
   margin-bottom: 10px;
   font-size: 13px;
   color: var(--muted);
 }
-.field input {
+.field input,
+.field select,
+.field textarea {
   display: block;
   width: 100%;
   margin-top: 4px;
@@ -282,4 +318,44 @@ button.edit {
   border: 1px solid var(--line);
   border-radius: 8px;
   padding: 7px 10px;
+  font: inherit;
 }
+.field textarea { resize: vertical; line-height: 1.5; }
+.field .prof-value { color: var(--accent); }
+
+/* 熟练度滑块 */
+input[type="range"] {
+  -webkit-appearance: none;
+  appearance: none;
+  height: 5px;
+  padding: 0;
+  border: none;
+  border-radius: 3px;
+  background: linear-gradient(
+    to right,
+    var(--accent) 0,
+    var(--accent) var(--prof, 60%),
+    #20242e var(--prof, 60%),
+    #20242e 100%
+  );
+}
+input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 15px;
+  height: 15px;
+  border-radius: 50%;
+  background: var(--accent);
+  border: 2px solid #0d1016;
+  cursor: pointer;
+}
+input[type="range"]::-moz-range-thumb {
+  width: 13px;
+  height: 13px;
+  border-radius: 50%;
+  background: var(--accent);
+  border: 2px solid #0d1016;
+  cursor: pointer;
+}
+
+/* 分组小标题的补充说明 */
+h3 small { font-weight: 400; font-size: 11px; color: #6c7484; margin-left: 6px; }

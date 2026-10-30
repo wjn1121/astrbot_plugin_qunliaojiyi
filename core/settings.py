@@ -23,6 +23,9 @@ DEFAULTS: dict[str, Any] = {
     "min_history_for_analysis": 10,
     "max_messages_per_learn": 80,
     "max_stable_inject": 5,
+    # 手动记忆的注入名额，和 max_stable_inject 各算各的：
+    # 否则手工加满 5 条后，6 小时一次的学习成果一条都进不了注入。
+    "max_manual_inject": 3,
     "enable_situational_inject": True,
     "max_situational_inject": 2,
     "situational_similarity_threshold": 0.4,
@@ -54,6 +57,7 @@ RUNTIME_KEYS = {
     "min_history_for_analysis",
     "max_messages_per_learn",
     "max_stable_inject",
+    "max_manual_inject",
     "enable_situational_inject",
     "max_situational_inject",
     "situational_similarity_threshold",

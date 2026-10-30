@@ -11,3 +11,5 @@ Thumbs.db
 .idea/
 .vscode/
 *.log
+# 本地开发笔记，含部署路径等内部信息，不入库
+.workbuddy/

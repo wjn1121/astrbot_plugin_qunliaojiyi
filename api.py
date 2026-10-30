@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 
 from quart import jsonify, request
@@ -14,6 +15,7 @@ from quart import jsonify, request
 from astrbot.api import logger
 
 from .constants import PLUGIN_VERSION
+from .core.storage import MANUAL_MAX_PER_SESSION
 from .utils import display_name
 
 
@@ -45,21 +47,39 @@ def _bind(plugin, func):
 # ── 序列化 ──────────────────────────────────────────────────────────────
 
 
-def _serialize_session(plugin, session_id: str, traits, msgs) -> dict:
-    stable, situational = plugin.storage.split(session_id)
-    override = plugin.storage.session_override(session_id)
+def _serialize_session(plugin, session_id: str, msgs) -> dict:
+    storage = plugin.storage
+    learned_stable, learned_sit = storage.learned_split(session_id)
+    manual = storage.manual_of(session_id)
+    override = storage.session_override(session_id)
+    injector = plugin.manager.injector
+    # 面板要告诉用户「哪几条真的会进注入」，否则改熟练度全靠猜
+    selected = sorted(injector.selected_stable_contents(session_id))
     return {
         "session_id": session_id,
         "display_name": display_name(session_id),
-        "stable": stable,
-        "situational": situational,
+        "stable": learned_stable,
+        "situational": learned_sit,
+        "manual": manual,
         "history": msgs[-30:],
         "history_count": len(msgs),
-        "learn_state": plugin.storage.learn_state.get(session_id, {}),
+        "learn_state": storage.learn_state.get(session_id, {}),
         "override": override,
         "learn_enabled": override.get("learn", True),
         "inject_enabled": override.get("inject", True),
+        "selected": selected,
+        "limits": injector.limits(),
     }
+
+
+def _valid_session_id(session_id: str) -> bool:
+    """粗校验 unified_msg_origin：至少三段且每段非空。
+
+    真校验不了平台实例是否真实存在（那是运行时信息），所以面板侧还要靠
+    「前缀下拉 + 未知会话二次确认」兜住最常见的填错场景。
+    """
+    parts = (session_id or "").split(":")
+    return len(parts) >= 3 and all(p.strip() for p in parts[:3])
 
 
 def _matches(session: dict, query: str) -> bool:
@@ -69,7 +89,9 @@ def _matches(session: dict, query: str) -> bool:
         session.get("session_id", ""),
         session.get("display_name", ""),
     ]
-    for t in session.get("stable", []) + session.get("situational", []):
+    for t in (
+        session.get("stable", []) + session.get("situational", []) + session.get("manual", [])
+    ):
         haystack.append(str(t.get("content") or ""))
         haystack.append(str(t.get("context") or ""))
         haystack.extend(str(x) for x in (t.get("triggers") or []))
@@ -92,21 +114,23 @@ async def api_status(plugin):
     page_size = max(5, min(100, page_size))
     sort = (request.args.get("sort") or "traits").strip()
 
-    sessions = []
-    for session_id in plugin.storage.universal:
-        sessions.append(
-            _serialize_session(
-                plugin,
-                session_id,
-                plugin.storage.traits_of(session_id),
-                plugin.storage.chat_history.get(session_id, []),
-            )
-        )
+    # 学习产出、手动记忆、待学习缓冲任一有数据就列出来：
+    # 手动加了记忆但群里还没说过话的会话也必须出现在面板里。
+    known = set(plugin.storage.universal) | set(plugin.storage.manual)
+    # 新建会话时的平台实例候选：从已有 session_id 抽第一段。
+    # 手填平台实例是最容易出错的地方（填成 aiocqhttp 而实际是 bot1 就会造出僵尸会话）。
+    platforms = sorted(
+        {sid.split(":", 1)[0] for sid in known | set(plugin.storage.chat_history) if ":" in sid}
+    )
+    sessions = [
+        _serialize_session(plugin, session_id, plugin.storage.chat_history.get(session_id, []))
+        for session_id in known
+    ]
     # 只有待学习消息、还没学到特征的会话也列出来，方便调试
     for session_id, msgs in plugin.storage.chat_history.items():
-        if session_id in plugin.storage.universal or not msgs:
+        if session_id in known or not msgs:
             continue
-        sessions.append(_serialize_session(plugin, session_id, [], msgs))
+        sessions.append(_serialize_session(plugin, session_id, msgs))
 
     sessions = [s for s in sessions if _matches(s, query)]
     if sort == "recent":
@@ -115,7 +139,12 @@ async def api_status(plugin):
         sessions.sort(key=lambda s: s["display_name"])
     else:
         sessions.sort(
-            key=lambda s: (len(s["stable"]) + len(s["situational"]), s["history_count"]),
+            key=lambda s: (
+                # 手动记忆也要计入，否则只加了一条手工记忆的新群会沉到最后一页，
+                # 用户刷新后找不到，直接当成没加上。
+                len(s["stable"]) + len(s["situational"]) + len(s["manual"]),
+                s["history_count"],
+            ),
             reverse=True,
         )
 
@@ -139,6 +168,10 @@ async def api_status(plugin):
                 "total_pages": total_pages,
                 "query": query,
                 "sort": sort,
+                "platforms": platforms,
+                "known_ids": sorted(known | set(plugin.storage.chat_history)),
+                "inject_limits": plugin.manager.injector.limits(),
+                "manual_max": MANUAL_MAX_PER_SESSION,
             },
         }
     )
@@ -155,18 +188,87 @@ async def api_manage(plugin):
     try:
         if action == "learn":
             return jsonify({"success": True, "data": await plugin.manager.learn_now(session_id)})
+        if action == "add_trait":
+            if not _valid_session_id(session_id):
+                return jsonify(
+                    {"success": False, "message": "会话 ID 格式应为「平台:GroupMessage:群号」"}
+                )
+            trait, error = await plugin.storage.add_manual_trait(
+                session_id,
+                str(body.get("content") or ""),
+                category=str(body.get("category") or "stable"),
+                context=str(body.get("context") or ""),
+                triggers=body.get("triggers"),
+                proficiency=body.get("proficiency"),
+            )
+            if trait is None:
+                return jsonify({"success": False, "message": error})
+            await plugin.storage.flush()
+            return jsonify({"success": True, "data": trait, "message": "已添加"})
+        if action == "add_traits_batch":
+            if not _valid_session_id(session_id):
+                return jsonify(
+                    {"success": False, "message": "会话 ID 格式应为「平台:GroupMessage:群号」"}
+                )
+            # 批量粘贴：一行一条「内容|场景|触发词1,触发词2」，场景与触发词可省略
+            category = str(body.get("category") or "stable")
+            proficiency = body.get("proficiency")
+            added: list[str] = []
+            failed: list[dict] = []
+            for raw in str(body.get("text") or "").splitlines():
+                line = raw.strip()
+                if not line:
+                    continue
+                parts = [p.strip() for p in line.split("|")]
+                triggers = (
+                    [x for x in re.split(r"[,，\s]+", parts[2]) if x]
+                    if len(parts) > 2 and parts[2]
+                    else []
+                )
+                trait, error = await plugin.storage.add_manual_trait(
+                    session_id,
+                    parts[0] if parts else "",
+                    category=category,
+                    context=parts[1] if len(parts) > 1 else "",
+                    triggers=triggers,
+                    proficiency=proficiency,
+                )
+                if trait is None:
+                    failed.append({"line": line[:40], "reason": error})
+                else:
+                    added.append(str(trait.get("content") or ""))
+            await plugin.storage.flush()
+            return jsonify({"success": True, "data": {"added": added, "failed": failed}})
         if action == "delete_trait":
-            ok = await plugin.storage.delete_trait(session_id, str(body.get("content") or ""))
+            ok = await plugin.storage.delete_trait(
+                session_id,
+                str(body.get("content") or ""),
+                source=str(body.get("source") or "") or None,
+            )
             return jsonify({"success": ok, "message": "已删除" if ok else "未找到该特征"})
         if action == "clear_session":
-            await plugin.storage.clear_session(session_id)
-            return jsonify({"success": True, "message": "已清空该会话"})
+            scope = str(body.get("scope") or "all")
+            await plugin.storage.clear_session(session_id, scope=scope)
+            label = {"learned": "学习产出", "manual": "手动记忆"}.get(scope, "全部记忆")
+            return jsonify({"success": True, "message": f"已清空该会话的{label}"})
         if action == "clear_history":
             await plugin.storage.clear_history(session_id)
             return jsonify({"success": True, "message": "已清空待学习记录"})
         if action == "clear_all":
-            count = await plugin.storage.clear_all()
-            return jsonify({"success": True, "message": f"已清空 {count} 个会话"})
+            scope = str(body.get("scope") or "all")
+            result = await plugin.storage.clear_all(scope=scope)
+            parts = []
+            if result["learned"]:
+                parts.append(f"{result['learned']} 个会话的学习产出")
+            if result["manual"]:
+                parts.append(f"{result['manual']} 个会话的手动记忆")
+            return jsonify(
+                {
+                    "success": True,
+                    "data": result,
+                    "message": ("已清空 " + "、".join(parts)) if parts else "没有可清空的数据",
+                }
+            )
         if action == "set_session_override":
             override = await plugin.storage.set_override(
                 session_id,
@@ -180,16 +282,19 @@ async def api_manage(plugin):
                 {"success": True, "message": "已恢复默认" if removed else "本来就没有单独设置"}
             )
         if action == "update_trait":
-            old_content = str(body.get("content") or "")
-            updated = await plugin.storage.update_trait(
+            updated, error = await plugin.storage.update_trait(
                 session_id,
-                old_content,
+                str(body.get("content") or ""),
                 new_content=body.get("new_content"),
                 context=body.get("context"),
                 triggers=body.get("triggers"),
+                proficiency=body.get("proficiency"),
+                category=body.get("category"),
+                source=str(body.get("source") or "") or None,
             )
             if updated is None:
-                return jsonify({"success": False, "message": "未找到该特征"})
+                return jsonify({"success": False, "message": error or "保存失败"})
+            await plugin.storage.flush()
             return jsonify({"success": True, "data": updated})
         if action == "set_setting":
             key = str(body.get("key") or "")
@@ -264,10 +369,16 @@ async def api_import(plugin):
         chat_history = (
             json.loads(history_path.read_text(encoding="utf-8")) if history_path.is_file() else {}
         )
+        # 1.2.0 起手动记忆单独一个文件；老备份没有它，按空处理即可
+        manual_path = backup_dir / "manual_traits.json"
+        manual = (
+            json.loads(manual_path.read_text(encoding="utf-8")) if manual_path.is_file() else {}
+        )
         result = plugin.storage.import_backup(
             universal,
             chat_history,
             mode=mode,
+            manual=manual,
             limits=(
                 int(plugin.settings.get("max_stable_traits")),
                 int(plugin.settings.get("max_situational_traits")),
@@ -292,6 +403,7 @@ async def api_export(plugin):
                 "version": PLUGIN_VERSION,
                 "exported_at": time.time(),
                 "universal": plugin.storage.universal,
+                "manual_traits": plugin.storage.manual,
                 "chat_history": plugin.storage.chat_history,
                 "learn_state": plugin.storage.learn_state,
                 "overrides": plugin.storage.overrides,

@@ -17,7 +17,7 @@ from typing import Any
 
 from astrbot.api import logger
 
-from .storage import CATEGORY_SITUATIONAL, CATEGORY_STABLE, Storage
+from .storage import Storage
 from .types import ChatMessage, ParsedTraits, Trait
 
 # 数字梗 / 短重复串（666、233、哈哈哈）不进稳定风格
@@ -185,16 +185,10 @@ class Learner:
                 lines.append(f"{sender}: {content}")
         history_str = "\n".join(lines)
 
-        existing = self.storage.traits_of(session_id)
-        stable_lines = [
-            f"- {t.get('content')}"
-            for t in existing
-            if t.get("category", CATEGORY_STABLE) == CATEGORY_STABLE
-        ]
+        existing_stable, existing_sit = self.storage.learned_split(session_id)
+        stable_lines = [f"- {t.get('content')}" for t in existing_stable]
         sit_lines = [
-            f"- {t.get('content')}（场景：{t.get('context', '')}）"
-            for t in existing
-            if t.get("category") == CATEGORY_SITUATIONAL
+            f"- {t.get('content')}（场景：{t.get('context', '')}）" for t in existing_sit
         ]
         hint = ""
         if stable_lines or sit_lines:
@@ -204,6 +198,16 @@ class Learner:
             if sit_lines:
                 parts.append("场景化表达：\n" + "\n".join(sit_lines))
             hint = "\n\n已有的风格特征（请保留合适的并补充新的）：\n" + "\n".join(parts)
+
+        # 手动记忆单独告诉模型：一是让它别重复输出同样的内容（否则会被去重丢掉，
+        # 白白少一条产出），二是避免它提炼出语义冲突的条目。
+        manual = self.storage.manual_of(session_id)
+        if manual:
+            manual_lines = [f"- {t.get('content')}" for t in manual[:20]]
+            hint += (
+                "\n\n以下内容已由管理员手动指定，不需要重复输出，也不许输出与之重复或矛盾的条目：\n"
+                + "\n".join(manual_lines)
+            )
 
         return f"""分析以下群聊记录，提炼这个群的说话风格和语言习惯。
 

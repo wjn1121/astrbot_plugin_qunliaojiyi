@@ -15,7 +15,7 @@ from typing import Any
 
 from astrbot.api import logger
 
-from .storage import CATEGORY_SITUATIONAL, CATEGORY_STABLE, Storage
+from .storage import CATEGORY_SITUATIONAL, CATEGORY_STABLE, SOURCE_MANUAL, Storage
 from .types import Trait
 
 
@@ -24,7 +24,7 @@ class Injector:
         self.plugin = plugin
         self.storage = storage
         # 稳定风格文本缓存：数据版本不变时不重复拼装
-        self._stable_cache: dict[str, tuple[int, str | None]] = {}
+        self._stable_cache: dict[str, tuple[int, tuple[int, int, int], str | None]] = {}
         # 场景化特征的嵌入向量缓存：内容不变时不重复请求 embedding
         self._emb_cache: dict[str, dict[str, list[float]]] = {}
         self._emb_version: dict[str, int] = {}
@@ -76,24 +76,36 @@ class Injector:
     def _build_stable_text(
         self, session_id: str, local: list[Trait], global_stable: list[Trait]
     ) -> str | None:
+        settings = self.plugin.settings
+        # 名额也算进缓存键：否则面板把 max_manual_inject 从 3 改成 0 后，
+        # 要等到下一次数据变更才会生效，看起来像设置没起作用。
+        quota = (
+            int(settings.get("max_manual_inject")),
+            int(settings.get("max_stable_inject")),
+            int(settings.get("max_global_styles")),
+        )
         version = self.storage.get_version()
         cached = self._stable_cache.get(session_id)
-        if cached is not None and cached[0] == version:
-            return cached[1]
+        if cached is not None and cached[0] == version and cached[1] == quota:
+            return cached[2]
 
-        settings = self.plugin.settings
-        max_local = int(settings.get("max_stable_inject"))
-        max_global = int(settings.get("max_global_styles"))
-        local_names = self.select_by_proficiency(local, max_local)
-        global_names = self.select_by_proficiency(global_stable, max_global)
+        # 手动记忆和学习风格各占自己的名额：手工加多了不会把学到的一条都挤掉，
+        # 学习再频繁也顶不掉你明确指定的那几条。
+        manual = [t for t in local if t.get("source") == SOURCE_MANUAL]
+        learned = [t for t in local if t.get("source") != SOURCE_MANUAL]
+        manual_names = self.select_top(manual, quota[0])
+        learned_names = self.select_top(learned, quota[1])
+        global_names = self.select_top(global_stable, quota[2])
 
         text = None
-        if local_names or global_names:
+        if manual_names or learned_names or global_names:
             lines = ["<style_guidelines>", "以下是从群聊记录里提炼的说话风格参考："]
-            if local_names:
-                lines.append(f"本群风格：{'、'.join(local_names)}")
+            if manual_names:
+                lines.append(f"本群固定风格（管理员指定，优先遵守）：{'、'.join(manual_names)}")
+            if learned_names:
+                lines.append(f"本群学习风格：{'、'.join(learned_names)}")
             if global_names:
-                lines.append(f"全局风格：{'、'.join(global_names)}")
+                lines.append(f"其他群风格（仅作参考）：{'、'.join(global_names)}")
             lines.extend(
                 [
                     "使用要求：",
@@ -105,7 +117,7 @@ class Injector:
             )
             text = "\n".join(lines)
 
-        self._stable_cache[session_id] = (version, text)
+        self._stable_cache[session_id] = (version, quota, text)
         return text
 
     # ── 场景化表达 ──────────────────────────────────────────────────────
@@ -173,8 +185,12 @@ class Injector:
         if not matched:
             return None
         matched.sort(key=lambda x: x[1], reverse=True)
-        top = int(settings.get("max_situational_inject"))
-        selected = [t for t, _ in matched[:top]]
+        top = max(0, int(settings.get("max_situational_inject")))
+        # 手动记忆优先占位，剩余名额给学习到的。场景化本身条数就少，
+        # 再让学习结果把它挤掉，手工加的基本等于白加。
+        manual_hits = [t for t, _ in matched if t.get("source") == SOURCE_MANUAL][:top]
+        learned_hits = [t for t, _ in matched if t.get("source") != SOURCE_MANUAL]
+        selected = manual_hits + learned_hits[: max(0, top - len(manual_hits))]
         lines = ["当前语境相关的场景化表达（仅供理解与自然接梗，不要主动扩散）："]
         for trait in selected:
             content = trait.get("content", "")
@@ -244,21 +260,50 @@ class Injector:
     # ── 选择算法 ────────────────────────────────────────────────────────
 
     @staticmethod
-    def select_by_proficiency(traits: list[dict], top_n: int) -> list[str]:
+    def select_top(traits: list[dict], top_n: int) -> list[str]:
+        """按熟练度取前 top_n 条内容。名额为 0 时返回空，表示这类不注入。"""
         if top_n <= 0:
             return []
         ordered = sorted(traits, key=lambda t: t.get("proficiency", 0), reverse=True)
         return [str(t["content"]) for t in ordered[:top_n] if t.get("content")]
 
-    def summary(self, session_id: str) -> dict[str, Any]:
-        stable, situational = self.storage.split(session_id)
+    def selected_stable_contents(self, session_id: str) -> set[str]:
+        """当前会真正进入注入的稳定风格内容，面板标「注入中」用。
+
+        跨群参考那部分不算：它取决于别的群的数据，在本群卡片上标出来只会误导。
+        """
+        settings = self.plugin.settings
+        local, _ = self.storage.split(session_id)
+        manual = [t for t in local if t.get("source") == SOURCE_MANUAL]
+        learned = [t for t in local if t.get("source") != SOURCE_MANUAL]
+        names = self.select_top(manual, int(settings.get("max_manual_inject")))
+        names += self.select_top(learned, int(settings.get("max_stable_inject")))
+        return set(names)
+
+    def limits(self) -> dict[str, int]:
+        """当前注入名额，面板用来解释「为什么这条没入选」。"""
+        settings = self.plugin.settings
         return {
-            "has_styles": bool(stable or situational),
-            "stable_count": len(stable),
-            "situational_count": len(situational),
-            "stable_preview": [t.get("content") for t in stable[:3]],
+            "manual": int(settings.get("max_manual_inject")),
+            "learned": int(settings.get("max_stable_inject")),
+            "situational": int(settings.get("max_situational_inject")),
+        }
+
+    def summary(self, session_id: str) -> dict[str, Any]:
+        learned_stable, learned_sit = self.storage.learned_split(session_id)
+        manual = self.storage.manual_of(session_id)
+        manual_stable = [t for t in manual if t.get("category", CATEGORY_STABLE) == CATEGORY_STABLE]
+        manual_sit = [t for t in manual if t.get("category") == CATEGORY_SITUATIONAL]
+        return {
+            "has_styles": bool(learned_stable or learned_sit or manual),
+            "stable_count": len(learned_stable),
+            "situational_count": len(learned_sit),
+            "manual_count": len(manual),
+            "manual_stable_count": len(manual_stable),
+            "manual_situational_count": len(manual_sit),
+            "stable_preview": [t.get("content") for t in learned_stable[:3]],
             "situational_preview": [
                 {"content": t.get("content"), "context": t.get("context", "")}
-                for t in situational[:3]
+                for t in learned_sit[:3]
             ],
         }
