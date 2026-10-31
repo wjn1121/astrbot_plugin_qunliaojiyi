@@ -21,7 +21,13 @@ from typing import Any
 
 from astrbot.api import logger
 
-from .storage import CATEGORY_SITUATIONAL, CATEGORY_STABLE, SOURCE_MANUAL, Storage
+from .storage import (
+    CATEGORY_SITUATIONAL,
+    CATEGORY_STABLE,
+    SOURCE_MANUAL,
+    Storage,
+    trait_score,
+)
 from .types import Trait
 
 
@@ -72,11 +78,14 @@ class Injector:
         settings = self.plugin.settings
         if not settings.get("enabled") or not settings.get("inject_enabled"):
             return False
-        if self.storage.traits_of(session_id):
+        # 只看真正能进注入的特征：库里全是待审/已归档时不该判定「有风格可注入」
+        if self.storage.active_traits_of(session_id):
             return True
         if settings.get("enable_cross_group"):
             return any(
-                self.storage.traits_of(sid) for sid in self.storage.universal if sid != session_id
+                self.storage.active_traits_of(sid, include_manual=False)
+                for sid in self.storage.universal
+                if sid != session_id
             )
         return False
 
@@ -226,7 +235,8 @@ class Injector:
         manual = [t for t in local if t.get("source") == SOURCE_MANUAL]
         learned = [t for t in local if t.get("source") != SOURCE_MANUAL]
         manual_names = self.select_top(manual, quota[0])
-        learned_names = self.select_top(learned, quota[1])
+        learned_picks = self.select_top_traits(learned, quota[1])
+        learned_names = [str(t["content"]) for t in learned_picks]
         global_names = self.select_top(global_stable, quota[2])
 
         text = None
@@ -239,7 +249,11 @@ class Injector:
             if manual_names:
                 lines.append(f"本群固定风格（管理员指定，优先遵守）：{'、'.join(manual_names)}")
             if learned_names:
-                lines.append(f"本群学习风格：{'、'.join(learned_names)}")
+                if bool(settings.get("style_group_render")):
+                    lines.append("本群学习风格：")
+                    lines.extend(f"  {line}" for line in self._grouped_style_lines(learned_picks))
+                else:
+                    lines.append(f"本群学习风格：{'、'.join(learned_names)}")
             if global_names:
                 lines.append(f"其他群风格（仅作参考）：{'、'.join(global_names)}")
             lines.append("</style_guidelines>")
@@ -397,12 +411,35 @@ class Injector:
     # ── 选择算法 ────────────────────────────────────────────────────────
 
     @staticmethod
-    def select_top(traits: list[dict], top_n: int) -> list[str]:
-        """按熟练度取前 top_n 条内容。名额为 0 时返回空，表示这类不注入。"""
+    def select_top_traits(traits: list[dict], top_n: int) -> list[dict]:
+        """按有效权重取前 top_n 条（保留完整字段，分组渲染要用到 dimension）。"""
         if top_n <= 0:
             return []
-        ordered = sorted(traits, key=lambda t: t.get("proficiency", 0), reverse=True)
-        return [str(t["content"]) for t in ordered[:top_n] if t.get("content")]
+        ordered = sorted(traits, key=trait_score, reverse=True)
+        return [t for t in ordered[:top_n] if t.get("content")]
+
+    @staticmethod
+    def select_top(traits: list[dict], top_n: int) -> list[str]:
+        """按有效权重取前 top_n 条内容。名额为 0 时返回空，表示这类不注入。"""
+        return [str(t["content"]) for t in Injector.select_top_traits(traits, top_n)]
+
+    @staticmethod
+    def _grouped_style_lines(traits: list[dict]) -> list[str]:
+        """按维度分组渲染，读起来像「一个人」而不是「一份配置」。"""
+        order = ["语气词", "句式节奏", "互动方式", "话题偏好", "黑话梗"]
+        buckets: dict[str, list[str]] = {}
+        for trait in traits:
+            content = str(trait.get("content") or "").strip()
+            if not content:
+                continue
+            dim = str(trait.get("dimension") or "").strip() or "风格"
+            buckets.setdefault(dim, []).append(content)
+        lines: list[str] = []
+        for dim in order + [d for d in buckets if d not in order]:
+            values = buckets.get(dim)
+            if values:
+                lines.append(f"{dim}：{'、'.join(values)}")
+        return lines
 
     def selected_stable_contents(self, session_id: str, strength: int | None = None) -> set[str]:
         """当前会真正进入注入的稳定风格内容，面板标「注入中」用。

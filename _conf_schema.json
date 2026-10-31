@@ -15,19 +15,101 @@
     "description": "学习分析间隔（秒）",
     "type": "int",
     "default": 21600,
-    "hint": "每隔多少秒对攒下的聊天做一次批量提炼。默认 21600（6 小时）≈ 一天最多 4 次，这是「几乎零消耗」的核心。影响：token ↑（调小，学得更勤）/ ↓（调大，如 43200 = 12 小时可再减半）。"
+    "hint": "兜底扫描间隔（秒）。1.4.0 后主要由「攒够 30 条新消息」触发学习，这里只管长时间没人聊时的兜底检查。默认 21600（6 小时）。影响：token ↑（调小，兜底更勤）/ ↓（调大，如 43200）。"
   },
   "min_history_for_analysis": {
     "description": "触发学习的最少消息数",
     "type": "int",
     "default": 10,
-    "hint": "某个会话攒够这么多条新消息才送去提炼，消息少的群直接跳过不发请求。影响：token ↓（调大，触发次数变少，但样本也更少）/ ↑（调小，如 5 会更频繁学习）。"
+    "hint": "一次学习至少要有的消息条数。手动 /学习风格 与兜底扫描看它；日常增量触发看 learn_increment_messages。影响：token ↓（调大，触发变少但样本也更少）/ ↑（调小）。"
   },
   "max_messages_per_learn": {
     "description": "单次提炼最多带入的消息数",
     "type": "int",
     "default": 80,
-    "hint": "从最近记录里最多取多少条交给 LLM，避免长历史把单次请求撑大。影响：token ↑（调大，单次 prompt 更长）/ ↓（调小，如 40 可让单次成本减半，但可用素材变少）。"
+    "hint": "单次学习最多带多少条消息。增量链路只发新攒的那部分，这个值是上限，避免长历史把请求撑大。影响：token ↑（调大）/ ↓（调小，如 40 可让单次成本减半，但可用素材变少）。"
+  },
+  "learn_mode": {
+    "description": "学习链路",
+    "type": "string",
+    "options": [
+      "accumulate",
+      "replace"
+    ],
+    "default": "accumulate",
+    "hint": "accumulate = 增量累积：只学新消息，按「情境+表达」入库并累加权重，条目会跨轮次长大（推荐）。replace = 1.3.x 旧行为：每轮整表重写，措辞会漂移、权重会归零。出问题时切回 replace 即可，数据双向兼容。"
+  },
+  "learn_increment_messages": {
+    "description": "[累积] 攒够多少条新消息就学一次",
+    "type": "int",
+    "default": 30,
+    "hint": "增量学习的触发线。消息攒够这么多就单独给这个群学一次，只处理新消息。影响：token ↑（调小，学得勤）/ ↓（调大，如 60 可减半）。"
+  },
+  "learn_min_interval": {
+    "description": "[累积] 两次学习的最小间隔（秒）",
+    "type": "int",
+    "default": 1800,
+    "hint": "防止群里刷屏时高频学习烧钱。默认 1800（30 分钟），与「攒够 30 条」共同决定触发时机。影响：token ↑（调小）/ ↓（调大，如 3600）。"
+  },
+  "learn_candidate_max": {
+    "description": "[累积] 单次提炼的候选上限",
+    "type": "int",
+    "default": 12,
+    "hint": "每轮最多让模型产出多少条候选。这只是「候选数」，不等于库里能存多少（见 trait_max_total）。影响：token ↑（调大）。"
+  },
+  "learn_require_evidence": {
+    "description": "[累积] 候选必须带本轮原文证据",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后，模型给的每条特征都要附一句本轮聊天的原话，程序核对不上就丢弃。这是防模型编造最有效的一道门，建议保持开启。影响：0（纯本地校验）。"
+  },
+  "learn_self_check": {
+    "description": "[累积] 入库自检",
+    "type": "bool",
+    "default": true,
+    "hint": "新候选入库前，额外问一次模型「这是可复用的说话习惯还是一次性玩梗」，过不了的不入库。失败会自动放行，不影响学习。影响：token ↑（每个会话每次学习多一次小请求）。"
+  },
+  "trait_activate_count": {
+    "description": "[累积] 新条目生效前需要被观察到的次数",
+    "type": "int",
+    "default": 2,
+    "hint": "新特征要跨这么多轮被重复观察到才进注入，防止「今天冒一个梗，明天变人格」。设 1 = 立刻生效（不推荐）。影响：0。"
+  },
+  "trait_inject_min_count": {
+    "description": "[累积] 注入所需的最低权重",
+    "type": "int",
+    "default": 2,
+    "hint": "把上一条换算成权重后的门槛：20 分 = 被观察到 2 次。低于它的条目不进 prompt。影响：token ↓（调大，注入条数变少）。"
+  },
+  "trait_decay_days_full": {
+    "description": "[累积] 权重衰减的天数上限",
+    "type": "int",
+    "default": 30,
+    "hint": "距上次出现多少天后权重见底（按二次曲线，刚出现过的几乎不掉，越久掉得越快）。不吃存储值，只在排序时打折，所以重新出现就会自动「复活」。影响：0。"
+  },
+  "trait_archive_days": {
+    "description": "[累积] 多少天未活跃可归档",
+    "type": "int",
+    "default": 30,
+    "hint": "长期没再出现的特征会转入归档：不删数据、不参与注入，面板里可随时恢复。影响：0。"
+  },
+  "trait_max_total": {
+    "description": "[累积] 每个会话最多保留多少条特征",
+    "type": "int",
+    "default": 300,
+    "hint": "库的容量上限（对齐 MaiBot 的 300）。超了按有效权重从低到高归档，钉住的不动。条数多少不影响每次注入的长度（只取前 5 条）。影响：0。"
+  },
+  "style_group_render": {
+    "description": "[累积] 注入时按维度分组渲染",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后注入文本从「本群学习风格：A、B、C」变成按语气/节奏/互动/话题/黑话分组的分行描述，读起来更像一个人而不是配置表。影响：token ≈0。"
+  },
+  "review_require_manual": {
+    "description": "[审核] 新条目必须人工批准才生效",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后新特征一律停在「待审」，要在面板学习库或 /记忆审核 里批准才进注入。适合对人格很敏感的场景。影响：0（但要花时间点按钮）。"
   },
   "max_stable_inject": {
     "description": "最多注入稳定风格条数",

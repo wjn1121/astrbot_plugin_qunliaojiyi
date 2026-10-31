@@ -6,6 +6,6 @@
 
 PLUGIN_NAME = "astrbot_plugin_qunliaojiyi"
 PLUGIN_AUTHOR = "wjn1121"
-PLUGIN_DESC = "群聊记忆：低频学习群聊风格并按语境注入"
-PLUGIN_VERSION = "1.3.0"
+PLUGIN_DESC = "群聊记忆：增量学习群聊风格与人格档案，按语境零网络注入"
+PLUGIN_VERSION = "1.4.0"
 

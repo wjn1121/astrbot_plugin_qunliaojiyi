@@ -1,8 +1,13 @@
-"""学习者：把攒下的聊天记录交给 LLM，提炼成稳定风格 + 场景化表达。
+"""学习者：把攒下的新消息交给 LLM，提炼成「情境 → 表达」候选，累积进特征库。
+
+两条链路由 ``learn_mode`` 决定：
+- ``accumulate``（默认）：候选 → 原文证据校验 → 入库自检 → 语义合并/新增 → 权重累加，
+  措辞变了也认得出是同一条，库会随轮次长大；
+- ``replace``（1.3.x 旧行为）：整表重写，措辞一变权重就归零，只在回退时使用。
 
 关键成本控制（相对烤箱之心新版的定时任务）：
 - **按会话整批提炼**，不是每条消息都请求；
-- 只有攒够 ``min_history_for_analysis`` 条才发请求；
+- 只有攒够 ``learn_increment_messages`` 条新消息（或兜底到点）才发请求；
 - 单次最多带 ``max_messages_per_learn`` 条，避免长历史把 prompt 撑大；
 - 提炼完成后立刻清空该会话的缓冲，不会重复分析同一批内容。
 """
@@ -17,7 +22,7 @@ from typing import Any
 
 from astrbot.api import logger
 
-from .storage import Storage
+from .storage import Storage, normalize_text
 from .types import ChatMessage, ParsedTraits, Trait
 
 # 数字梗 / 短重复串（666、233、哈哈哈）不进稳定风格
@@ -46,6 +51,25 @@ class Learner:
         self.plugin = plugin
         self.storage = storage
 
+    # ── 人格档案联动 ────────────────────────────────────────────────────
+
+    def refresh_persona(self, session_id: str) -> None:
+        """学习结束后把成果同步到人格档案。
+
+        只喂学习产出（``universal``），不混手动记忆：手动记忆是「注入时额外
+        指定」，人格档案是「这个群学出来的样子」，混在一起会让文件看不出
+        哪些是学来的。失败只记日志，不影响学习结果。
+        """
+        store = getattr(self.plugin, "persona", None)
+        if store is None:
+            return
+        try:
+            result = store.rebuild(session_id, self.storage.universal.get(session_id, []))
+            if result.get("changed"):
+                logger.info(f"[群聊记忆] 人格档案已更新：{session_id}")
+        except Exception as e:  # noqa: BLE001 - 档案是附加产物，不能拖垮学习
+            logger.warning(f"[群聊记忆] 更新人格档案失败 {session_id}: {e}")
+
     # ── 对外入口 ────────────────────────────────────────────────────────
 
     async def learn(self, session_id: str, provider_id: str = "", manual: bool = False) -> dict:
@@ -67,7 +91,12 @@ class Learner:
         message_count = len(history)
         chars = sum(len(str(m.get("content") or "")) for m in history)
         started = time.monotonic()
-        prompt = self._build_prompt(session_id, history)
+        mode = self._learn_mode()
+        prompt = (
+            self._build_prompt_accumulate(session_id, history)
+            if mode != "replace"
+            else self._build_prompt(session_id, history)
+        )
         try:
             provider = await self._resolve_provider(provider_id, session_id)
             if provider is None:
@@ -96,41 +125,101 @@ class Learner:
             if not text:
                 raise ValueError("LLM 返回空内容")
 
-            parsed = self._extract_traits(text)
-            if not parsed:
-                raise ValueError("未能从输出中解析出 JSON 特征")
+            if mode == "replace":
+                parsed = self._extract_traits(text)
+                if not parsed:
+                    raise ValueError("未能从输出中解析出 JSON 特征")
 
-            self.storage.replace_traits(
+                self.storage.replace_traits(
+                    session_id,
+                    parsed["universal"],
+                    parsed["situational"],
+                    limits=(
+                        int(settings.get("max_stable_traits")),
+                        int(settings.get("max_situational_traits")),
+                    ),
+                )
+                await self.storage.clear_history(session_id)
+
+                elapsed = time.monotonic() - started
+                self.storage.record_learn(
+                    session_id,
+                    ok=True,
+                    stable=len(parsed["universal"]),
+                    situational=len(parsed["situational"]),
+                    elapsed=elapsed,
+                    message_count=message_count,
+                    chars=chars,
+                )
+                logger.info(
+                    f"[群聊记忆] {session_id} 学习完成（replace）：稳定 {len(parsed['universal'])} 条，"
+                    f"场景化 {len(parsed['situational'])} 条，耗时 {elapsed:.1f}s"
+                )
+                self.refresh_persona(session_id)
+                return {
+                    "ok": True,
+                    "mode": "replace",
+                    "stable": len(parsed["universal"]),
+                    "situational": len(parsed["situational"]),
+                    "elapsed": round(elapsed, 2),
+                    "universal": parsed["universal"],
+                }
+
+            # ── accumulate：候选 → 证据校验 → 入库自检 → upsert ──────────
+            raw_candidates = self._extract_expressions(text)
+            if not raw_candidates:
+                raise ValueError("未能从输出中解析出候选表达")
+
+            verified, dropped_evidence = self._verify_evidence(raw_candidates, history)
+            kept, dropped_check = await self._self_check(verified, provider, session_id)
+            stats = self.storage.upsert_traits(
                 session_id,
-                parsed["universal"],
-                parsed["situational"],
+                kept,
                 limits=(
                     int(settings.get("max_stable_traits")),
                     int(settings.get("max_situational_traits")),
                 ),
+                max_total=int(settings.get("trait_max_total") or 300),
+                activate_at=max(1, int(float(settings.get("trait_activate_count") or 2) * 10)),
             )
+            self.storage.archive_stale(session_id)
             await self.storage.clear_history(session_id)
 
+            stable_n = sum(1 for c in kept if not str(c.get("context") or "").strip())
+            situ_n = len(kept) - stable_n
             elapsed = time.monotonic() - started
             self.storage.record_learn(
                 session_id,
                 ok=True,
-                stable=len(parsed["universal"]),
-                situational=len(parsed["situational"]),
+                stable=stable_n,
+                situational=situ_n,
                 elapsed=elapsed,
                 message_count=message_count,
                 chars=chars,
+                message=(
+                    f"新增 {stats['added']} / 合并 {stats['merged']} / "
+                    f"转生效 {stats['activated']} / 证据不符 {dropped_evidence} / "
+                    f"自检未过 {dropped_check}"
+                ),
             )
             logger.info(
-                f"[群聊记忆] {session_id} 学习完成：稳定 {len(parsed['universal'])} 条，"
-                f"场景化 {len(parsed['situational'])} 条，耗时 {elapsed:.1f}s"
+                f"[群聊记忆] {session_id} 学习完成（accumulate）：候选 {len(raw_candidates)} 条，"
+                f"证据不符丢 {dropped_evidence}，自检丢 {dropped_check}，"
+                f"入库新增 {stats['added']} 合并 {stats['merged']} 转生效 {stats['activated']}，"
+                f"耗时 {elapsed:.1f}s"
             )
+            self.refresh_persona(session_id)
             return {
                 "ok": True,
-                "stable": len(parsed["universal"]),
-                "situational": len(parsed["situational"]),
+                "mode": "accumulate",
+                "stable": stable_n,
+                "situational": situ_n,
+                "added": stats["added"],
+                "merged": stats["merged"],
+                "activated": stats["activated"],
+                "dropped_evidence": dropped_evidence,
+                "dropped_check": dropped_check,
                 "elapsed": round(elapsed, 2),
-                "universal": parsed["universal"],
             }
         except asyncio.TimeoutError:
             elapsed = time.monotonic() - started
@@ -180,6 +269,78 @@ class Learner:
             return None
 
     # ── Prompt 构建 ─────────────────────────────────────────────────────
+
+    def _learn_mode(self) -> str:
+        """当前学习链路：accumulate（累积）或 replace（1.3.x 旧行为）。"""
+        mode = str(self.plugin.settings.get("learn_mode") or "accumulate").strip().lower()
+        return "replace" if mode == "replace" else "accumulate"
+
+    def _build_prompt_accumulate(self, session_id: str, history: list[ChatMessage]) -> str:
+        """累积链路的提炼 prompt：要求给「什么时候说 + 怎么说 + 原文证据」。"""
+        lines = []
+        for msg in history:
+            sender = str(msg.get("sender") or "?")[:24]
+            content = str(msg.get("content") or "").replace("\n", " ")[:300]
+            if content:
+                lines.append(f"{sender}: {content}")
+        history_str = "\n".join(lines)
+
+        # 已有特征只给「情境 + 表达 + 权重」，控制 prompt 长度；权重高的排在前面，
+        # 让模型知道哪些已经是这个群的稳定习惯，不要重复输出。
+        existing = sorted(
+            (t for t in self.storage.universal.get(session_id, [])
+             if t.get("status") != "rejected"),
+            key=lambda t: t.get("proficiency", 0),
+            reverse=True,
+        )[:30]
+        hint = ""
+        if existing:
+            rows = []
+            for t in existing:
+                situation = str(t.get("context") or "").strip() or "（任何场合）"
+                rows.append(f"- 情境：{situation}｜表达：{t.get('content')}｜权重 {t.get('proficiency', 0)}")
+            hint = (
+                "\n\n已有的表达习惯（权重越高越是这个群的稳定风格。"
+                "不要重复输出这些内容；如果某个已有说法不够准确，可以给更准确的新说法）：\n"
+                + "\n".join(rows)
+            )
+
+        manual = self.storage.manual_of(session_id)
+        if manual:
+            manual_lines = [f"- {t.get('content')}" for t in manual[:20]]
+            hint += (
+                "\n\n以下内容已由管理员手动指定，不要重复输出，也不要输出与之矛盾的条目：\n"
+                + "\n".join(manual_lines)
+            )
+
+        limit = int(self.plugin.settings.get("learn_candidate_max") or 12)
+        return f"""分析以下群聊记录，提炼这个群「在什么情况下、用什么方式说话」。
+
+聊天记录：
+```
+{history_str}
+```{hint}
+
+要求：
+1. 只返回有效 JSON，不要解释，不要代码围栏。
+2. 格式：
+   {{"expressions": [{{"situation": "当……时", "style": "怎么说", "evidence": "本轮聊天里的原话片段", "dimension": "语气词", "triggers": ["触发词"]}}]}}
+3. situation 写「什么时候适用」，可以是空字符串（表示任何场合都成立的语气、句式特征）。
+   style 写「具体怎么说」，要是能直接照做的表达习惯，10-30 字，不要写「说话随意」这类放到任何群都成立的空话。
+4. evidence 必须从上面的聊天记录里**原样复制**一小段（不超过 40 字，挑最能体现这条风格的那句）。
+   找不到对应原话就不要输出这一条。这一条是硬性要求。
+5. dimension 只能取：语气词 / 句式节奏 / 互动方式 / 话题偏好 / 黑话梗。
+6. triggers 只给场景化表达：1-3 个「群友消息里出现就该接这个梗」的短词（2-6 字）。
+   不要用「哈哈」「好」这类到处都有的词；稳定风格不需要 triggers，给空数组。
+7. 最多 {limit} 条。宁可少而准，不要凑数。
+8. 一次性玩梗、某一件具体的事不要收录，只收「以后还会反复出现的说话习惯」。
+9. 描述里不要出现英文双引号。
+
+示例输出：
+{{"expressions": [
+  {{"situation": "", "style": "句末常带喵、qwq 等语气词卖萌", "evidence": "我又歪了喵", "dimension": "语气词", "triggers": []}},
+  {{"situation": "有人报抽卡结果时", "style": "用「出货了？」反问，或直接骂欧", "evidence": "出货了属于是", "dimension": "互动方式", "triggers": ["出货", "抽卡"]}}
+]}}"""
 
     def _build_prompt(self, session_id: str, history: list[ChatMessage]) -> str:
         lines = []
@@ -239,6 +400,179 @@ class Learner:
                   {{"content": "绷不住了", "context": "看到离谱内容时感叹", "triggers": ["绷不住", "绷"]}}]}}"""
 
     # ── 输出解析 ────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _grab_json(text: str) -> str | None:
+        match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+        if match:
+            return match.group(1)
+        start, end = text.find("{"), text.rfind("}")
+        if start != -1 and end > start:
+            return text[start : end + 1]
+        return None
+
+    def _extract_expressions(self, text: str) -> list[dict]:
+        """解析累积链路的候选：``situation`` / ``style`` / ``evidence``。
+
+        模型偶尔仍会按 1.3.x 的 ``universal`` / ``situational`` 格式输出，这里一并兜住，
+        不带证据的候选会在下一步被证据校验挡掉。
+        """
+        json_str = self._grab_json(text)
+        if not json_str:
+            logger.warning("[群聊记忆] LLM 输出里找不到 JSON 结构")
+            return []
+        try:
+            data = json.loads(json_str)
+        except (json.JSONDecodeError, ValueError) as e:
+            logger.warning(f"[群聊记忆] 候选 JSON 解析失败: {e}")
+            return []
+        if not isinstance(data, dict):
+            return []
+
+        out: list[dict] = []
+
+        def push(style: Any, situation: Any = "", triggers: Any = None,
+                 dimension: Any = "", evidence: Any = "") -> None:
+            content = str(style or "").strip().strip("「」\"'")
+            if not content or len(content) > 60:
+                return
+            out.append(
+                {
+                    "content": content,
+                    "context": str(situation or "").strip()[:60],
+                    "triggers": self._clean_triggers(triggers),
+                    "dimension": str(dimension or "").strip()[:12],
+                    "evidence": str(evidence or "").strip()[:120],
+                }
+            )
+
+        expressions = data.get("expressions")
+        if isinstance(expressions, list):
+            for item in expressions:
+                if isinstance(item, dict):
+                    push(
+                        item.get("style") or item.get("content"),
+                        item.get("situation") or item.get("context"),
+                        item.get("triggers"),
+                        item.get("dimension"),
+                        item.get("evidence"),
+                    )
+                elif isinstance(item, str):
+                    push(item)
+
+        # 1.3.x 格式兜底
+        for item in data.get("universal") or []:
+            if isinstance(item, str):
+                push(item)
+        for item in data.get("situational") or []:
+            if isinstance(item, dict):
+                push(
+                    item.get("content"),
+                    item.get("context"),
+                    item.get("triggers"),
+                    item.get("dimension"),
+                    item.get("evidence"),
+                )
+
+        # 护栏：数字梗、短重复串只能算场景化表达，不能当稳定风格
+        for cand in out:
+            if not cand["context"] and looks_like_meme(cand["content"]):
+                cand["context"] = "群友使用或刷出该表达时自然接梗，不要主动扩散"
+                if not cand["triggers"]:
+                    cand["triggers"] = self._clean_triggers([cand["content"]])
+
+        # 同批次去重（同表达同情境只留一条）
+        seen: set[tuple[str, str]] = set()
+        dedup: list[dict] = []
+        for cand in out:
+            key = (cand["content"], cand["context"])
+            if key in seen:
+                continue
+            seen.add(key)
+            dedup.append(cand)
+        return dedup
+
+    def _verify_evidence(
+        self, candidates: list[dict], history: list[ChatMessage]
+    ) -> tuple[list[dict], int]:
+        """证据必须是本轮聊天里的原话，否则整条丢弃。
+
+        这是防 LLM 编造特征最有效的一道门：编出来的风格找不到原文，直接出局；
+        同时也让面板上「这条从哪学来的」有据可查。
+        """
+        if not bool(self.plugin.settings.get("learn_require_evidence")):
+            return candidates, 0
+        pool = [normalize_text(m.get("content")) for m in history if m.get("content")]
+        blob = "\n".join(pool)
+        kept, dropped = [], 0
+        for cand in candidates:
+            evidence = normalize_text(cand.get("evidence"))
+            if not evidence:
+                dropped += 1
+                continue
+            if evidence in blob or any(evidence in part for part in pool):
+                kept.append(cand)
+            else:
+                logger.debug(
+                    f"[群聊记忆] 证据与该轮聊天对不上，丢弃候选：{cand.get('content')} / {cand.get('evidence')}"
+                )
+                dropped += 1
+        return kept, dropped
+
+    async def _self_check(
+        self, candidates: list[dict], provider: Any, session_id: str
+    ) -> tuple[list[dict], int]:
+        """入库自检：让 LLM 判断候选里哪些是「可复用的说话习惯」。
+
+        失败一律放行——自检是提质手段，不该成为学习链路的新故障点。
+        """
+        if not candidates:
+            return [], 0
+        if not bool(self.plugin.settings.get("learn_self_check")):
+            return candidates, 0
+
+        rows = []
+        for idx, cand in enumerate(candidates, 1):
+            situation = cand.get("context") or "（任何场合）"
+            rows.append(
+                f"{idx}. 情境：{situation}｜表达：{cand['content']}｜证据：{cand.get('evidence') or '无'}"
+            )
+        prompt = f"""以下是刚从群聊记录里提炼出的说话习惯候选，判断每一条是否值得长期保留。
+
+候选：
+{chr(10).join(rows)}
+
+淘汰标准（满足任意一条就淘汰）：
+- 只在某一次具体事件里出现，不是可复用的说话习惯
+- 过于笼统，放到任何群都成立（如「说话比较随意」「喜欢用表情」这类空话）
+- 只是某个人偶尔的说法，不是这个群的普遍习惯
+
+只输出 JSON，不要解释，不要代码围栏：{{"keep": [1, 3], "drop": [2]}}
+编号必须覆盖全部候选。"""
+        try:
+            resp = await asyncio.wait_for(
+                provider.text_chat(prompt=prompt, contexts=[], system_prompt=SYSTEM_PROMPT),
+                timeout=60,
+            )
+            try:
+                self.plugin.usage.record("learn", getattr(resp, "usage", None), session_id)
+            except Exception as e:  # noqa: BLE001
+                logger.debug(f"[群聊记忆] 记录自检消耗失败（可忽略）: {e}")
+            text = (getattr(resp, "completion_text", "") or "").strip()
+            json_str = self._grab_json(text)
+            if not json_str:
+                return candidates, 0
+            data = json.loads(json_str)
+            drop_ids = {int(i) for i in (data.get("drop") or []) if str(i).strip().isdigit()}
+            if not drop_ids:
+                return candidates, 0
+            kept = [c for i, c in enumerate(candidates, 1) if i not in drop_ids]
+            dropped = len(candidates) - len(kept)
+            logger.info(f"[群聊记忆] 入库自检淘汰 {dropped} 条候选")
+            return kept, dropped
+        except Exception as e:  # noqa: BLE001 - 自检失败不影响学习
+            logger.warning(f"[群聊记忆] 入库自检失败，候选全部放行: {e}")
+            return candidates, 0
 
     def _extract_traits(self, text: str) -> ParsedTraits | None:
         match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)

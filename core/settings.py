@@ -22,6 +22,35 @@ DEFAULTS: dict[str, Any] = {
     "analysis_interval_seconds": 21600,
     "min_history_for_analysis": 10,
     "max_messages_per_learn": 80,
+    # ── 学习链路（1.4.0）────────────────────────────────────────────────
+    # accumulate = 增量累积（新链路，upsert + 权重 + 时效 + 审核）
+    # replace    = 1.3.x 旧行为（每轮整表重写），出问题时一键回滚
+    "learn_mode": "accumulate",
+    # 新增多少条消息就学一次。比「固定 6 小时一大锅」更接近持续学习，
+    # 也只处理新消息，token 更省。
+    "learn_increment_messages": 30,
+    # 两次学习的最小间隔，防止群里刷屏时高频烧钱
+    "learn_min_interval": 1800,
+    # 每轮候选上限。只是候选数，不等于库存上限
+    "learn_candidate_max": 12,
+    # 候选必须给出本轮聊天的原文证据，对不上就丢弃（防 LLM 编造）
+    "learn_require_evidence": True,
+    # 入库自检：让 LLM 判断候选是不是「可复用的说话习惯」
+    "learn_self_check": True,
+    # 新条目权重到多少才生效（10 = 被观察到一次，20 = 跨两轮确认）
+    "trait_activate_count": 2,
+    # 注入的最低有效权重，低于这个不进 prompt
+    "trait_inject_min_count": 2,
+    # 时效折扣：多少天后权重见底
+    "trait_decay_days_full": 30,
+    # 多少天未活跃可归档（归档不删数据，面板可恢复）
+    "trait_archive_days": 30,
+    # 每个会话在库条数上限，超出按有效权重从低到高归档
+    "trait_max_total": 300,
+    # 注入时按维度分组渲染（语气/节奏/互动/话题/黑话），比一行逗号拼接更像人
+    "style_group_render": False,
+    # true = 新条目必须人工批准才生效；false = 自检通过 + 权重达标自动生效
+    "review_require_manual": False,
     "max_stable_inject": 5,
     # 手动记忆的注入名额，和 max_stable_inject 各算各的：
     # 否则手工加满 5 条后，6 小时一次的学习成果一条都进不了注入。
@@ -128,6 +157,20 @@ RUNTIME_KEYS = {
     "max_stable_traits",
     "max_situational_traits",
     "debug_mode",
+    # 学习链路（1.4.0）
+    "learn_mode",
+    "learn_increment_messages",
+    "learn_min_interval",
+    "learn_candidate_max",
+    "learn_require_evidence",
+    "learn_self_check",
+    "trait_activate_count",
+    "trait_inject_min_count",
+    "trait_decay_days_full",
+    "trait_archive_days",
+    "trait_max_total",
+    "style_group_render",
+    "review_require_manual",
     # 风格强度与人格让位
     "style_strength",
     "active_style_strength",

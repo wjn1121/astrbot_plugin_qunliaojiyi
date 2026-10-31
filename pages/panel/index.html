@@ -7,93 +7,204 @@
   <link rel="stylesheet" href="./style.css" />
 </head>
 <body>
-  <main class="wrap">
-    <header class="top">
-      <div>
+  <div class="shell">
+    <aside class="side">
+      <div class="brand">
         <h1>🧠 群聊记忆</h1>
-        <p class="sub" id="version">从群聊里学习说话风格，低频提炼、按语境注入</p>
+        <p class="sub" id="version">正在加载…</p>
       </div>
-      <div class="top-actions">
+
+      <nav class="nav" id="nav">
+        <button type="button" class="nav-item on" data-tab="overview">📊 <span>概览</span></button>
+        <button type="button" class="nav-item" data-tab="library">📚 <span>学习库</span><b class="nav-badge" id="navPending" hidden>0</b></button>
+        <button type="button" class="nav-item" data-tab="persona">🧬 <span>人格档案</span></button>
+        <button type="button" class="nav-item" data-tab="usage">💸 <span>Token 消费</span></button>
+        <button type="button" class="nav-item" data-tab="settings">⚙️ <span>参数</span></button>
+        <button type="button" class="nav-item" data-tab="preview">🔍 <span>注入预览</span></button>
+        <button type="button" class="nav-item" data-tab="sessions">💬 <span>会话与特征</span></button>
+      </nav>
+
+      <div class="side-actions">
         <button id="newSessionBtn" class="ghost">➕ 新建会话记忆</button>
         <button id="refresh" class="ghost">🔄 刷新</button>
         <button id="importBtn" class="ghost">📥 导入备份</button>
         <button id="exportBtn" class="ghost">📤 导出数据</button>
       </div>
-    </header>
+    </aside>
 
-    <section class="card">
-      <h2>运行状态</h2>
-      <div id="stats" class="grid"></div>
-      <p class="hint" id="schedule"></p>
-    </section>
+    <main class="content">
+      <section class="pane on" data-pane="overview">
+        <section class="card">
+          <h2>运行状态</h2>
+          <div id="stats" class="grid"></div>
+          <p class="hint" id="schedule"></p>
+        </section>
 
-    <section class="card">
-      <h2>累计成本 <small>统计的是本插件自己发起的请求量，不含正常聊天</small></h2>
-      <div id="cost" class="grid"></div>
-    </section>
+        <section class="card">
+          <h2>累计成本 <small>统计的是本插件自己发起的请求量，不含正常聊天</small></h2>
+          <div id="cost" class="grid"></div>
+        </section>
+      </section>
 
-    <section class="card">
-      <h2 class="card-title">
-        <span>💸 今日消耗</span>
-        <small>按北京时间自然日，只计本插件发起的请求</small>
-      </h2>
-      <div id="usageTop" class="usage-top"></div>
-      <div id="usageTokens" class="grid"></div>
-      <div id="usageBars" class="bars"></div>
-      <p class="hint" id="usageSearch"></p>
-      <p class="hint usage-note">金额按 DeepSeek 牌价估算，节假日会略微高估；全机消耗是下限值（多轮工具调用中间请求会漏计）。</p>
-    </section>
+      <section class="pane" data-pane="library">
+        <section class="card">
+          <h2 class="card-title">
+            <span>📚 学习库 <small>按群聊 / 私聊分开存，权重越高越容易进注入</small></span>
+            <span class="trait-tools">
+              <input id="traitSearch" type="search" placeholder="搜群号或内容" />
+              <select id="traitStatus">
+                <option value="">全部状态</option>
+                <option value="pending">待审</option>
+                <option value="active">已生效</option>
+                <option value="archived">已归档</option>
+                <option value="rejected">已否决</option>
+              </select>
+              <button id="approveAllBtn" class="ghost">全部批准</button>
+            </span>
+          </h2>
+          <div id="traitStats" class="grid"></div>
+          <p class="hint" id="traitSearchNote" hidden></p>
+          <p class="hint">点「证据」能看到这条是从哪句话学来的。权重是原始分，括号里是按时效打折后的有效分。分组标题右边的 📌 可以把该群置顶，置顶的排在列表最前。</p>
+          <div id="traits" class="traits"></div>
+        </section>
+      </section>
 
-    <section class="card">
-      <h2 class="card-title">
-        <span>⚙️ 运行参数 <small>（改动即时生效，不写回配置文件）</small></span>
-        <button id="resetRuntime" class="ghost">恢复配置值</button>
-      </h2>
-      <div id="settings" class="settings"></div>
-      <p class="hint err" id="settingsMsg"></p>
-    </section>
+      <section class="pane" data-pane="persona">
+        <section class="card">
+          <h2 class="card-title">
+            <span>🧬 人格档案 <small>每个群一份 markdown，自动段随学习更新，人工段永远归你</small></span>
+            <button id="rebuildAllPersona" class="ghost">全部重新生成</button>
+          </h2>
+          <div class="persona-layout">
+            <aside class="persona-side">
+              <input id="personaSearch" type="search" placeholder="输入群号 / QQ 号搜索" />
+              <div id="personaList" class="persona-list"></div>
+            </aside>
+            <div class="persona-main">
+              <div id="personaHead" class="persona-head"></div>
 
-    <section class="card">
-      <h2 class="card-title">
-        <span>🔍 注入预览</span>
-        <small>选一个会话，输入一句话，看实际会注入什么</small>
-      </h2>
-      <div class="preview-bar">
-        <div class="seg" id="previewMode">
-          <button type="button" data-active="0" class="on">被动</button>
-          <button type="button" data-active="1">主动</button>
-        </div>
-        <select id="previewSession"></select>
-        <input id="previewMessage" type="text" placeholder="输入一条群友可能说的话，例如：笑死我了 666" />
-        <button id="previewBtn">预览</button>
-      </div>
-      <p class="hint" id="previewNote"></p>
-      <pre id="previewOut" class="preview-out empty">尚未预览</pre>
-    </section>
+              <div class="persona-block">
+                <div class="block-head">
+                  <b>🤖 自动生成</b>
+                  <small>来自学习库中已生效的特征，学习或审核后自动重写</small>
+                  <button id="rebuildPersona" class="ghost">重新生成</button>
+                </div>
+                <pre id="personaAuto" class="persona-auto">选一个群查看</pre>
+              </div>
 
-    <section class="card">
-      <h2 class="card-title">
-        <span>📚 会话与特征</span>
-        <span class="title-actions">
-          <button id="clearLearned" class="ghost danger">清空学习产出</button>
-          <button id="clearManual" class="ghost danger">清空手动记忆</button>
-          <button id="clearAll" class="ghost danger">清空全部</button>
-        </span>
-      </h2>
-      <div class="toolbar">
-        <input id="search" type="search" placeholder="搜索会话名、群号或特征内容" />
-        <select id="sort">
-          <option value="traits">按特征数</option>
-          <option value="recent">按最近学习</option>
-          <option value="name">按名称</option>
-        </select>
-        <span id="pagerInfo" class="hint"></span>
-        <button id="prevPage" class="ghost">上一页</button>
-        <button id="nextPage" class="ghost">下一页</button>
-      </div>
-      <div id="sessions"></div>
-    </section>
-  </main>
+              <div class="persona-block">
+                <div class="block-head">
+                  <b>✍️ 人工补充</b>
+                  <small>只属于你，插件永远不改这一段</small>
+                  <button id="savePersona">保存</button>
+                </div>
+                <textarea id="personaManual" rows="8" placeholder="例如：群友管句尾的「呢」叫阴阳怪气，别用；有人认真问技术问题才正经回答。"></textarea>
+              </div>
+
+              <div class="persona-foot">
+                <span id="personaPath" class="hint"></span>
+                <button id="copyPersona" class="ghost">复制全文</button>
+                <button id="downloadPersona" class="ghost">下载 .md</button>
+              </div>
+            </div>
+          </div>
+        </section>
+      </section>
+
+      <section class="pane" data-pane="usage">
+        <section class="card">
+          <h2 class="card-title">
+            <span>💸 今日消耗</span>
+            <small>按北京时间自然日，只计本插件发起的请求</small>
+          </h2>
+          <div id="usageTop" class="usage-top"></div>
+          <div id="usageTokens" class="grid"></div>
+          <p class="hint usage-note">金额按 DeepSeek 牌价估算，节假日会略微高估；全机消耗是下限值（多轮工具调用中间请求会漏计）。</p>
+        </section>
+
+        <section class="card">
+          <h2 class="card-title">
+            <span>今日调用分布 <small>按小时，悬停看这一小时的明细</small></span>
+            <span class="seg" id="hourMetric">
+              <button type="button" data-metric="cost" class="on">金额</button>
+              <button type="button" data-metric="calls">次数</button>
+            </span>
+          </h2>
+          <div id="hourChart" class="hour-chart"></div>
+          <p class="hint" id="hourNote"></p>
+        </section>
+
+        <section class="card">
+          <h2 class="card-title">
+            <span>近 7 天</span>
+            <small>每天一根，悬停看当天金额与调用次数</small>
+          </h2>
+          <div id="usageBars" class="bars"></div>
+          <p class="hint" id="usageSearch"></p>
+        </section>
+      </section>
+
+      <section class="pane" data-pane="settings">
+        <section class="card">
+          <h2 class="card-title">
+            <span>⚙️ 运行参数 <small>（改动即时生效，不写回配置文件）</small></span>
+            <button id="resetRuntime" class="ghost">恢复配置值</button>
+          </h2>
+          <div id="settings" class="settings"></div>
+          <p class="hint err" id="settingsMsg"></p>
+        </section>
+      </section>
+
+      <section class="pane" data-pane="preview">
+        <section class="card">
+          <h2 class="card-title">
+            <span>🔍 注入预览</span>
+            <small>选一个会话，输入一句话，看实际会注入什么</small>
+          </h2>
+          <div class="preview-bar">
+            <div class="seg" id="previewMode">
+              <button type="button" data-active="0" class="on">被动</button>
+              <button type="button" data-active="1">主动</button>
+            </div>
+            <div class="picker" id="previewPicker">
+              <input id="previewSessionInput" type="text" placeholder="输入群号 / QQ 号搜索会话" autocomplete="off" />
+              <input id="previewSession" type="hidden" />
+              <div class="picker-menu" id="previewMenu" hidden></div>
+            </div>
+            <input id="previewMessage" type="text" placeholder="输入一条群友可能说的话，例如：笑死我了 666" />
+            <button id="previewBtn">预览</button>
+          </div>
+          <p class="hint" id="previewNote"></p>
+          <pre id="previewOut" class="preview-out empty">尚未预览</pre>
+        </section>
+      </section>
+
+      <section class="pane" data-pane="sessions">
+        <section class="card">
+          <h2 class="card-title">
+            <span>💬 会话与特征</span>
+            <span class="title-actions">
+              <button id="clearLearned" class="ghost danger">清空学习产出</button>
+              <button id="clearManual" class="ghost danger">清空手动记忆</button>
+              <button id="clearAll" class="ghost danger">清空全部</button>
+            </span>
+          </h2>
+          <div class="toolbar">
+            <input id="search" type="search" placeholder="搜索会话名、群号或特征内容" />
+            <select id="sort">
+              <option value="traits">按特征数</option>
+              <option value="recent">按最近学习</option>
+              <option value="name">按名称</option>
+            </select>
+            <span id="pagerInfo" class="hint"></span>
+            <button id="prevPage" class="ghost">上一页</button>
+            <button id="nextPage" class="ghost">下一页</button>
+          </div>
+          <div id="sessions"></div>
+        </section>
+      </section>
+    </main>
+  </div>
 
   <div id="confirmModal" class="modal" hidden>
     <div class="modal-box">

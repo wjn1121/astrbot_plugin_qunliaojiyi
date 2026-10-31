@@ -12,6 +12,16 @@ from typing import Literal, TypedDict
 
 Category = Literal["stable", "situational"]
 
+# 特征生命周期状态：
+# pending  新入库，权重还没攒够或还没通过人工审核，不进注入
+# active   已生效，参与注入
+# archived 权重触底或长期未活跃，保留但不再注入，可人工恢复
+# rejected 自检或人工否决，保留原样以便翻案，永不注入
+TraitStatus = Literal["pending", "active", "archived", "rejected"]
+
+# 最后一次改动来源：人工改过之后，自动自检不再覆盖
+ModifiedBy = Literal["ai", "manual"]
+
 # 特征来源：learned 来自定时学习，manual 由面板手动添加（存在另一个文件里）
 # 该字段只做运行期标记，不落库——落库位置本身就是区分依据。
 Source = Literal["learned", "manual"]
@@ -21,6 +31,12 @@ class Trait(TypedDict, total=False):
     """一条风格特征。
 
     total=False：旧版数据没有 triggers 字段，读取时按空列表处理。
+
+    1.4.0 起字段语义对齐 MaiBot 的 Expression：
+    - ``content`` 对应 style（怎么说），``context`` 对应 situation（什么时候说）
+    - ``context`` 为空 = 跨场景稳定风格；非空 = 有触发场景的表达
+    - ``proficiency`` 是**原始权重**（只增不减）。实际排序用 ``effective_score``，
+      按 ``last_seen`` 做时效折扣，所以不需要后台定期跑衰减任务。
     """
 
     content: str
@@ -32,6 +48,23 @@ class Trait(TypedDict, total=False):
     last_seen: float
     last_updated: float
     source: Source
+    # ── 1.4.0 新增 ──────────────────────────────────────────────────────
+    status: TraitStatus
+    seen: int
+    alias: list[str]
+    evidence: list[dict]
+    pinned: bool
+    dimension: str
+    modified_by: ModifiedBy
+    first_seen: float
+
+
+class Evidence(TypedDict, total=False):
+    """一条特征的来源原文，面板上点开就能看到"这句话从哪儿学来的"。"""
+
+    text: str
+    at: float
+    sender: str
 
 
 class ChatMessage(TypedDict, total=False):

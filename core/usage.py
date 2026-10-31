@@ -73,6 +73,21 @@ class SessionCounts(TypedDict, total=False):
     output: int
 
 
+class HourCounts(TypedDict, total=False):
+    """一个小时的计数，用于「今日 24 小时」那张图。
+
+    粒度只到小时：既不存明细（省磁盘、也不留隐私），又够画柱状图和定位
+    「22 点这一波是学习还是聊天」。
+    """
+
+    calls: int
+    cost: float
+    search_calls: int
+    input_other: int
+    input_cached: int
+    output: int
+
+
 class DayDoc(TypedDict, total=False):
     """单个日文件的完整结构。"""
 
@@ -83,6 +98,7 @@ class DayDoc(TypedDict, total=False):
     tokens: TokenCounts
     by_source: dict[str, SourceCounts]
     by_session: dict[str, SessionCounts]
+    by_hour: list[HourCounts]
 
 
 # ── 纯工具函数（不依赖实例状态，方便单测）──────────────────────────────────
@@ -119,6 +135,17 @@ def _empty_session() -> SessionCounts:
     }
 
 
+def _empty_hour() -> HourCounts:
+    return {
+        "calls": 0,
+        "cost": 0.0,
+        "search_calls": 0,
+        "input_other": 0,
+        "input_cached": 0,
+        "output": 0,
+    }
+
+
 def _empty_doc(day: str) -> DayDoc:
     return {
         "date": day,
@@ -128,6 +155,8 @@ def _empty_doc(day: str) -> DayDoc:
         "tokens": _empty_tokens(),
         "by_source": {name: _empty_source(name) for name in ALL_SOURCES},
         "by_session": {},
+        # 固定 24 格，索引就是北京时间的小时数，前端不用做对齐
+        "by_hour": [_empty_hour() for _ in range(24)],
     }
 
 
@@ -227,10 +256,17 @@ def resolve_dir(plugin_data_dir: str | Path) -> Path:
         plugin_dir = Path(plugin_data_dir)
     except (TypeError, ValueError):
         plugin_dir = Path(".")
+
+    candidates: list[Path] = []
     try:
-        candidates = [plugin_dir.parent.parent / "qunliao_token", plugin_dir / "token_stats"]
-    except Exception:
-        candidates = [plugin_dir / "token_stats"]
+        # 只有标准的 <data>/plugin_data/<插件名> 布局才往 data 顶层放。
+        # 不判断层级的话，自定义数据目录（或拿临时目录跑测试）会一路往上算，
+        # 最坏把统计写到文件系统根目录下。
+        if plugin_dir.parent.name == "plugin_data":
+            candidates.append(plugin_dir.parent.parent / "qunliao_token")
+    except Exception:  # noqa: BLE001
+        pass
+    candidates.append(plugin_dir / "token_stats")
 
     for candidate in candidates:
         if _ensure_writable(candidate):
@@ -382,6 +418,21 @@ class UsageTracker:
                     session[field] = _as_int(counts.get(field))  # type: ignore[literal-required]
                 doc["by_session"][session_id] = session
 
+        # 老文件没有分时数据，留 24 个空桶即可（不能因为升级把当天数据丢掉）
+        raw_hours = raw.get("by_hour")
+        if isinstance(raw_hours, list):
+            for hour in range(24):
+                if hour >= len(raw_hours):
+                    break
+                counts = raw_hours[hour]
+                if not isinstance(counts, dict):
+                    continue
+                bucket = _empty_hour()
+                for field in ("calls", "search_calls", "input_other", "input_cached", "output"):
+                    bucket[field] = _as_int(counts.get(field))  # type: ignore[literal-required]
+                bucket["cost"] = round(_as_float(counts.get("cost")), 6)
+                doc["by_hour"][hour] = bucket
+
         # 老文件或手改文件可能没有 cost；按此刻牌价粗算一个，仅供展示
         if "cost" in raw:
             doc["cost"] = _as_float(raw.get("cost"))
@@ -497,6 +548,16 @@ class UsageTracker:
                     session["input_cached"] = int(session.get("input_cached") or 0) + input_cached
                     session["output"] = int(session.get("output") or 0) + output
 
+                # 分时桶：索引就是北京时间的小时。跨天时 _ensure_day_locked
+                # 已经把 data 换成新一天的空文档，所以这里直接取 now 的小时是安全的
+                hour = now_beijing().hour
+                bucket_hour = data["by_hour"][hour]
+                bucket_hour["calls"] = int(bucket_hour.get("calls") or 0) + 1
+                bucket_hour["cost"] = round(float(bucket_hour.get("cost") or 0.0) + cost, 6)
+                bucket_hour["input_other"] = int(bucket_hour.get("input_other") or 0) + input_other
+                bucket_hour["input_cached"] = int(bucket_hour.get("input_cached") or 0) + input_cached
+                bucket_hour["output"] = int(bucket_hour.get("output") or 0) + output
+
                 self._version += 1
                 self._mark_dirty()
         except Exception as e:  # 统计坏了不能影响正常回复
@@ -526,6 +587,11 @@ class UsageTracker:
                     data["by_session"][sid] = session
                 used = int(session.get("search_calls") or 0) + 1
                 session["search_calls"] = used
+
+                # 搜索单独计费，不进 calls —— 顶部「今日调用」也是同口径（只数
+                # LLM 请求），两边不一致的话用户会以为分时图多数了一次
+                bucket_hour = data["by_hour"][now_beijing().hour]
+                bucket_hour["search_calls"] = int(bucket_hour.get("search_calls") or 0) + 1
 
                 self._version += 1
                 self._mark_dirty()
@@ -618,6 +684,34 @@ class UsageTracker:
         except Exception:
             return 0.0
 
+    def hours(self) -> list[dict]:
+        """今日 24 小时序列，固定 24 条，索引即北京时间小时。
+
+        不足一小时的格子照样返回 0，前端不用自己补齐——补齐逻辑放在前后端
+        任何一侧都可能两边都以为对方做了。
+        """
+        doc = self.today()
+        raw = doc.get("by_hour")
+        buckets = raw if isinstance(raw, list) else []
+        out: list[dict] = []
+        for hour in range(24):
+            counts = buckets[hour] if hour < len(buckets) and isinstance(buckets[hour], dict) else {}
+            out.append(
+                {
+                    "hour": hour,
+                    "label": f"{hour:02d}:00",
+                    "cost": round(_as_float(counts.get("cost")), 4),
+                    "calls": _as_int(counts.get("calls")),
+                    "search_calls": _as_int(counts.get("search_calls")),
+                    "tokens": {
+                        "input_other": _as_int(counts.get("input_other")),
+                        "input_cached": _as_int(counts.get("input_cached")),
+                        "output": _as_int(counts.get("output")),
+                    },
+                }
+            )
+        return out
+
     def summary(self) -> dict:
         """给 api.py 用的汇总视图。"""
         doc = self.today()
@@ -633,6 +727,8 @@ class UsageTracker:
                 "calls": _as_int(doc.get("calls")),
             },
             "days": self.snapshot(),
+            "hours": self.hours(),
+            "current_hour": now_beijing().hour,
             "search_used_by_session": used_by_session,
         }
 

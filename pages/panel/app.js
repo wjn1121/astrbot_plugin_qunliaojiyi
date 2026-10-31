@@ -16,11 +16,13 @@ function escAttr(text) {
 let pendingConfirm = null;
 let lastStatus = null;
 // 列表视图状态：搜索 / 分页 / 排序，翻页与搜索都走服务端
-const view = { q: "", page: 1, sort: "traits" };
+const view = { q: "", page: 1, sort: "traits", traitStatus: "", traitQuery: "", personaQuery: "" };
 // 展开过的会话，刷新后恢复，避免「加完记忆一刷新就收起」的割裂感
 const openSessions = new Set();
 // 预览按哪一档算：主动插话用的强度和被动不是一回事
 let previewActive = false;
+// 置顶的会话，顺序由后端给（先加的在前面），前端只用不改
+let pinnedIds = [];
 
 function showToast(message) {
   const toast = $("toast");
@@ -96,6 +98,63 @@ function parseTriggers(raw) {
     .filter(Boolean);
 }
 
+// ── 左侧标签页 ──────────────────────────────────────────────────────
+
+const TAB_KEY = "qunliao.tab";
+const TAB_TEXT = {
+  overview: "概览",
+  library: "学习库",
+  persona: "人格档案",
+  usage: "Token 消费",
+  settings: "参数",
+  preview: "注入预览",
+  sessions: "会话与特征",
+};
+
+function switchTab(tab) {
+  if (!TAB_TEXT[tab]) tab = "overview";
+  document.querySelectorAll(".pane").forEach((pane) => {
+    pane.classList.toggle("on", pane.dataset.pane === tab);
+  });
+  document.querySelectorAll("#nav .nav-item").forEach((btn) => {
+    btn.classList.toggle("on", btn.dataset.tab === tab);
+  });
+  // 人格档案要读磁盘文件，没必要每次刷新都扫一遍，切过去时再加载
+  if (tab === "persona") ensurePersona();
+  try {
+    // 在 iframe 里，sessionStorage 可能被宿主的沙箱限制，失败就当没记住
+    localStorage.setItem(TAB_KEY, tab);
+  } catch (err) {
+    /* 忽略 */
+  }
+}
+
+function restoreTab() {
+  let saved = "";
+  try {
+    saved = localStorage.getItem(TAB_KEY) || "";
+  } catch (err) {
+    saved = "";
+  }
+  switchTab(TAB_TEXT[saved] ? saved : "overview");
+}
+
+// ── 置顶（群号 / QQ 号排在最前，可任意多个）──────────────────────────
+
+function isPinned(sessionId) {
+  return pinnedIds.includes(sessionId);
+}
+
+async function togglePin(sessionId) {
+  const next = !isPinned(sessionId);
+  const ok = await manageWithMessage(
+    { action: "set_pin", session_id: sessionId, pinned: next },
+    next ? "已置顶，排在列表最前" : "已取消置顶",
+  );
+  // 顺序与分页都在服务端算，置顶后必须重拉，否则当前页里看不到刚置顶的那条
+  if (ok) await load();
+}
+
 // ── 加载 ────────────────────────────────────────────────────────────
 
 async function load() {
@@ -108,7 +167,8 @@ async function load() {
     }));
     view.page = data.page || 1;
     lastStatus = data;
-    $("version").textContent = `v${data.version || "?"} · 从群聊里学习说话风格，低频提炼、按语境注入`;
+    pinnedIds = data.pinned_ids || [];
+    $("version").textContent = `v${data.version || "?"} · 从群聊里增量积累说话风格，按语境零网络注入`;
     renderStats(data.stats || {}, data.manager || {});
     renderUsage(data);
     renderSettings(data.settings || {});
@@ -117,9 +177,199 @@ async function load() {
     renderPager(data);
     // 预览会话下拉刚填好，「本群今日搜索」要按它重算
     renderUsageSearch(data);
+    await loadTraits();
   } catch (err) {
     console.error("加载状态失败:", err);
     showToast("加载失败，请查看日志");
+  }
+}
+
+// ── 学习库（1.4.0 累积链路）──────────────────────────────────────────
+
+let traitGroups = [];
+// 用户手动折叠 / 展开过的分组。记下来是因为默认只展开「有待审」的组，
+// 十几个群全展开等于没分组，但用户主动点开的那个不该被每次刷新收回去。
+const traitGroupState = new Map();
+
+const TRAIT_STATUS_TEXT = {
+  pending: "待审",
+  active: "已生效",
+  archived: "已归档",
+  rejected: "已否决",
+};
+
+async function loadTraits() {
+  try {
+    const data = unwrap(await Bridge.apiGet("traits", { status: view.traitStatus || "" }));
+    traitGroups = data.groups || [];
+    const stats = data.stats || {};
+    const items = [
+      ["待审", data.pending_total ?? 0],
+      ["生效", stats.active ?? 0],
+      ["归档", stats.archived ?? 0],
+      ["否决", stats.rejected ?? 0],
+      ["手动记忆", stats.manual ?? 0],
+    ];
+    const box = $("traitStats");
+    if (box) {
+      box.innerHTML = items
+        .map(([k, v]) => `<div class="stat"><span>${esc(k)}</span><b>${esc(v)}</b></div>`)
+        .join("");
+    }
+    // 侧栏角标：有待审时提示，不切过去也知道有事要做
+    const pending = Number(data.pending_total ?? 0);
+    const badge = $("navPending");
+    if (badge) {
+      badge.hidden = !pending;
+      badge.textContent = pending > 99 ? "99+" : String(pending);
+    }
+    renderTraits(traitGroups);
+  } catch (err) {
+    console.error("加载学习库失败:", err);
+  }
+}
+
+// 学习库按会话分组：同一个群 / 私聊的条目聚在一起，置顶的排最前。
+// 分组本身始终渲染（哪怕当前筛选下为空），否则切状态时整组会「消失」，
+// 用户容易以为数据被删了。
+function renderTraits(groups) {
+  const box = $("traits");
+  if (!box) return;
+  const query = (view.traitQuery || "").trim().toLowerCase();
+
+  const visible = groups
+    .map((g) => {
+      // 搜群号 / 群名命中时整组原样保留：搜群号的人想看这个群里的全部内容，
+      // 而不是一个标题留下、条目被内容过滤清空的空壳。
+      const bySession = query && `${g.session_id} ${g.display_name}`.toLowerCase().includes(query);
+      return { ...g, traits: bySession ? g.traits || [] : filterTraits(g, query), bySession };
+    })
+    .filter((g) => !query || g.traits.length || g.bySession);
+
+  const allBtn = $("approveAllBtn");
+  if (allBtn) {
+    const hasPending = visible.some((g) => (g.counts && g.counts.pending) > 0);
+    allBtn.style.display = hasPending ? "" : "none";
+  }
+
+  // 搜索时给个命中数，否则「怎么只剩这几个群」会让人以为数据丢了
+  const note = $("traitSearchNote");
+  if (note) {
+    if (query) {
+      const hits = visible.filter((g) => g.traits.length).length;
+      note.hidden = false;
+      note.textContent = `搜索「${view.traitQuery.trim()}」：命中 ${hits} 个群 / 共 ${groups.length} 个群，命中群里的条目已全部展开。`;
+    } else {
+      note.hidden = true;
+    }
+  }
+
+  if (!visible.length) {
+    box.innerHTML = `<p class="hint">${
+      groups.length ? "没有匹配的条目。" : "还没有学到任何内容，先在群里聊几句。"
+    }</p>`;
+    return;
+  }
+  box.innerHTML = visible.map(groupCard).join("");
+}
+
+function filterTraits(group, query) {
+  const traits = group.traits || [];
+  if (!query) return traits;
+  return traits.filter((t) =>
+    [t.content, t.context, ...(t.triggers || []), ...(t.alias || [])]
+      .join(" ")
+      .toLowerCase()
+      .includes(query),
+  );
+}
+
+function groupOpen(group) {
+  // 搜索时全部展开：收着的话搜到了也看不见，等于没搜
+  if (view.traitQuery) return true;
+  if (traitGroupState.has(group.session_id)) return traitGroupState.get(group.session_id);
+  // 默认只展开有待审条目的组
+  return (group.counts && group.counts.pending) > 0 && (group.traits || []).length > 0;
+}
+
+function groupCard(group) {
+  const sid = escAttr(group.session_id);
+  const counts = group.counts || {};
+  const traits = group.traits || [];
+  const tags = [];
+  if (counts.pending) tags.push(`<span class="group-tag pending">待审 ${esc(counts.pending)}</span>`);
+  if (group.manual) tags.push(`<span class="group-count">手动 ${esc(group.manual)}</span>`);
+  const body = traits.length
+    ? `<div class="trait-body">${traits.map(traitItem).join("")}</div>`
+    : '<div class="trait-body"><p class="hint">这个筛选下没有条目。</p></div>';
+  return `<details class="trait-group" data-gsid="${sid}"${groupOpen(group) ? " open" : ""}>
+    <summary>
+      <b>${group.pinned ? "📌 " : ""}${esc(group.display_name)}</b>
+      <span class="group-count">${esc(traits.length)} / ${esc(group.total ?? traits.length)} 条</span>
+      ${tags.join("")}
+      <button type="button" class="pin-btn${group.pinned ? " on" : ""}" data-pact="pin" data-sid="${sid}">${
+        group.pinned ? "已置顶" : "置顶"
+      }</button>
+    </summary>
+    ${body}
+  </details>`;
+}
+
+function traitItem(t) {
+  const status = t.status || "active";
+  const sid = escAttr(t.session_id || "");
+  const content = escAttr(t.content || "");
+  const situation = t.context ? `当${esc(t.context)}时` : "任何场合都成立";
+  const alias = (t.alias || []).length
+    ? `<div class="trait-alias">同义说法：${(t.alias || []).map((x) => esc(x)).join(" / ")}</div>`
+    : "";
+  const evidence = (t.evidence || []).map((e) => esc(e.text || "")).filter(Boolean);
+  const evidenceHtml = evidence.length
+    ? `<details class="trait-evidence"><summary>证据 ${evidence.length} 条</summary><ul>${evidence
+        .map((x) => `<li>${x}</li>`)
+        .join("")}</ul></details>`
+    : `<span class="hint">暂无原文证据</span>`;
+  const btns = [];
+  if (status === "pending") {
+    btns.push(`<button class="ghost" data-tact="approve" data-sid="${sid}" data-content="${content}">批准</button>`);
+    btns.push(`<button class="ghost danger" data-tact="reject" data-sid="${sid}" data-content="${content}">否决</button>`);
+  } else if (status === "active") {
+    btns.push(
+      `<button class="ghost" data-tact="${t.pinned ? "unpin" : "pin"}" data-sid="${sid}" data-content="${content}">${t.pinned ? "取消钉住" : "钉住"}</button>`,
+    );
+    btns.push(`<button class="ghost danger" data-tact="reject" data-sid="${sid}" data-content="${content}">否决</button>`);
+  } else {
+    btns.push(`<button class="ghost" data-tact="restore" data-sid="${sid}" data-content="${content}">恢复</button>`);
+  }
+  return `<div class="trait-row">
+    <div class="trait-head">
+      <span class="trait-status st-${esc(status)}">${esc(TRAIT_STATUS_TEXT[status] || status)}</span>
+      <span class="trait-situation">${situation}</span>
+      ${t.pinned ? '<span class="trait-pin">钉住</span>' : ""}
+      <span class="trait-weight">权重 ${esc(t.proficiency ?? 0)}<small>有效 ${esc(t.effective_score ?? 0)}</small></span>
+    </div>
+    <div class="trait-style">${esc(t.content || "")}</div>
+    <div class="trait-meta">命中 ${esc(t.seen ?? 1)} 次${t.modified_by === "manual" ? " · 人工调整过" : ""}</div>
+    ${alias}
+    ${evidenceHtml}
+    <div class="trait-btns">${btns.join("")}</div>
+  </div>`;
+}
+
+async function reviewTrait(action, sessionId, content) {
+  try {
+    const payload = unwrap(
+      await Bridge.apiPost("review", { action, session_id: sessionId, content }),
+    );
+    if (payload && payload.success === false) {
+      showToast(payload.message || "操作失败");
+      return;
+    }
+    showToast(payload.message || "已更新");
+    await loadTraits();
+  } catch (err) {
+    console.error("审核失败:", err);
+    showToast("操作失败，请查看日志");
   }
 }
 
@@ -192,7 +442,78 @@ function renderUsage(data) {
     .map(([k, v]) => `<div class="stat"><span>${esc(k)} token</span><b>${esc(v)}</b></div>`)
     .join("");
 
+  renderHours(usage);
   renderBars(usage.days || []);
+}
+
+// ── 今日 24 小时分布 ─────────────────────────────────────────────────
+//
+// 仿 DeepSeek 用量页的形态：左侧金额刻度、中间 24 根柱子、底部时间轴。
+// 柱子按最大值归一化，所以「今天只有一笔」时那根柱子也是满高——看的是分布
+// 形状而不是绝对值，绝对值在上面「今日金额」里已经有了。
+
+let hourMetric = "cost";
+
+function renderHours(usage) {
+  const box = $("hourChart");
+  if (!box) return;
+  const hours = usage.hours || [];
+  const note = $("hourNote");
+  if (!hours.length) {
+    box.innerHTML = "";
+    if (note) note.textContent = "还没有小时级数据。这个版本的插件开始记录后，每小时的分布会出现在这里。";
+    return;
+  }
+
+  const byCalls = hourMetric === "calls";
+  const values = hours.map((h) => (byCalls ? Number(h.calls) || 0 : Number(h.cost) || 0));
+  const max = Math.max(...values, byCalls ? 1 : 0.0001);
+  const nowHour = Number(usage.current_hour ?? -1);
+  const total = values.reduce((a, b) => a + b, 0);
+
+  const ticks = byCalls
+    ? [Math.round(max), Math.round(max / 2), 0].map((v) => String(v))
+    : [max, max / 2, 0].map((v) => `¥${fmtMoney(v)}`);
+
+  const bars = hours
+    .map((h, i) => {
+      const value = values[i];
+      const height = value > 0 ? Math.max(3, Math.round((value / max) * 100)) : 0;
+      const tip = byCalls
+        ? `${h.label} · ${h.calls} 次调用${h.search_calls ? ` · ${h.search_calls} 次搜索` : ""}`
+        : `${h.label} · ¥${fmtMoney(h.cost)} · ${h.calls} 次调用`;
+      const classes = ["hbar"];
+      if (i === nowHour) classes.push("now");
+      return `<div class="${classes.join(" ")}">
+        <span class="hbar-tip">${esc(tip)}</span>
+        <div class="hbar-col"><i style="height:${height}%"></i></div>
+      </div>`;
+    })
+    .join("");
+
+  // 只标 5 个时间点：24 个标签会糊成一片
+  const axis = [0, 6, 12, 18, 23]
+    .map((hour) => {
+      const left = (hour / 23) * 100;
+      const shift = hour === 0 ? "0" : hour === 23 ? "-100%" : "-50%";
+      return `<span style="left:${left}%;transform:translateX(${shift})">${hours[hour].label}</span>`;
+    })
+    .join("");
+
+  box.innerHTML = `
+    <div class="hour-yaxis">${ticks.map((t) => `<span>${esc(t)}</span>`).join("")}</div>
+    <div class="hour-body">
+      <div class="hour-grid"><i></i><i></i><i></i></div>
+      <div class="hour-bars">${bars}</div>
+    </div>
+    <div class="hour-xaxis">${axis}</div>`;
+
+  if (note) {
+    const peak = hours.reduce((best, h) => (Number(h[byCalls ? "calls" : "cost"]) > Number(best[byCalls ? "calls" : "cost"]) ? h : best), hours[0]);
+    note.textContent = total > 0
+      ? `峰值在 ${peak.label}（${byCalls ? `${peak.calls} 次` : `¥${fmtMoney(peak.cost)}`}），当前 ${String(nowHour).padStart(2, "0")}:00 这一小时已统计在内。`
+      : "今天还没有产生调用。";
+  }
 }
 
 // 近 7 天柱状图：纯 div 按最大值归一化，悬停看当天金额
@@ -685,8 +1006,11 @@ function sessionCard(s) {
 
   return `<details class="session" data-sid="${sid}"${opened}>
     <summary>
-      <b>${esc(s.display_name)}</b>
+      <b>${s.pinned ? "📌 " : ""}${esc(s.display_name)}</b>
       <span>学习 ${learnedCount} · 手动 ${manual.length} · 待学习 ${s.history_count ?? 0}</span>
+      <button type="button" class="pin-btn${s.pinned ? " on" : ""}" data-act="pin" data-sid="${sid}">${
+        s.pinned ? "已置顶" : "置顶"
+      }</button>
     </summary>
     <div class="body">
       <p class="hint">${esc(stateLine)}<br>${esc(quota)}</p>
@@ -752,18 +1076,247 @@ function traitRow(s, trait, kind) {
   </li>`;
 }
 
+// ── 预览会话选择器（可输入群号 / QQ 号搜索）──────────────────────────
+//
+// 原生 select 在两三个群时够用，几十个群就只能一行行翻。这里换成
+// 「输入框 + 下拉列表」：键入群号、QQ 号或「群」字都能过滤，置顶的排在前面。
+
+let previewOptions = [];   // [{ id, label, pinned }]
+let previewSelectedId = "";
+
+function previewDisplayText() {
+  const current = previewOptions.find((o) => o.id === previewSelectedId);
+  return current ? `${current.pinned ? "📌 " : ""}${current.label}` : "";
+}
+
+function syncPreviewInput() {
+  $("previewSessionInput").value = previewDisplayText();
+  // 其余逻辑（预览、今日搜索次数）都还读这个隐藏值，保持一致
+  $("previewSession").value = previewSelectedId || "";
+}
+
 function fillPreviewSessions(data) {
-  const select = $("previewSession");
-  const current = select.value;
   const ids = data.known_ids || [];
-  if (!ids.length) {
-    select.innerHTML = '<option value="">（还没有任何会话）</option>';
+  const pinned = data.pinned_ids || pinnedIds;
+  const rank = new Map(pinned.map((id, i) => [id, i]));
+  previewOptions = [...ids]
+    .sort((a, b) => (rank.get(a) ?? 1e6) - (rank.get(b) ?? 1e6))
+    .map((id) => ({ id, label: nameOf(id), pinned: rank.has(id) }));
+
+  // 刷新后要保住当前选中；那个会话没了就退回第一个
+  if (!previewOptions.some((o) => o.id === previewSelectedId)) {
+    previewSelectedId = previewOptions.length ? previewOptions[0].id : "";
+  }
+  syncPreviewInput();
+  $("previewSessionInput").placeholder = previewOptions.length
+    ? "输入群号 / QQ 号搜索会话"
+    : "（还没有任何会话）";
+}
+
+function openPreviewMenu() {
+  const menu = $("previewMenu");
+  const typed = $("previewSessionInput").value.trim().toLowerCase();
+  // 输入框里平时就写着选中项的名字，直接拿它当关键词会把列表过滤成一条，
+  // 所以只有用户真的改了内容才当搜索词
+  const keyword = typed && typed !== previewDisplayText().toLowerCase() ? typed : "";
+  const hits = previewOptions.filter(
+    (o) => !keyword || `${o.id} ${o.label}`.toLowerCase().includes(keyword),
+  );
+
+  menu.innerHTML = hits.length
+    ? hits
+        .slice(0, 200)
+        .map(
+          (o) => `<button type="button" class="picker-item${o.id === previewSelectedId ? " on" : ""}" data-id="${escAttr(o.id)}">
+            <span>${o.pinned ? "📌 " : ""}${esc(o.label)}</span>
+            <small>${esc(o.id)}</small>
+          </button>`,
+        )
+        .join("")
+    : '<p class="hint picker-empty">没有匹配的会话</p>';
+  menu.hidden = false;
+}
+
+function closePreviewMenu() {
+  $("previewMenu").hidden = true;
+  // 关掉时把输入框还原成选中项的名字，避免留下半截搜索词
+  syncPreviewInput();
+}
+
+function selectPreview(id) {
+  previewSelectedId = id;
+  $("previewMenu").hidden = true;
+  syncPreviewInput();
+  if (lastStatus) renderUsageSearch(lastStatus);
+}
+
+// ── 人格档案（按群生成的文件，自动段 + 人工段）──────────────────────
+
+let personaList = [];        // 概览：[{session_id, display_name, pinned, exists, updated_at, ...}]
+let personaCurrent = "";     // 当前查看的会话
+let personaLoaded = false;
+let personaFull = "";        // 当前文件的完整内容，用于复制/下载
+
+async function ensurePersona(force) {
+  if (personaLoaded && !force) return;
+  await loadPersonaList();
+}
+
+async function loadPersonaList() {
+  try {
+    const data = unwrap(await Bridge.apiGet("persona", {}));
+    personaList = data.sessions || [];
+    personaLoaded = true;
+    renderPersonaList();
+    // 首次进来默认打开第一个群，省一次点击
+    if (!personaCurrent || !personaList.some((s) => s.session_id === personaCurrent)) {
+      const first = personaList[0];
+      if (first) await openPersona(first.session_id);
+      else renderPersonaEmpty();
+    }
+  } catch (err) {
+    console.error("加载人格档案列表失败:", err);
+    showToast("加载人格档案失败");
+  }
+}
+
+function renderPersonaList() {
+  const box = $("personaList");
+  if (!box) return;
+  const query = (view.personaQuery || "").trim().toLowerCase();
+  const rows = personaList.filter(
+    (s) => !query || `${s.session_id} ${s.display_name}`.toLowerCase().includes(query),
+  );
+  if (!rows.length) {
+    box.innerHTML = `<p class="hint">${personaList.length ? "没有匹配的会话。" : "还没有学到东西，先在群里聊几句。"}</p>`;
     return;
   }
-  select.innerHTML = ids
-    .map((id) => `<option value="${escAttr(id)}">${esc(nameOf(id))}</option>`)
+  box.innerHTML = rows
+    .map((s) => {
+      const on = s.session_id === personaCurrent ? " on" : "";
+      const state = s.exists ? "已生成" : "未生成";
+      return `<div class="persona-item${on}" data-sid="${escAttr(s.session_id)}">
+        <span class="pi-name">${s.pinned ? "📌 " : ""}${esc(s.display_name)}</span>
+        <span class="pi-meta">${esc(s.trait_active ?? 0)}/${esc(s.trait_total ?? 0)} 条生效 · ${state}</span>
+        <button type="button" class="pin-btn${s.pinned ? " on" : ""}" data-pact="pin" data-sid="${escAttr(s.session_id)}">${
+          s.pinned ? "已置顶" : "置顶"
+        }</button>
+      </div>`;
+    })
     .join("");
-  if (current && ids.includes(current)) select.value = current;
+}
+
+function renderPersonaEmpty() {
+  $("personaHead").innerHTML = '<p class="hint">还没有任何群的学习数据，人格档案会在学习出内容后自动生成。</p>';
+  $("personaAuto").textContent = "";
+  $("personaManual").value = "";
+  $("personaPath").textContent = "";
+  personaFull = "";
+}
+
+async function openPersona(sessionId) {
+  personaCurrent = sessionId;
+  renderPersonaList();
+  try {
+    const data = unwrap(await Bridge.apiGet("persona", { session_id: sessionId }));
+    if (data && data.success === false) {
+      showToast(data.message || "读取失败");
+      return;
+    }
+    personaFull = data.full || "";
+    const updated = data.updated_at ? fmtTime(data.updated_at) : "尚未生成";
+    $("personaHead").innerHTML = `
+      <b>${esc(data.display_name || nameOf(sessionId))}</b>
+      <span class="hint">${esc(data.trait_active ?? 0)} 条生效特征 · 最后更新 ${esc(updated)}</span>`;
+    $("personaAuto").textContent = data.auto || "（自动段还是空的：这个群还没有通过审核的特征）";
+    $("personaManual").value = data.manual || "";
+    $("personaPath").textContent = data.path ? `文件：${data.path}` : "";
+    // 列表里的「已生成 / 未生成」要靠这次访问刷新
+    const row = personaList.find((s) => s.session_id === sessionId);
+    if (row && !row.exists) {
+      row.exists = true;
+      renderPersonaList();
+    }
+  } catch (err) {
+    console.error("读取人格档案失败:", err);
+    showToast("读取人格档案失败");
+  }
+}
+
+async function savePersona() {
+  if (!personaCurrent) {
+    showToast("先选一个群");
+    return;
+  }
+  const manual = $("personaManual").value;
+  const payload = unwrap(
+    await Bridge.apiPost("manage", {
+      action: "save_persona",
+      session_id: personaCurrent,
+      manual,
+    }),
+  );
+  if (payload && payload.success === false) {
+    showToast(payload.message || "保存失败");
+    return;
+  }
+  showToast("人工补充已保存");
+  // 重新读一次，头部时间戳与全文同步刷新
+  await openPersona(personaCurrent);
+}
+
+async function rebuildPersona(scope) {
+  const label = scope === "all" ? "全部群" : "当前群";
+  if (scope === "all" && !(await askConfirm("按学习库里已生效的特征，重新生成所有人格档案？人工补充的内容不受影响。"))) return;
+  const payload = unwrap(
+    await Bridge.apiPost("manage", {
+      action: "rebuild_persona",
+      session_id: scope === "all" ? "" : personaCurrent,
+    }),
+  );
+  if (payload && payload.success === false) {
+    showToast(payload.message || "生成失败");
+    return;
+  }
+  showToast(`${label}已重新生成`);
+  await loadPersonaList();
+  if (scope !== "all" && personaCurrent) await openPersona(personaCurrent);
+}
+
+async function copyPersona() {
+  if (!personaFull) {
+    showToast("还没有可复制的内容");
+    return;
+  }
+  try {
+    await navigator.clipboard.writeText(personaFull);
+    showToast("已复制全文");
+  } catch (err) {
+    // iframe 里没有剪贴板权限时降级成「选中文本」
+    const area = document.createElement("textarea");
+    area.value = personaFull;
+    document.body.appendChild(area);
+    area.select();
+    document.execCommand("copy");
+    area.remove();
+    showToast("已复制全文");
+  }
+}
+
+function downloadPersona() {
+  if (!personaFull) {
+    showToast("还没有可下载的内容");
+    return;
+  }
+  const blob = new Blob([personaFull], { type: "text/markdown;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `${String(personaCurrent || "persona").replace(/[^0-9A-Za-z_-]+/g, "_")}.md`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
 // ── 操作 ────────────────────────────────────────────────────────────
@@ -1047,14 +1600,61 @@ async function submitNewSession() {
 // ── 启动 ────────────────────────────────────────────────────────────
 
 Bridge.ready().then(() => {
+  restoreTab();
+  $("nav").addEventListener("click", (e) => {
+    const btn = e.target.closest(".nav-item");
+    if (btn) switchTab(btn.dataset.tab);
+  });
   $("refresh").addEventListener("click", load);
   $("importBtn").addEventListener("click", importBackup);
   $("exportBtn").addEventListener("click", exportData);
   $("newSessionBtn").addEventListener("click", openNewSession);
   $("previewBtn").addEventListener("click", preview);
-  $("previewSession").addEventListener("change", () => {
-    if (lastStatus) renderUsageSearch(lastStatus);
-  });
+  // 预览会话选择器：输入群号即过滤，回车选第一条，Esc 取消
+  const previewInput = $("previewSessionInput");
+  const previewMenu = $("previewMenu");
+  if (previewInput && previewMenu) {
+    previewInput.addEventListener("focus", openPreviewMenu);
+    previewInput.addEventListener("input", openPreviewMenu);
+    previewInput.addEventListener("keydown", (e) => {
+      if (e.key === "Escape") {
+        closePreviewMenu();
+        previewInput.blur();
+      } else if (e.key === "Enter") {
+        const first = previewMenu.querySelector(".picker-item");
+        if (first) {
+          e.preventDefault();
+          selectPreview(first.dataset.id);
+        }
+      }
+    });
+    // 用 mousedown 而不是 click：click 之前 input 会先失焦，菜单已经关掉了
+    previewMenu.addEventListener("mousedown", (e) => {
+      const item = e.target.closest(".picker-item");
+      if (!item) return;
+      e.preventDefault();
+      selectPreview(item.dataset.id);
+    });
+    previewInput.addEventListener("blur", () => {
+      setTimeout(() => {
+        if (!previewMenu.hidden) closePreviewMenu();
+      }, 120);
+    });
+  }
+  // 24 小时图切「金额 / 次数」：只换这一张图，不重新请求
+  const hourSeg = $("hourMetric");
+  if (hourSeg) {
+    hourSeg.addEventListener("click", (e) => {
+      const btn = e.target.closest("button[data-metric]");
+      if (!btn) return;
+      hourMetric = btn.dataset.metric === "calls" ? "calls" : "cost";
+      [...hourSeg.querySelectorAll("button")].forEach((b) => {
+        b.classList.toggle("on", b === btn);
+      });
+      if (lastStatus) renderHours(lastStatus.usage || {});
+    });
+  }
+
   // 预览档位：被动 / 主动，主动插话用的强度是另一档
   $("previewMode").addEventListener("click", (e) => {
     const btn = e.target.closest("button[data-active]");
@@ -1183,6 +1783,11 @@ Bridge.ready().then(() => {
     e.stopPropagation();
     const act = btn.dataset.act;
     const sid = btn.dataset.sid;
+    if (act === "pin") {
+      // 按钮在 <summary> 里，不拦默认行为会把会话卡片一起折叠
+      e.preventDefault();
+      return togglePin(sid);
+    }
     if (act === "learn") return learn(sid);
     if (act === "add_trait") return openAdd(sid);
     if (act === "clear_history") {
@@ -1228,6 +1833,98 @@ Bridge.ready().then(() => {
     const edit = row && row.querySelector('[data-act="edit_trait"]');
     if (edit) edit.click();
   });
+
+  // 学习库：分组置顶 / 条目审核 / 记住分组的折叠状态
+  // 逐个判空：浏览器缓存了旧版 index.html 时，绑定到不存在的节点会让整个面板初始化中断。
+  const traitsBox = $("traits");
+  if (traitsBox) {
+    traitsBox.addEventListener("click", async (e) => {
+      // 置顶按钮在 <summary> 里，不 preventDefault 会把整个分组一起折叠
+      const pin = e.target.closest("[data-pact='pin']");
+      if (pin) {
+        e.preventDefault();
+        e.stopPropagation();
+        await togglePin(pin.dataset.sid);
+        return;
+      }
+      const btn = e.target.closest("[data-tact]");
+      if (btn) {
+        await reviewTrait(btn.dataset.tact, btn.dataset.sid, btn.dataset.content);
+        return;
+      }
+      // 点 summary 时 details.open 还是旧值，取反就是切换后的状态
+      const summary = e.target.closest(".trait-group > summary");
+      if (summary) {
+        const group = summary.parentElement;
+        traitGroupState.set(group.dataset.gsid, !group.open);
+      }
+    });
+  }
+
+  const traitSearch = $("traitSearch");
+  if (traitSearch) {
+    traitSearch.addEventListener("input", (e) => {
+      // 纯本地过滤：学习库一次最多几百条，没必要为搜索再跑一趟服务端
+      view.traitQuery = e.target.value;
+      renderTraits(traitGroups);
+    });
+  }
+
+  const traitStatusSelect = $("traitStatus");
+  if (traitStatusSelect) {
+    traitStatusSelect.addEventListener("change", async (e) => {
+      view.traitStatus = e.target.value || "";
+      await loadTraits();
+    });
+  }
+
+  const approveAllBtn = $("approveAllBtn");
+  if (approveAllBtn) {
+    approveAllBtn.addEventListener("click", async () => {
+      if (!(await askConfirm("把当前所有待审条目一次性批准为生效？"))) return;
+      await reviewTrait("approve_all", "", "");
+    });
+  }
+
+  // 人格档案：搜索 / 选中 / 置顶 / 保存 / 重新生成
+  const personaSearch = $("personaSearch");
+  if (personaSearch) {
+    personaSearch.addEventListener("input", (e) => {
+      view.personaQuery = e.target.value;
+      renderPersonaList();
+    });
+  }
+
+  const personaBox = $("personaList");
+  if (personaBox) {
+    personaBox.addEventListener("click", async (e) => {
+      const pin = e.target.closest("[data-pact='pin']");
+      if (pin) {
+        e.stopPropagation();
+        await togglePin(pin.dataset.sid);
+        personaLoaded = false;
+        await ensurePersona(true);
+        return;
+      }
+      const item = e.target.closest(".persona-item");
+      if (item && item.dataset.sid !== personaCurrent) await openPersona(item.dataset.sid);
+    });
+  }
+
+  const savePersonaBtn = $("savePersona");
+  if (savePersonaBtn) savePersonaBtn.addEventListener("click", savePersona);
+
+  const rebuildBtn = $("rebuildPersona");
+  if (rebuildBtn) rebuildBtn.addEventListener("click", () => rebuildPersona("one"));
+
+  const rebuildAllBtn = $("rebuildAllPersona");
+  if (rebuildAllBtn) rebuildAllBtn.addEventListener("click", () => rebuildPersona("all"));
+
+  const copyBtn = $("copyPersona");
+  if (copyBtn) copyBtn.addEventListener("click", copyPersona);
+
+  const downloadBtn = $("downloadPersona");
+  if (downloadBtn) downloadBtn.addEventListener("click", downloadPersona);
 
   // 会话级开关：学习 / 注入 / 主动回复 / 联网搜索三态
   $("sessions").addEventListener("change", async (e) => {

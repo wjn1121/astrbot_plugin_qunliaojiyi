@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -36,6 +37,40 @@ CATEGORY_SITUATIONAL = "situational"
 SOURCE_LEARNED = "learned"
 SOURCE_MANUAL = "manual"
 
+# ── 特征生命周期（1.4.0）────────────────────────────────────────────────
+STATUS_PENDING = "pending"
+STATUS_ACTIVE = "active"
+STATUS_ARCHIVED = "archived"
+STATUS_REJECTED = "rejected"
+ALL_STATUSES = (STATUS_PENDING, STATUS_ACTIVE, STATUS_ARCHIVED, STATUS_REJECTED)
+
+MODIFIED_AI = "ai"
+MODIFIED_MANUAL = "manual"
+
+# 新条目入库时的原始权重。攒到 ACTIVATE_PROFICIENCY 才进注入，
+# 也就是「至少被两个不同轮次观察到」——一次性玩梗升不上来。
+NEW_TRAIT_PROFICIENCY = 10
+ACTIVATE_PROFICIENCY = 20
+INJECT_MIN_PROFICIENCY = 20
+# 每次被确认的增益，按「这条出现在多少个不同日期」递减：
+# 同一天被刷屏提十次也顶不上去，跨天反复出现的才是真风格。
+GAIN_BY_DAYS = (10, 5, 2)
+
+# 时效折扣：不改存储值，排序时按距上次出现的天数打折。
+# 好处是不需要后台定期跑衰减任务，也不会因为学习频率变化而改变衰减速度；
+# 一旦重新被观察到，last_seen 刷新，权重自动「复活」。
+FRESHNESS_DAYS = 30
+FRESHNESS_FLOOR = 0.08
+ARCHIVE_SCORE = 5.0
+
+# 合并阈值：二元组相似度。「短句碎发一条一发连刷，极少合并成长段」与
+# 「短句碎发一条一发，极少合并长段」≈0.61，「互怼调侃随意不破防」与「互怼调侃不破防」≈0.60，
+# 都能合并；不相关的两条风格通常 <0.2。
+MERGE_SIMILARITY = 0.55
+DIFF_JACCARD_WEIGHT = 0.85
+EVIDENCE_KEEP = 5
+ALIAS_KEEP = 8
+
 # 手动添加的硬性边界：面板会校验，这里再拦一道，防止外部接口绕过
 MANUAL_CONTENT_MAX = 100
 MANUAL_TRIGGER_MAX = 3
@@ -49,6 +84,68 @@ DEFAULT_MANUAL_PROFICIENCY = 60
 # set_override 需要区分「调用方没传这个参数」和「显式传了 None」：
 # search 是 三态开关，None 本身有含义（跟随全局），不能像 learn/inject 那样用它当缺省。
 _UNSET = object()
+
+_PUNCT_CHARS = " \t\r\n，。、！？；：“”‘’（）《》【】,.!?;:'\"()[]{}~`…-—"
+_PUNCT_RE = re.compile("[" + re.escape(_PUNCT_CHARS) + "]+")
+
+
+def normalize_text(text: Any) -> str:
+    """去掉标点、空白与大小写差异，只留内容用于比较。"""
+    return _PUNCT_RE.sub("", str(text or "")).lower()
+
+
+def _bigrams(text: str) -> set[str]:
+    """字符二元组集合。中文不需要分词，二元组足够判断「是不是在说同一件事」。"""
+    raw = normalize_text(text)
+    if not raw:
+        return set()
+    if len(raw) == 1:
+        return {raw}
+    return {raw[i : i + 2] for i in range(len(raw) - 1)}
+
+
+def text_similarity(a: Any, b: Any) -> float:
+    """两条文本的相似度（0~1）。
+
+    单纯用 Jaccard 会漏掉「一句是另一句的压缩/改写」的情况，所以同时算重叠系数
+    （交集 / 较短那条的大小），再按 0.85 折算后取较大值——重叠系数不折算的话，
+    短文本会把长文本吞掉。
+    """
+    sa, sb = _bigrams(str(a or "")), _bigrams(str(b or ""))
+    if not sa or not sb:
+        return 0.0
+    inter = len(sa & sb)
+    jaccard = inter / len(sa | sb)
+    overlap = inter / min(len(sa), len(sb))
+    return max(jaccard, overlap * DIFF_JACCARD_WEIGHT)
+
+
+def _day_of(ts: Any) -> str:
+    try:
+        return time.strftime("%Y-%m-%d", time.localtime(float(ts)))
+    except (TypeError, ValueError, OSError):
+        return ""
+
+
+def trait_score(trait: dict, now: float | None = None) -> float:
+    """特征当前的**有效权重**：原始权重按距上次出现的天数打折。
+
+    刚出现过的条目几乎不打折，越久越淡，30 天见底。
+    钉住的条目不打折（人工指定优先）。
+    """
+    base = float(trait.get("proficiency", 0) or 0)
+    if trait.get("pinned"):
+        return base
+    last = float(trait.get("last_seen", 0) or 0)
+    if last <= 0:
+        return base
+    days = max(0.0, ((now or time.time()) - last) / 86400.0)
+    if days <= 0:
+        return base
+    ratio = min(days, FRESHNESS_DAYS) / FRESHNESS_DAYS
+    factor = 1.0 - ratio * ratio * (1.0 - FRESHNESS_FLOOR)
+    return base * max(FRESHNESS_FLOOR, factor)
+
 
 
 class Storage:
@@ -69,6 +166,10 @@ class Storage:
         # 主动回复状态：{"bot1:GroupMessage:123": {...}}，结构由 active.py 定义，
         # 这里只负责存取，不解释内容
         self.active: dict[str, dict] = self._load("active.json")
+        # 面板置顶：{"sessions": ["bot1:GroupMessage:123", ...]}，纯展示顺序偏好。
+        # 单独一个文件而不是塞进 overrides，因为置顶不影响学习/注入行为，
+        # 混进去会让「恢复默认」把用户排好的顺序一起清掉。
+        self.pins: dict[str, Any] = self._load("pins.json")
 
         self._lock = asyncio.Lock()
         self._version = 0
@@ -80,6 +181,7 @@ class Storage:
             "metrics": False,
             "overrides": False,
             "active": False,
+            "pins": False,
         }
         self._save_task: asyncio.Task | None = None
         self._save_delay = 5.0
@@ -136,6 +238,9 @@ class Storage:
             if self._dirty["active"]:
                 await self._write("active.json", self.active)
                 self._dirty["active"] = False
+            if self._dirty["pins"]:
+                await self._write("pins.json", self.pins)
+                self._dirty["pins"] = False
 
     async def _write(self, filename: str, data: dict) -> None:
         try:
@@ -144,6 +249,39 @@ class Storage:
             )
         except OSError as e:
             logger.error(f"[群聊记忆] 保存 {filename} 失败: {e}")
+
+    # ── 面板置顶（pins.json）───────────────────────────────────────────
+    #
+    # 只影响面板里的展示顺序：置顶的会话（群号 / QQ 号）排在列表最前面。
+    # 不进注入、不进学习、不参与排序权重，所以清数据时也不清它。
+
+    def pinned_sessions(self) -> list[str]:
+        """置顶的会话 ID，按用户设定的先后顺序。"""
+        raw = self.pins.get("sessions")
+        if not isinstance(raw, list):
+            return []
+        return [str(x) for x in raw if str(x or "").strip()]
+
+    def is_pinned(self, session_id: str) -> bool:
+        return session_id in self.pinned_sessions()
+
+    async def set_pin(self, session_id: str, pinned: bool) -> bool:
+        """加 / 取消置顶，返回状态是否真的变了。"""
+        session_id = (session_id or "").strip()
+        if not session_id:
+            return False
+        current = self.pinned_sessions()
+        if pinned:
+            if session_id in current:
+                return False
+            current.append(session_id)
+        else:
+            if session_id not in current:
+                return False
+            current = [x for x in current if x != session_id]
+        self.pins["sessions"] = current
+        self._mark("pins")
+        return True
 
     # ── 会话级开关 ──────────────────────────────────────────────────────
 
@@ -248,7 +386,12 @@ class Storage:
         return stable, situational
 
     def split(self, session_id: str, include_manual: bool = True) -> tuple[list[Trait], list[Trait]]:
-        return self._partition(self.traits_of(session_id, include_manual=include_manual))
+        """注入用的特征：只含已生效且权重过线的，按钉住 → 有效权重排序。
+
+        面板要展示「库里的全部条目」请用 learned_split / traits_of，
+        这里刻意只给能进 prompt 的那部分，避免待审和已归档的条目被注入。
+        """
+        return self._partition(self.active_traits_of(session_id, include_manual=include_manual))
 
     def learned_split(self, session_id: str) -> tuple[list[Trait], list[Trait]]:
         """只看学习产出的特征，面板分组展示用。"""
@@ -351,6 +494,330 @@ class Storage:
             self._version += 1
             self._mark("universal")
         return dropped
+
+    # ── 累积链路（1.4.0）───────────────────────────────────────────────
+    #
+    # 旧链路 replace_traits 是「本轮 LLM 输出即整张表」，本轮没提到的旧条目会消失。
+    # 新链路改成 upsert：候选要么合并进已有条目（累加权重），要么作为新条目入库，
+    # 已有条目不会因为「这轮没被提到」而消失，只在权重见底后归档。
+
+    @staticmethod
+    def _match_trait(bucket: list[dict], content: str, context: str) -> dict | None:
+        """在库里找这条候选对应的已有特征，找不到返回 None。
+
+        两级匹配：先比归一化后的完整文本，再用二元组相似度兜措辞漂移。
+        场景标签也要对得上，否则「同一句话在不同场景」会被错误合并。
+        """
+        norm_content = normalize_text(content)
+        norm_context = normalize_text(context)
+        best: tuple[float, dict] | None = None
+        for trait in bucket:
+            if trait.get("status") == STATUS_REJECTED:
+                continue
+            if normalize_text(trait.get("content")) == norm_content and (
+                normalize_text(trait.get("context")) == norm_context
+            ):
+                return trait
+            score = text_similarity(content, trait.get("content"))
+            if score < MERGE_SIMILARITY:
+                continue
+            # 场景也要合得上：都为空，或有一边为空，或彼此相似
+            ctx_score = text_similarity(context, trait.get("context"))
+            if norm_context and normalize_text(trait.get("context")) and ctx_score < MERGE_SIMILARITY:
+                continue
+            if best is None or score > best[0]:
+                best = (score, trait)
+        return best[1] if best else None
+
+    @staticmethod
+    def _norm_evidence(raw: Any, now: float) -> list[dict]:
+        """证据统一成 ``{text, at, sender}``。学习链路给字符串，导入/接口可能给字典。"""
+        out: list[dict] = []
+        items = raw if isinstance(raw, list) else ([raw] if raw else [])
+        for item in items:
+            if isinstance(item, dict):
+                text = str(item.get("text") or "").strip()
+                try:
+                    at = float(item.get("at") or now)
+                except (TypeError, ValueError):
+                    at = now
+                sender = str(item.get("sender") or "")
+            else:
+                text = str(item or "").strip()
+                at, sender = now, ""
+            if text:
+                out.append({"text": text[:120], "at": at, "sender": sender[:24]})
+        return out
+
+    def upsert_traits(
+        self,
+        session_id: str,
+        candidates: list[dict],
+        *,
+        limits: tuple[int, int] | None = None,
+        max_total: int = 300,
+        activate_at: int = ACTIVATE_PROFICIENCY,
+        ladder: tuple[int, ...] = GAIN_BY_DAYS,
+    ) -> dict[str, int]:
+        """把本轮候选合并进库，返回统计。
+
+        候选结构：``{content, context, triggers, dimension, evidence, category}``。
+        合并时**主措辞保持首次入库的写法**，新说法只进 alias —— 这样注入文本不会
+        这周「连刷」下周「连发」，人设描述始终稳定。
+        """
+        now = time.time()
+        bucket = self.universal.setdefault(session_id, [])
+        stats = {"added": 0, "merged": 0, "activated": 0}
+        today = _day_of(now)
+
+        for cand in candidates:
+            content = str(cand.get("content") or "").strip()
+            if not content:
+                continue
+            context = str(cand.get("context") or "").strip()
+            category = (
+                CATEGORY_SITUATIONAL if context else str(cand.get("category") or CATEGORY_STABLE)
+            )
+            if category not in (CATEGORY_STABLE, CATEGORY_SITUATIONAL):
+                category = CATEGORY_STABLE
+            evidence = self._norm_evidence(cand.get("evidence"), now)
+
+            hit = self._match_trait(bucket, content, context)
+            if hit is None:
+                trait: dict[str, Any] = {
+                    "content": content,
+                    "category": category,
+                    "context": context,
+                    "triggers": list(cand.get("triggers") or [])[:3],
+                    "proficiency": NEW_TRAIT_PROFICIENCY,
+                    "confirmed_rounds": 1,
+                    "seen": 1,
+                    "alias": [],
+                    "evidence": list(evidence)[:EVIDENCE_KEEP],
+                    "status": STATUS_PENDING,
+                    "checked_by": "",
+                    "modified_by": MODIFIED_AI,
+                    "pinned": False,
+                    "dimension": str(cand.get("dimension") or "").strip(),
+                    "first_seen": now,
+                    "last_seen": now,
+                    "last_updated": now,
+                }
+                bucket.append(trait)
+                stats["added"] += 1
+                continue
+
+            # 合并：用证据覆盖的日期数决定这次涨多少
+            days = {_day_of(ev.get("at")) for ev in hit.get("evidence") or [] if ev.get("at")}
+            days.add(today)
+            days.discard("")
+            step = ladder[min(max(len(days) - 1, 0), len(ladder) - 1)]
+            hit["proficiency"] = min(100, int(hit.get("proficiency", 0) or 0) + step)
+            hit["confirmed_rounds"] = int(hit.get("confirmed_rounds", 0) or 0) + 1
+            hit["seen"] = int(hit.get("seen", 1) or 1) + 1
+            hit["last_seen"] = now
+            hit["last_updated"] = now
+            if not hit.get("first_seen"):
+                hit["first_seen"] = hit["last_seen"]
+            if content != hit.get("content"):
+                alias = hit.setdefault("alias", [])
+                if content not in alias:
+                    alias.append(content)
+                    del alias[:-ALIAS_KEEP]
+            if evidence:
+                merged_evidence = list(hit.get("evidence") or []) + list(evidence)
+                hit["evidence"] = merged_evidence[-EVIDENCE_KEEP:]
+            if not hit.get("triggers") and cand.get("triggers"):
+                hit["triggers"] = list(cand.get("triggers") or [])[:3]
+            if hit.get("status") == STATUS_PENDING and hit["proficiency"] >= activate_at:
+                hit["status"] = STATUS_ACTIVE
+                stats["activated"] += 1
+            stats["merged"] += 1
+
+        # 存量数据（迁移后 status=active）第一次被新版确认时也补齐结构
+        self._version += 1
+        self._mark("universal")
+        if limits:
+            self.trim_traits(session_id, limits)
+        self.cap_total(session_id, max_total)
+        return stats
+
+    def cap_total(self, session_id: str, max_total: int, *, keep_active: bool = True) -> int:
+        """库里条数超上限时，从有效权重最低的开始归档。返回归档条数。"""
+        if max_total <= 0:
+            return 0
+        bucket = self.universal.get(session_id) or []
+        if len(bucket) <= max_total:
+            return 0
+        now = time.time()
+        # 钉住的排最前（永不淘汰），其余按有效权重降序
+        ordered = sorted(
+            bucket,
+            key=lambda t: (1 if t.get("pinned") else 0, trait_score(t, now)),
+            reverse=True,
+        )
+        keep, drop = ordered[:max_total], ordered[max_total:]
+        if not drop:
+            return 0
+        for trait in drop:
+            trait["status"] = STATUS_ARCHIVED if keep_active else trait.get("status", STATUS_ACTIVE)
+        self.universal[session_id] = keep + drop
+        self._version += 1
+        self._mark("universal")
+        return len(drop)
+
+    def archive_stale(self, session_id: str, *, now: float | None = None) -> int:
+        """把权重见底的生效特征转归档。归档不删数据，面板可恢复。"""
+        bucket = self.universal.get(session_id) or []
+        moved = 0
+        for trait in bucket:
+            if trait.get("status") != STATUS_ACTIVE or trait.get("pinned"):
+                continue
+            if trait_score(trait, now) < ARCHIVE_SCORE:
+                trait["status"] = STATUS_ARCHIVED
+                moved += 1
+        if moved:
+            self._version += 1
+            self._mark("universal")
+        return moved
+
+    def active_traits_of(self, session_id: str, include_manual: bool = True) -> list[Trait]:
+        """参与注入的特征：已生效且有效权重过线，按钉住 → 有效权重排序。"""
+        now = time.time()
+        # 留 0.5 的容差：权重刚好等于门槛的条目，几小时的时效折扣就会算出
+        # 19.9998 这种数，不该因为浮点噪声把它判出局。
+        threshold = INJECT_MIN_PROFICIENCY - 0.5
+        learned = [
+            t
+            for t in self.universal.get(session_id, [])
+            if t.get("status", STATUS_ACTIVE) == STATUS_ACTIVE
+            and trait_score(t, now) >= threshold
+        ]
+        learned.sort(key=lambda t: (1 if t.get("pinned") else 0, trait_score(t, now)), reverse=True)
+        if not include_manual:
+            return learned
+        manual = self.manual.get(session_id) or []
+        # 手动记忆不看时效，人工指定的一直有效
+        return learned + [{**t, "source": SOURCE_MANUAL} for t in manual]
+
+    def set_trait_status(
+        self,
+        session_id: str,
+        content: str,
+        status: str,
+        *,
+        source: str | None = SOURCE_LEARNED,
+    ) -> bool:
+        """人工审核：批准 / 否决 / 归档 / 恢复。改过之后自动自检不再覆盖。"""
+        if status not in ALL_STATUSES:
+            return False
+        for table, _key in self._table_pairs(source):
+            for trait in table.get(session_id, []):
+                if trait.get("content") != content:
+                    continue
+                trait["status"] = status
+                trait["modified_by"] = MODIFIED_MANUAL
+                trait["checked_by"] = MODIFIED_MANUAL
+                trait["last_updated"] = time.time()
+                if status == STATUS_ACTIVE:
+                    # 人工批准即视为可信，权重至少抬到生效线，否则下一轮又掉回待审
+                    trait["proficiency"] = max(
+                        int(trait.get("proficiency", 0) or 0), ACTIVATE_PROFICIENCY
+                    )
+                    trait["last_seen"] = trait["last_updated"]
+                self._version += 1
+                self._mark("manual" if table is self.manual else "universal")
+                return True
+        return False
+
+    def set_pinned(self, session_id: str, content: str, pinned: bool) -> bool:
+        for trait in self.universal.get(session_id, []):
+            if trait.get("content") != content:
+                continue
+            trait["pinned"] = bool(pinned)
+            trait["modified_by"] = MODIFIED_MANUAL
+            trait["last_updated"] = time.time()
+            self._version += 1
+            self._mark("universal")
+            return True
+        return False
+
+    def pending_traits(self, session_id: str | None = None) -> list[dict]:
+        """待审条目，供面板「学习库」和管理员命令使用。"""
+        out: list[dict] = []
+        sessions = [session_id] if session_id else list(self.universal.keys())
+        for sid in sessions:
+            for trait in self.universal.get(sid or "", []):
+                if trait.get("status") == STATUS_PENDING:
+                    out.append({**trait, "session_id": sid})
+        return out
+
+    def trait_stats(self, session_id: str) -> dict[str, int]:
+        """按状态统计条数，面板顶部的角标用。"""
+        counts = {status: 0 for status in ALL_STATUSES}
+        for trait in self.universal.get(session_id, []):
+            status = trait.get("status", STATUS_ACTIVE)
+            if status in counts:
+                counts[status] += 1
+        counts["manual"] = len(self.manual.get(session_id) or [])
+        counts["total"] = len(self.universal.get(session_id) or [])
+        return counts
+
+    def migrate_traits(self) -> int:
+        """把 1.3.x 的旧特征补齐 1.4.0 字段，返回改动的条目数。
+
+        旧数据没有生命周期概念，一律按「已生效」处理，不重新走审核，
+        否则升级当天所有记忆会集体失效。proficiency 沿用原值（0-100），
+        直接当作原始权重使用，不需要换算。
+        """
+        changed = 0
+        now = time.time()
+        for table, _key in ((self.universal, "universal"), (self.manual, "manual")):
+            for _sid, traits in table.items():
+                for trait in traits:
+                    touched = False
+                    if "status" not in trait:
+                        trait["status"] = STATUS_ACTIVE
+                        touched = True
+                    if "seen" not in trait:
+                        trait["seen"] = max(1, int(trait.get("confirmed_rounds", 1) or 1))
+                        touched = True
+                    if "alias" not in trait:
+                        trait["alias"] = []
+                        touched = True
+                    if "evidence" not in trait:
+                        trait["evidence"] = []
+                        touched = True
+                    if "pinned" not in trait:
+                        # 手动记忆一律钉住：人工指定的不该被时效折扣吃掉
+                        trait["pinned"] = table is self.manual
+                        touched = True
+                    if "modified_by" not in trait:
+                        trait["modified_by"] = MODIFIED_MANUAL if table is self.manual else MODIFIED_AI
+                        touched = True
+                    if "first_seen" not in trait:
+                        trait["first_seen"] = float(trait.get("last_seen", now) or now)
+                        touched = True
+                    if "dimension" not in trait:
+                        trait["dimension"] = ""
+                        touched = True
+                    # 存量条目在旧链路里是「已生效」的，不能因为新门槛（有效权重 ≥20）
+                    # 突然集体失效，这里统一抬到门槛之上留 5 分余量，避免几小时的
+                    # 时效折扣就把它们挤出注入线。新建条目仍从 10 起步，
+                    # 要靠第二轮观察才能进注入。
+                    if (
+                        trait.get("status") == STATUS_ACTIVE
+                        and int(trait.get("proficiency", 0) or 0) < INJECT_MIN_PROFICIENCY + 5
+                    ):
+                        trait["proficiency"] = INJECT_MIN_PROFICIENCY + 5
+                        touched = True
+                    if touched:
+                        changed += 1
+                        self._mark("manual" if table is self.manual else "universal")
+        if changed:
+            self._version += 1
+            logger.info(f"[群聊记忆] 特征结构已迁移到 1.4.0 格式，共 {changed} 条")
+        return changed
 
     # ── 手动记忆（独立文件，学习流程不读不写）──────────────────────────
 
