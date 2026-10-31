@@ -1,2 +1,5 @@
-# 本插件不依赖任何额外 pip 包，仅使用 AstrBot 运行时自带的 quart / 标准库。
-# 旧版 style_learning 的实现同样没有第三方依赖，这里保持一致。
+# 本插件不依赖任何额外 pip 包。
+# 用到的 quart（Web API）与 aiohttp（联网搜索）都是 AstrBot 运行时自带的依赖，
+# 所以这里保持为空——`pip install -r requirements.txt` 不会装任何东西。
+# 搜索功能只在 web_search_mode=plugin 且配了 key 时才会真的发请求，
+# aiohttp 缺失时该功能降级为不搜索，不影响其余部分。

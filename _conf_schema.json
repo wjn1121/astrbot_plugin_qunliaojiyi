@@ -160,5 +160,264 @@
     "type": "int",
     "default": 600,
     "hint": "插件启动后等多久做第一轮分析，避免和 AstrBot 启动阶段抢资源。影响：token 不变，只影响第一轮学习的时间点。"
+  },
+  "style_strength": {
+    "description": "[风格] 被动回复风格强度",
+    "type": "int",
+    "slider": {
+      "min": 0,
+      "max": 100,
+      "step": 5
+    },
+    "default": 100,
+    "hint": "有人跟机器人说话时，学到的风格要体现到什么程度。0 = 完全不注入（纯人格）；1-30 = 只留 1 条且措辞很弱；31-69 = 名额减半；70-99 = 名额四分之三；100 = 满额。强度和注入名额是一起降的，不只改措辞——只改措辞模型照样被塞满。影响：token ↓（调低，每轮少带几十到一百多字）。"
+  },
+  "active_style_strength": {
+    "description": "[风格] 主动回复风格强度",
+    "type": "int",
+    "slider": {
+      "min": 0,
+      "max": 100,
+      "step": 5
+    },
+    "default": 60,
+    "hint": "机器人自己插话时用这一档，和被动回复分开。默认 60 故意低于让位阈值 70，这样主动插话永远不会推翻人格设定——插话本来就被嫌吵，再演另一个人更糟。影响：token ↓（通常比被动低）。"
+  },
+  "style_override_threshold": {
+    "description": "[风格] 风格压过人格的起始强度",
+    "type": "int",
+    "slider": {
+      "min": 0,
+      "max": 100,
+      "step": 5
+    },
+    "default": 100,
+    "hint": "强度【严格大于】这个值才允许让位。默认 100 配合默认强度 100 → 开箱永远不让位，行为和 1.2.0 一致：风格满额注入，但冲突时人格优先。想让群风格压过人设，就把它调到 100 以下，例如阈值 70 + 强度 100 → 每轮 100% 按风格走；阈值 70 + 强度 85 → 85%。注意这只是指令层的优先级声明，不是真把人格删掉，实际服从率是倾向而非保证。影响：token 不变，但开 deep 会击穿缓存。"
+  },
+  "style_override_deep": {
+    "description": "[风格] 深度覆盖人格（会击穿缓存）",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后，让位命中时把声明同时追加到 system prompt 末尾，效果明显更硬。代价：每次命中都改 system prompt，DeepSeek 的前缀缓存必然失效，输入价格从 ¥0.05/百万 跳到 ¥1.5/百万（30 倍）。默认关闭，只在确实需要强效果时开。影响：token 单价 ↑↑。"
+  },
+  "reply_max_chars": {
+    "description": "[字数] 被动回复字数上限",
+    "type": "int",
+    "default": 0,
+    "hint": "有人跟机器人说话时的字数上限。0 = 不限制（与 1.2.0 行为一致），填了才会在请求里加一段字数要求。注意这是**倾向不是硬限制**：设 80 实际常见 90-120 字。影响：token ↓（设置后回复变短）。"
+  },
+  "active_reply_max_chars": {
+    "description": "[字数] 主动回复字数上限",
+    "type": "int",
+    "default": 80,
+    "hint": "机器人自己插话时的字数上限，默认 80。插话本来就该是路过接一句，三行字容易变成抢话。同样只是倾向。影响：token ↓。"
+  },
+  "reply_max_chars_hard": {
+    "description": "[字数] 超限时硬截断",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后在消息发出前按字数硬切，切到最近一个句末标点。**不建议开**：会切坏 markdown 表格、链接、代码块和表情占位符，被切的作品是明显残句，比啰嗦更难看。只在「宁可断也不能长」的场景手动开。影响：token 不变。"
+  },
+  "active_reply_enabled": {
+    "description": "[主动回复] 启用主动回复",
+    "type": "bool",
+    "default": false,
+    "hint": "默认关闭。开启后机器人会在群里自己找时机接话，而不只是在被叫时回复。这是本插件唯一会「凭空产生请求」的功能，建议先看下面几项再开。影响：token ↑（一天最多 active_reply_daily_limit 次）。"
+  },
+  "active_reply_mode": {
+    "description": "[主动回复] 触发方式",
+    "type": "string",
+    "options": [
+      "probability",
+      "rule",
+      "llm_judge"
+    ],
+    "default": "probability",
+    "hint": "probability = 每个冷却窗口掷一次骰，零额外请求；rule = 命中提问句式/关键词/冷场就接话，零额外请求但更容易触发；llm_judge = 攒够 N 条问一次模型该不该接，判定本身有消耗。影响：llm_judge 的 token ↑↑，另外两种 = 0。"
+  },
+  "active_reply_chance": {
+    "description": "[主动回复] 每个窗口的参与概率",
+    "type": "float",
+    "slider": {
+      "min": 0.0,
+      "max": 1.0,
+      "step": 0.05
+    },
+    "default": 0.15,
+    "hint": "仅 probability 模式生效。每过一个冷却窗口掷一次骰，15% ≈ 一天约 7 次期望值，正好落在日限 8 以内。注意骰子是按**窗口**掷的，不是按消息——按消息掷会让群越热闹越容易插话，与直觉相反。影响：token 与触发次数成正比。"
+  },
+  "active_reply_cooldown_seconds": {
+    "description": "[主动回复] 冷却时间（秒）",
+    "type": "int",
+    "default": 1800,
+    "hint": "两次参与评估之间至少隔多久，默认 1800（30 分钟）≈ 一天最多 48 个窗口。配合概率 0.15 得出一周期望 7 次。影响：token ↓（调大，窗口变少）。"
+  },
+  "active_reply_daily_limit": {
+    "description": "[主动回复] 每日上限（每个群）",
+    "type": "int",
+    "default": 8,
+    "hint": "每个群每天最多主动说几次，按自然日重置。默认 8 ≈ 1.2 万 token/天（按每次回复 1500 token 估）。不建议调到 20 以上：QQ 平台对高频主动发言有风控风险，也容易招人烦。影响：token ↑（调大）。"
+  },
+  "active_reply_quiet_hours": {
+    "description": "[主动回复] 静默时段",
+    "type": "string",
+    "default": "01:00-08:00",
+    "hint": "这个时间段内完全不主动说话，零消耗。格式 01:00-08:00，支持跨天（如 22:00-06:00）。留空表示不静默。半夜刷群容易被踢。影响：token ↓。"
+  },
+  "active_reply_min_messages": {
+    "description": "[主动回复] 冷清阈值",
+    "type": "int",
+    "default": 3,
+    "hint": "最近 10 分钟群里少于这么多条消息就不插话，避免对着空气说话。默认 3，设 0 关闭检测。影响：token ↓。"
+  },
+  "active_reply_judge_stack": {
+    "description": "[主动回复] 判定攒消息数",
+    "type": "int",
+    "default": 8,
+    "hint": "仅 llm_judge 模式生效：攒够多少条消息才问一次模型。默认 8，群里 200 条/天 ≈ 25 次判定 ≈ 1.5 万 token/天。数字越小越灵敏，判定请求也越多。影响：token ↑（调小）。"
+  },
+  "active_reply_backoff_limit": {
+    "description": "[主动回复] 连击退避阈值",
+    "type": "int",
+    "default": 3,
+    "hint": "连续主动几次都没人接话，就把冷却时间翻倍（封顶 4 倍），防止自嗨。填 0 关闭退避。一旦有人说话立刻清零。影响：token ↓。"
+  },
+  "active_reply_keywords": {
+    "description": "[主动回复] 额外触发词",
+    "type": "list",
+    "default": [],
+    "hint": "仅 rule 模式生效：除了内置提问句式（有没有人知道/求推荐/怎么弄 等），再额外加几个词，命中就接话。留空只用内置句式。影响：token 与命中次数成正比。"
+  },
+  "active_reply_guidance": {
+    "description": "[主动回复] 语气引导",
+    "type": "string",
+    "default": "这是一条由你主动发起的群聊回复，没有人向你提问。\n不要使用「有什么可以帮你」「我在」「已收到」这类服务式或召唤式开头；\n不要提及自己是主动发言或任何机制；\n像普通群友一样简短接话；话题不适合接就少说或不说。",
+    "hint": "告诉模型这是主动发言、别用客服腔。留空则完全不注入这段。影响：token 轻微 ↑（多几十字）。"
+  },
+  "active_reply_provider_id": {
+    "description": "[主动回复] 使用的 Provider ID",
+    "type": "string",
+    "_special": "select_provider",
+    "default": "",
+    "hint": "判定和主动回复共用这个模型，留空用当前会话默认。影响：token 单价取决于这里选的模型，换成 flash 可显著降低成本。"
+  },
+  "web_search_mode": {
+    "description": "[联网搜索] 接管模式",
+    "type": "string",
+    "options": [
+      "plugin",
+      "inherit",
+      "off"
+    ],
+    "default": "plugin",
+    "hint": "plugin = 插件自己挂搜索工具，能按群限次（推荐，也是默认）；inherit = 完全沿用 AstrBot 全局设置，但插件看不到搜了几次、管不了上限；off = 就算 AstrBot 全局开着也把搜索工具摘掉。影响：token ↑（每次搜索约多 1200 token）。"
+  },
+  "web_search_provider": {
+    "description": "[联网搜索] 服务商",
+    "type": "string",
+    "options": [
+      "deepseek",
+      "tavily",
+      "bocha",
+      "brave"
+    ],
+    "default": "deepseek",
+    "hint": "deepseek 默认：¥0.005/次、复用你的模型 key、国内直连、失败不计费，最划算。tavily / bocha 国内能直连但有月额度（tavily 免费 1000 次/月，20 次/群/天 × 10 个群一个月就会烧穿）；brave 要梯子。影响：直接决定每次搜索的钱。"
+  },
+  "web_search_api_key": {
+    "description": "[联网搜索] API Key",
+    "type": "string",
+    "default": "",
+    "hint": "留空时如果下面「复用全局 key」开着，会自动读 AstrBot 里配的同一家 key，所以多数情况这里不用填。填了会写进 runtime.json（明文落盘），不想落盘就靠复用。影响：token 不变，只影响能不能搜。"
+  },
+  "web_search_reuse_global_key": {
+    "description": "[联网搜索] 复用 AstrBot 全局 key",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后，插件里 key 留空时自动读 AstrBot 全局配置里同一家的 key。好处是 key 只存一处、不会在 runtime.json 里留明文。DeepSeek 的搜索 key 和模型 key 是同一个，在 AstrBot 面板填一次即可。影响：token 不变。"
+  },
+  "web_search_max_results": {
+    "description": "[联网搜索] 返回条数",
+    "type": "int",
+    "default": 5,
+    "hint": "一次搜几条。DeepSeek 上限 50。5 条约 1200 token；调到 10 大约翻倍。影响：token ↑（调大）。"
+  },
+  "web_search_timeout": {
+    "description": "[联网搜索] 超时（秒）",
+    "type": "int",
+    "default": 8,
+    "hint": "超过这个时间就放弃搜索，按失败处理（不阻塞回复、也不计费）。调大会让群里等回复更久。影响：token 不变，只影响延迟。"
+  },
+  "web_search_need_content": {
+    "description": "[联网搜索] 返回网页正文",
+    "type": "bool",
+    "default": false,
+    "hint": "**建议保持关闭**。开了每条结果都带整页正文，5 条可能就是 3-5 万 token，一次搜索顶一天的学习消耗。默认的 summary 字段已有 600-800 字概要，够模型判断了。影响：token ↑↑↑（开了成本翻十倍以上）。"
+  },
+  "web_search_daily_limit": {
+    "description": "[联网搜索] 每日上限（每个群）",
+    "type": "int",
+    "default": 20,
+    "hint": "每个群每天最多搜几次，跨群独立计算，第二天自动归零。默认 20：单次综合成本约 ¥0.0075，20 次 ≈ ¥0.15/群/天，10 个群全打满约 ¥1.5/天。正常群一天真正需要实时信息的对话不超过 5 次，20 是 4 倍余量。影响：token ↑（调大）。"
+  },
+  "web_search_max_per_turn": {
+    "description": "[联网搜索] 单轮上限",
+    "type": "int",
+    "default": 2,
+    "hint": "一轮对话里最多搜几次，防止模型连环搜把当天配额一次烧完。设 0 表示不限（不建议）。影响：token ↑（调大）。"
+  },
+  "web_search_hint": {
+    "description": "[联网搜索] 搜索提示语",
+    "type": "string",
+    "default": "",
+    "hint": "留空则完全不注入。填了会告诉模型「需要实时信息先搜一下」，但可能导致它搜得过于频繁、把配额提前用完。建议先留空观察。影响：token 轻微 ↑，且可能显著增加搜索次数。"
+  },
+  "admin_extra_users": {
+    "description": "[管理员] 额外管理员 QQ",
+    "type": "list",
+    "default": [],
+    "hint": "除了 AstrBot 全局管理员（admins_id），还能管理这个插件的人。多个用逗号隔开。管理员可以在群里直接对话调参数、加记忆、查消耗。影响：token 不变。"
+  },
+  "admin_tool_enabled": {
+    "description": "[管理员] 允许对话调参",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后管理员在群里说话就能改设置、加记忆。非管理员群里这个工具**根本不会挂给模型**，所以别人看不到、也没法诱导它。影响：token 轻微 ↑（多一个工具定义，约 200 token）。"
+  },
+  "token_price_input_cached": {
+    "description": "[计价] 缓存命中输入价（元/百万 token）",
+    "type": "float",
+    "default": 0.05,
+    "hint": "DeepSeek 官方牌价，调价了就在这里改，不用等插件更新。影响：只影响面板显示的金额估算，不影响真实扣费。"
+  },
+  "token_price_input_miss": {
+    "description": "[计价] 未命中输入价（元/百万 token）",
+    "type": "float",
+    "default": 1.5,
+    "hint": "缓存没命中时的输入价格，是命中价的 30 倍。这也是为什么本插件坚持不改 system prompt。影响：只影响金额估算。"
+  },
+  "token_price_output": {
+    "description": "[计价] 输出价（元/百万 token）",
+    "type": "float",
+    "default": 4.5,
+    "hint": "每百万输出 token 的价格。影响：只影响金额估算。"
+  },
+  "token_price_peak_enabled": {
+    "description": "[计价] 区分峰谷价",
+    "type": "bool",
+    "default": true,
+    "hint": "高峰时段（工作日 09:00-12:00、14:00-18:00 北京时间）按倍率加价。关掉就全按空闲价算。节假日不单独处理，会略微高估。影响：只影响金额估算。"
+  },
+  "token_price_peak_multiplier": {
+    "description": "[计价] 高峰倍率",
+    "type": "float",
+    "default": 2.0,
+    "hint": "高峰时段是空闲时段的几倍价，DeepSeek 目前是 2 倍。影响：只影响金额估算。"
+  },
+  "token_stats_keep_days": {
+    "description": "[计价] 消耗记录保留天数",
+    "type": "int",
+    "default": 7,
+    "hint": "消耗记录按天存成文件，留几天。默认 7，超出的自动删。这些文件只存数字不存聊天内容，即使泄露也不含隐私。影响：只占磁盘，与 token 无关。"
   }
 }

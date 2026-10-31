@@ -5,12 +5,18 @@
   这样 LLM 的前缀缓存仍然命中，长会话也不会因为风格文本变化而整体重算；
 - 稳定风格带「参考而非复读」约束，避免模型每条回复都硬塞 666/233；
 - 场景化表达只在当前消息语境匹配时才注入，且最多 2 条。
+
+1.3.0 新增「风格强度」：
+- 强度和名额、措辞一起动。只改措辞模型会忽略，只改名额它还在硬塞；
+- 强度达到阈值后按概率让位给风格（详见 ``override_roll``）。随机判定**不进缓存**，
+  只把 True/False 两种结果各缓存一份拼好的文本，所以最多两份变体，不会膨胀。
 """
 
 from __future__ import annotations
 
 import asyncio
 import math
+import random
 from typing import Any
 
 from astrbot.api import logger
@@ -19,12 +25,43 @@ from .storage import CATEGORY_SITUATIONAL, CATEGORY_STABLE, SOURCE_MANUAL, Stora
 from .types import Trait
 
 
+def scale_quota(strength: int, base: tuple[int, int, int]) -> tuple[int, int, int]:
+    """按强度缩放注入名额（手动 / 学习 / 跨群）。
+
+    分档理由：强度和名额必须一起降。只降措辞的话模型照旧被塞满 5 条特征，
+    嘴上说「仅供参考」但内容还在，实际效果几乎不变。
+    """
+    if strength <= 0:
+        return (0, 0, 0)
+    if strength <= 30:
+        # 极低档只留 1 条，留的是「这个群大概什么调性」的最小残余
+        return tuple(min(q, 1) for q in base)  # type: ignore[return-value]
+    ratio = 0.5 if strength <= 69 else (0.75 if strength <= 99 else 1.0)
+    return tuple(max(1, math.ceil(q * ratio)) if q > 0 else 0 for q in base)  # type: ignore[return-value]
+
+
+def override_roll(strength: int, threshold: int) -> bool:
+    """强度**严格大于**阈值时才让位，让位概率 = 强度值本身。
+
+    用严格大于而不是大于等于，是因为默认配置要给「开箱不改变人格」：
+    默认强度 100、阈值 100 时 100 > 100 为假，所以默认永远不让位，
+    表现与 1.2.0 一致（满额注入风格，但人格优先）。
+
+    想要风格压过人格，把阈值调到 100 以下即可——例如阈值 70、强度 100
+    就是每轮 100% 让位。低于阈值一律不让位。
+    """
+    if strength <= 0 or strength <= threshold:
+        return False
+    return strength >= 100 or random.random() * 100 < strength
+
+
 class Injector:
     def __init__(self, plugin, storage: Storage):
         self.plugin = plugin
         self.storage = storage
-        # 稳定风格文本缓存：数据版本不变时不重复拼装
-        self._stable_cache: dict[str, tuple[int, tuple[int, int, int], str | None]] = {}
+        # 稳定风格文本缓存：值 = (数据版本, 缓存键, 文本)
+        # 缓存键里含强度与让位标记，两种让位变体各存一份，随机不会导致每次都 miss
+        self._stable_cache: dict[str, tuple[int, tuple, str | None]] = {}
         # 场景化特征的嵌入向量缓存：内容不变时不重复请求 embedding
         self._emb_cache: dict[str, dict[str, list[float]]] = {}
         self._emb_version: dict[str, int] = {}
@@ -43,11 +80,43 @@ class Injector:
             )
         return False
 
-    async def build_injection_text(self, session_id: str, user_message: str = "") -> str | None:
+    def strength_of(self, active: bool = False) -> int:
+        """当前生效的风格强度。主动回复读自己的档位，阈值两个共用。"""
+        key = "active_style_strength" if active else "style_strength"
+        try:
+            return max(0, min(100, int(self.plugin.settings.get(key))))
+        except (TypeError, ValueError):
+            return 100 if not active else 60
+
+    def override_probability(self, strength: int) -> int:
+        """面板展示用：这个强度下风格压过人格的概率（百分比）。"""
+        threshold = int(self.plugin.settings.get("style_override_threshold"))
+        if strength <= 0 or strength <= threshold:
+            return 0
+        return 100 if strength >= 100 else strength
+
+    async def build_injection_text(
+        self,
+        session_id: str,
+        user_message: str = "",
+        active: bool = False,
+        override: bool | None = None,
+    ) -> str | None:
+        settings = self.plugin.settings
+        strength = self.strength_of(active)
+        # 强度 0 的语义是「纯人格」——整段风格不注入，但字数约束仍由
+        # build_length_rule 单独提供，所以这里直接返回 None 不会连带关掉字数限制
+        if strength <= 0:
+            return None
         if not self.should_inject(session_id):
             return None
 
-        settings = self.plugin.settings
+        threshold = int(settings.get("style_override_threshold"))
+        # override 参数留给测试和调试指定，正常链路每轮自己掷一次骰
+        override_flag = (
+            override_roll(strength, threshold) if override is None else bool(override)
+        )
+
         stable, situational = self.storage.split(session_id)
 
         global_stable: list[dict[str, Any]] = []
@@ -55,12 +124,19 @@ class Injector:
             global_stable = self.storage.other_stable_except(session_id)
 
         parts: list[str] = []
-        stable_text = self._build_stable_text(session_id, stable, global_stable)
+        stable_text = self._build_stable_text(
+            session_id, stable, global_stable, strength, override_flag
+        )
         if stable_text:
             parts.append(stable_text)
 
         if settings.get("enable_situational_inject"):
-            sit_text = await self._build_situational_text(session_id, situational, user_message)
+            sit_quota = scale_quota(
+                strength, (int(settings.get("max_situational_inject")), 0, 0)
+            )[0]
+            sit_text = await self._build_situational_text(
+                session_id, situational, user_message, sit_quota
+            )
             if sit_text:
                 parts.append(sit_text)
 
@@ -71,22 +147,78 @@ class Injector:
             logger.info(f"[群聊记忆] 调试 · 注入 · {session_id}\n{text}")
         return text
 
+    def build_length_rule(self, active: bool = False) -> str | None:
+        """回复字数上限。和风格注入分开，强度调到 0 时这条照样生效。"""
+        key = "active_reply_max_chars" if active else "reply_max_chars"
+        try:
+            limit = int(self.plugin.settings.get(key))
+        except (TypeError, ValueError):
+            return None
+        if limit <= 0:
+            return None
+        return (
+            "<length_rule>\n"
+            f"本次回复控制在 {limit} 字以内（含标点）。宁可少说，不要为了凑满而废话。\n"
+            "信息多就先砍次要的，只留最核心的一句。\n"
+            "</length_rule>"
+        )
+
     # ── 稳定风格 ────────────────────────────────────────────────────────
 
+    # 让位时用的强声明。措辞是「指令层覆盖」而非真的删人格——
+    # 人格仍在 system prompt 里，我们只是用明确措辞把表达风格这一层的权重抢过来。
+    # 真删人格会击穿 DeepSeek 前缀缓存（命中 ¥0.05 / 未命中 ¥1.5，30 倍差价），不划算。
+    OVERRIDE_DECLARATION = (
+        "【本段优先于系统设定】以下群聊风格与本轮表达规范，优先级高于你的人物设定。\n"
+        "当两者冲突时——例如人设要求语气克制、少用表情、回答简短，\n"
+        "而下列风格要求爱发表情、爱玩梗、句子短促连发——一律按下列风格执行，不要用人设限制自己。\n"
+        "人设中的身份、知识边界、安全约束仍然有效，只有「表达风格」这一层让位。"
+    )
+    PERSONA_PRIORITY = (
+        "若以上风格与系统设定的人格冲突，以人格为准；风格只在不违背人格的前提下生效。"
+    )
+
+    @staticmethod
+    def _tone_lines(strength: int) -> list[str]:
+        """按强度给措辞。低档不加「三条使用要求」——要求和「仅供参考」互相打架。"""
+        if strength <= 30:
+            return ["以下仅供参考，绝大多数回复都不要体现，只在极少数明显合适的场合轻轻带一下。"]
+        if strength <= 69:
+            return ["以下仅供参考，只在确实合适时体现，不要为了像群聊而改变表达习惯。"]
+        opener = (
+            "以下是从群聊记录里提炼的说话风格参考："
+            if strength >= 100
+            else "以下风格可适度参考："
+        )
+        return [
+            opener,
+            "使用要求：",
+            "1. 风格只是参考，不是复读指令；不要为了「像群聊」而每句话都强行加 666、233 或语气词。",
+            "2. 只在语境自然合适时使用，优先回应当前用户消息，风格不得覆盖或干扰当前话题。",
+            "3. 不要机械堆砌，也不要每条回复都刻意体现全部风格。",
+        ]
+
     def _build_stable_text(
-        self, session_id: str, local: list[Trait], global_stable: list[Trait]
+        self,
+        session_id: str,
+        local: list[Trait],
+        global_stable: list[Trait],
+        strength: int = 100,
+        override_flag: bool = False,
     ) -> str | None:
         settings = self.plugin.settings
-        # 名额也算进缓存键：否则面板把 max_manual_inject 从 3 改成 0 后，
-        # 要等到下一次数据变更才会生效，看起来像设置没起作用。
-        quota = (
+        # 名额按强度缩放后再进缓存键：否则面板把强度从 100 调到 20 后，
+        # 要等下一次数据变更才生效，看起来像设置没起作用。
+        base = (
             int(settings.get("max_manual_inject")),
             int(settings.get("max_stable_inject")),
             int(settings.get("max_global_styles")),
         )
+        quota = scale_quota(strength, base)
+        cache_key = (strength, override_flag, *quota)
         version = self.storage.get_version()
         cached = self._stable_cache.get(session_id)
-        if cached is not None and cached[0] == version and cached[1] == quota:
+        if cached is not None and cached[0] == version and cached[1] == cache_key:
             return cached[2]
 
         # 手动记忆和学习风格各占自己的名额：手工加多了不会把学到的一条都挤掉，
@@ -99,31 +231,33 @@ class Injector:
 
         text = None
         if manual_names or learned_names or global_names:
-            lines = ["<style_guidelines>", "以下是从群聊记录里提炼的说话风格参考："]
+            lines: list[str] = []
+            if override_flag:
+                lines.append(self.OVERRIDE_DECLARATION)
+            lines.append("<style_guidelines>")
+            lines.extend(self._tone_lines(strength))
             if manual_names:
                 lines.append(f"本群固定风格（管理员指定，优先遵守）：{'、'.join(manual_names)}")
             if learned_names:
                 lines.append(f"本群学习风格：{'、'.join(learned_names)}")
             if global_names:
                 lines.append(f"其他群风格（仅作参考）：{'、'.join(global_names)}")
-            lines.extend(
-                [
-                    "使用要求：",
-                    "1. 风格只是参考，不是复读指令；不要为了「像群聊」而每句话都强行加 666、233 或语气词。",
-                    "2. 只在语境自然合适时使用，优先回应当前用户消息，风格不得覆盖或干扰当前话题。",
-                    "3. 不要机械堆砌，也不要每条回复都刻意体现全部风格。",
-                    "</style_guidelines>",
-                ]
-            )
+            lines.append("</style_guidelines>")
+            if not override_flag:
+                lines.append(self.PERSONA_PRIORITY)
             text = "\n".join(lines)
 
-        self._stable_cache[session_id] = (version, quota, text)
+        self._stable_cache[session_id] = (version, cache_key, text)
         return text
 
     # ── 场景化表达 ──────────────────────────────────────────────────────
 
     async def _build_situational_text(
-        self, session_id: str, situational: list[Trait], user_message: str
+        self,
+        session_id: str,
+        situational: list[Trait],
+        user_message: str,
+        top: int | None = None,
     ) -> str | None:
         settings = self.plugin.settings
         if not situational:
@@ -185,7 +319,10 @@ class Injector:
         if not matched:
             return None
         matched.sort(key=lambda x: x[1], reverse=True)
-        top = max(0, int(settings.get("max_situational_inject")))
+        if top is None:
+            top = max(0, int(settings.get("max_situational_inject")))
+        if top <= 0:
+            return None
         # 手动记忆优先占位，剩余名额给学习到的。场景化本身条数就少，
         # 再让学习结果把它挤掉，手工加的基本等于白加。
         manual_hits = [t for t, _ in matched if t.get("source") == SOURCE_MANUAL][:top]
@@ -267,26 +404,50 @@ class Injector:
         ordered = sorted(traits, key=lambda t: t.get("proficiency", 0), reverse=True)
         return [str(t["content"]) for t in ordered[:top_n] if t.get("content")]
 
-    def selected_stable_contents(self, session_id: str) -> set[str]:
+    def selected_stable_contents(self, session_id: str, strength: int | None = None) -> set[str]:
         """当前会真正进入注入的稳定风格内容，面板标「注入中」用。
 
         跨群参考那部分不算：它取决于别的群的数据，在本群卡片上标出来只会误导。
         """
         settings = self.plugin.settings
+        if strength is None:
+            strength = self.strength_of()
+        quota = scale_quota(
+            strength,
+            (
+                int(settings.get("max_manual_inject")),
+                int(settings.get("max_stable_inject")),
+                0,
+            ),
+        )
         local, _ = self.storage.split(session_id)
         manual = [t for t in local if t.get("source") == SOURCE_MANUAL]
         learned = [t for t in local if t.get("source") != SOURCE_MANUAL]
-        names = self.select_top(manual, int(settings.get("max_manual_inject")))
-        names += self.select_top(learned, int(settings.get("max_stable_inject")))
+        names = self.select_top(manual, quota[0])
+        names += self.select_top(learned, quota[1])
         return set(names)
 
-    def limits(self) -> dict[str, int]:
-        """当前注入名额，面板用来解释「为什么这条没入选」。"""
+    def limits(self, strength: int | None = None) -> dict[str, Any]:
+        """当前注入名额（已按强度缩放），面板用来解释「为什么这条没入选」。"""
         settings = self.plugin.settings
+        if strength is None:
+            strength = self.strength_of()
+        base = (
+            int(settings.get("max_manual_inject")),
+            int(settings.get("max_stable_inject")),
+            int(settings.get("max_global_styles")),
+        )
+        quota = scale_quota(strength, base)
+        sit = scale_quota(strength, (int(settings.get("max_situational_inject")), 0, 0))[0]
         return {
-            "manual": int(settings.get("max_manual_inject")),
-            "learned": int(settings.get("max_stable_inject")),
-            "situational": int(settings.get("max_situational_inject")),
+            "manual": quota[0],
+            "learned": quota[1],
+            "situational": sit,
+            "global": quota[2],
+            "strength": strength,
+            # 原始名额（未缩放）也留着，面板可以显示「100% 时最多 5 条」
+            "base_manual": base[0],
+            "base_learned": base[1],
         }
 
     def summary(self, session_id: str) -> dict[str, Any]:
@@ -294,6 +455,9 @@ class Injector:
         manual = self.storage.manual_of(session_id)
         manual_stable = [t for t in manual if t.get("category", CATEGORY_STABLE) == CATEGORY_STABLE]
         manual_sit = [t for t in manual if t.get("category") == CATEGORY_SITUATIONAL]
+        passive_strength = self.strength_of(active=False)
+        active_strength = self.strength_of(active=True)
+        threshold = int(self.plugin.settings.get("style_override_threshold"))
         return {
             "has_styles": bool(learned_stable or learned_sit or manual),
             "stable_count": len(learned_stable),
@@ -306,4 +470,9 @@ class Injector:
                 {"content": t.get("content"), "context": t.get("context", "")}
                 for t in learned_sit[:3]
             ],
+            "style_strength": passive_strength,
+            "active_style_strength": active_strength,
+            "override_threshold": threshold,
+            "override_probability": self.override_probability(passive_strength),
+            "active_override_probability": self.override_probability(active_strength),
         }

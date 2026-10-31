@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import os
+import time
 from pathlib import Path
 
 from astrbot.api import AstrBotConfig, logger
@@ -30,7 +31,19 @@ from astrbot.api.star import Context, Star, StarTools, register
 from . import api
 from .constants import PLUGIN_AUTHOR, PLUGIN_DESC, PLUGIN_NAME, PLUGIN_VERSION
 from .core import Manager, Settings, Storage
-from .hooks import collect_message, inject_style
+from .core.active import ActiveReply
+from .core.admin import admin_summary, is_admin
+from .core.usage import UsageTracker
+from .hooks import (
+    collect_message,
+    inject_style,
+    maybe_active_reply,
+    record_llm_usage,
+    truncate_result,
+)
+
+# 二次确认的有效期：超过这个时间就得重新发起，避免几小时前的确认突然生效
+_CONFIRM_TTL = 60.0
 
 
 @register(PLUGIN_NAME, PLUGIN_AUTHOR, PLUGIN_DESC, PLUGIN_VERSION)
@@ -47,7 +60,13 @@ class QunliaoJiyi(Star):
 
         self.settings = Settings(config, self.data_dir / "runtime.json")
         self.storage = Storage(self.data_dir)
+        # usage 要在 manager 之前：learner 学习完就调 plugin.usage.record
+        self.usage = UsageTracker(self.data_dir, self.settings)
         self.manager = Manager(self, self.storage, self.settings)
+        self.active = ActiveReply(self, self.storage, self.settings)
+
+        # 待确认的清空操作：{session_id: (scope, 发起时间)}
+        self._pending_clear: dict[str, tuple[str, float]] = {}
 
         api.register(self)
         logger.info(f"[群聊记忆] 初始化完成，数据目录 {self.data_dir}")
@@ -61,42 +80,51 @@ class QunliaoJiyi(Star):
 
     async def terminate(self) -> None:
         await self.manager.stop()
+        try:
+            await self.usage.flush()
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[群聊记忆] 关闭时写消耗记录失败: {e}")
         logger.info("[群聊记忆] 已停止")
 
     # ── 事件钩子（装饰器必须在类上，实现委托给 hooks.py）────────────────
 
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def on_all_message(self, event: AstrMessageEvent):
+        """收集消息，顺便看看要不要主动插话。
+
+        必须是 async generator：命中主动回复时要 ``yield event.request_llm(...)``，
+        普通 async 函数接不住这个返回值。
+        """
         await collect_message(self, event)
+        async for result in maybe_active_reply(self, event):
+            yield result
 
     @filter.on_llm_request(priority=17)
     async def on_llm_request(self, event: AstrMessageEvent, req):
         await inject_style(self, event, req)
 
+    @filter.on_llm_response()
+    async def on_llm_response(self, event: AstrMessageEvent, response):
+        await record_llm_usage(self, event, response)
+
+    @filter.on_decorating_result()
+    async def on_decorating_result(self, event: AstrMessageEvent):
+        await truncate_result(self, event)
+
     # ── 命令 ────────────────────────────────────────────────────────────
 
     @filter.command("风格状态")
     async def cmd_status(self, event: AstrMessageEvent):
-        summary = self.manager.injector.summary(event.unified_msg_origin)
-        stats = self.storage.stats()
-        if not summary["has_styles"]:
-            yield event.plain_result(
-                f"当前会话还没有学到风格特征。\n"
-                f"全局：{stats['sessions']} 个会话、{stats['traits']} 条特征，"
-                f"待学习消息 {stats['pending_messages']} 条。"
-            )
+        if not is_admin(self, event):
+            yield event.plain_result("这个命令只有管理员能用。")
             return
-        lines = [
-            "当前会话风格：",
-            f"学习产出：稳定 {summary['stable_count']} 条 · 场景化 {summary['situational_count']} 条",
-            f"手动记忆：{summary['manual_count']} 条",
-        ]
-        for name in summary["stable_preview"]:
-            lines.append(f"· {name}")
-        yield event.plain_result("\n".join(lines))
+        yield event.plain_result(admin_summary(self, event.unified_msg_origin))
 
     @filter.command("学习风格")
     async def cmd_learn(self, event: AstrMessageEvent):
+        if not is_admin(self, event):
+            yield event.plain_result("这个命令只有管理员能用。")
+            return
         session_id = event.unified_msg_origin
         history = self.storage.history_of(session_id, limit=999)
         need = int(self.settings.get("min_history_for_analysis"))
@@ -116,6 +144,57 @@ class QunliaoJiyi(Star):
             yield event.plain_result(f"学习失败：{result.get('reason', '未知原因')}")
 
     @filter.command("清空风格")
-    async def cmd_clear(self, event: AstrMessageEvent):
-        await self.storage.clear_session(event.unified_msg_origin, scope="all")
-        yield event.plain_result("已清空当前会话的学习风格、手动记忆与待学习记录。")
+    async def cmd_clear_learned(self, event: AstrMessageEvent):
+        """只清学习产出，不动手动记忆，也不动待学习消息。"""
+        if not is_admin(self, event):
+            yield event.plain_result("这个命令只有管理员能用。")
+            return
+        session_id = event.unified_msg_origin
+        raw = (getattr(event, "message_str", "") or "").strip()
+        if "全部" in raw or "all" in raw.lower():
+            self._pending_clear[session_id] = ("all", time.time())
+            yield event.plain_result(
+                "这会清空本群的学习产出、手动记忆、待学习消息和主动回复状态，不可恢复。\n"
+                "60 秒内发送 /确认清空 才会真的执行。"
+            )
+            return
+        await self.storage.clear_session(session_id, scope="learned")
+        yield event.plain_result(
+            "已清空本群的学习产出。手动记忆和待学习消息都没动——"
+            "要清后者请用 /清空记忆、/清空记录。"
+        )
+
+    @filter.command("清空记忆")
+    async def cmd_clear_manual(self, event: AstrMessageEvent):
+        """只清面板手动添加的记忆，不可恢复。"""
+        if not is_admin(self, event):
+            yield event.plain_result("这个命令只有管理员能用。")
+            return
+        await self.storage.clear_session(event.unified_msg_origin, scope="manual")
+        yield event.plain_result("已清空本群的手动记忆（学习产出不受影响）。")
+
+    @filter.command("清空记录")
+    async def cmd_clear_history(self, event: AstrMessageEvent):
+        """只清待学习消息缓冲。学习产出和手动记忆都不动。"""
+        if not is_admin(self, event):
+            yield event.plain_result("这个命令只有管理员能用。")
+            return
+        await self.storage.clear_session(event.unified_msg_origin, scope="history")
+        yield event.plain_result("已清空本群的待学习消息缓冲。")
+
+    @filter.command("确认清空")
+    async def cmd_confirm_clear(self, event: AstrMessageEvent):
+        if not is_admin(self, event):
+            yield event.plain_result("这个命令只有管理员能用。")
+            return
+        session_id = event.unified_msg_origin
+        pending = self._pending_clear.pop(session_id, None)
+        if not pending:
+            yield event.plain_result("没有待确认的清空操作。先发 /清空风格 全部。")
+            return
+        scope, issued_at = pending
+        if time.time() - issued_at > _CONFIRM_TTL:
+            yield event.plain_result("确认已过期（超过 60 秒），请重新发起。")
+            return
+        await self.storage.clear_session(session_id, scope=scope)
+        yield event.plain_result("已全部清空：学习产出、手动记忆、待学习消息、主动回复状态。")

@@ -88,6 +88,11 @@ class Learner:
                 timeout=180,
             )
             text = (getattr(resp, "completion_text", "") or "").strip()
+            # 记一次学习消耗。统计坏了不能影响学习本身，所以整段兜住异常。
+            try:
+                self.plugin.usage.record("learn", getattr(resp, "usage", None), session_id)
+            except Exception as e:  # noqa: BLE001
+                logger.debug(f"[群聊记忆] 记录学习消耗失败（可忽略）: {e}")
             if not text:
                 raise ValueError("LLM 返回空内容")
 

@@ -55,6 +55,19 @@ def _serialize_session(plugin, session_id: str, msgs) -> dict:
     injector = plugin.manager.injector
     # 面板要告诉用户「哪几条真的会进注入」，否则改熟练度全靠猜
     selected = sorted(injector.selected_stable_contents(session_id))
+
+    # 主动回复状态与搜索配额都可能因为数据损坏拿不到，单独兜住——
+    # 一个会话的附加信息坏掉不该让整个列表 500
+    try:
+        active_status = plugin.active.status(session_id)
+    except Exception as e:  # noqa: BLE001
+        logger.debug(f"[群聊记忆] 读取主动回复状态失败 {session_id}: {e}")
+        active_status = {}
+    try:
+        search_used = plugin.usage.search_used(session_id)
+    except Exception:  # noqa: BLE001
+        search_used = 0
+
     return {
         "session_id": session_id,
         "display_name": display_name(session_id),
@@ -67,6 +80,11 @@ def _serialize_session(plugin, session_id: str, msgs) -> dict:
         "override": override,
         "learn_enabled": override.get("learn", True),
         "inject_enabled": override.get("inject", True),
+        "active_enabled": bool(override.get("active", True)),
+        "search_allowed": storage.search_allowed(session_id),
+        "search_used": search_used,
+        "search_limit": int(plugin.settings.get("web_search_daily_limit")),
+        "active_status": active_status,
         "selected": selected,
         "limits": injector.limits(),
     }
@@ -172,9 +190,62 @@ async def api_status(plugin):
                 "known_ids": sorted(known | set(plugin.storage.chat_history)),
                 "inject_limits": plugin.manager.injector.limits(),
                 "manual_max": MANUAL_MAX_PER_SESSION,
+                "usage": _safe_usage(plugin),
+                "active_enabled": bool(plugin.settings.get("active_reply_enabled")),
+                "search": _search_summary(plugin),
+                "style": _style_summary(plugin),
             },
         }
     )
+
+
+def _safe_usage(plugin) -> dict:
+    try:
+        return plugin.usage.summary()
+    except Exception as e:  # noqa: BLE001 - 统计坏了面板也要能打开
+        logger.warning(f"[群聊记忆] 读取消耗统计失败: {e}")
+        return {"today": {}, "days": [], "search_used_by_session": {}}
+
+
+def _search_summary(plugin) -> dict:
+    """搜索结果面板要显示「当前到底能不能搜」，省得用户配了 key 还以为没生效。"""
+    try:
+        provider = str(plugin.settings.get("web_search_provider") or "").strip().lower()
+        key = ""
+        try:
+            from .core.search import resolve_key
+
+            key = resolve_key(plugin, provider)
+        except Exception:  # noqa: BLE001
+            key = ""
+        return {
+            "mode": str(plugin.settings.get("web_search_mode") or "plugin"),
+            "provider": provider,
+            "daily_limit": int(plugin.settings.get("web_search_daily_limit")),
+            "max_per_turn": int(plugin.settings.get("web_search_max_per_turn")),
+            "need_content": bool(plugin.settings.get("web_search_need_content")),
+            "key_configured": bool(key),
+        }
+    except Exception as e:  # noqa: BLE001
+        logger.debug(f"[群聊记忆] 读取搜索配置失败: {e}")
+        return {}
+
+
+def _style_summary(plugin) -> dict:
+    injector = plugin.manager.injector
+    try:
+        strength = injector.strength_of(active=False)
+        active_strength = injector.strength_of(active=True)
+        return {
+            "strength": strength,
+            "active_strength": active_strength,
+            "override_threshold": int(plugin.settings.get("style_override_threshold")),
+            "override_probability": injector.override_probability(strength),
+            "active_override_probability": injector.override_probability(active_strength),
+        }
+    except Exception as e:  # noqa: BLE001
+        logger.debug(f"[群聊记忆] 读取风格强度失败: {e}")
+        return {}
 
 
 # ── POST /manage ────────────────────────────────────────────────────────
@@ -249,7 +320,12 @@ async def api_manage(plugin):
         if action == "clear_session":
             scope = str(body.get("scope") or "all")
             await plugin.storage.clear_session(session_id, scope=scope)
-            label = {"learned": "学习产出", "manual": "手动记忆"}.get(scope, "全部记忆")
+            label = {
+                "learned": "学习产出",
+                "manual": "手动记忆",
+                "history": "待学习消息",
+                "active": "主动回复状态",
+            }.get(scope, "全部记忆")
             return jsonify({"success": True, "message": f"已清空该会话的{label}"})
         if action == "clear_history":
             await plugin.storage.clear_history(session_id)
@@ -258,10 +334,14 @@ async def api_manage(plugin):
             scope = str(body.get("scope") or "all")
             result = await plugin.storage.clear_all(scope=scope)
             parts = []
-            if result["learned"]:
+            if result.get("learned"):
                 parts.append(f"{result['learned']} 个会话的学习产出")
-            if result["manual"]:
+            if result.get("manual"):
                 parts.append(f"{result['manual']} 个会话的手动记忆")
+            if result.get("history"):
+                parts.append(f"{result['history']} 个会话的待学习消息")
+            if result.get("active"):
+                parts.append(f"{result['active']} 个会话的主动回复状态")
             return jsonify(
                 {
                     "success": True,
@@ -270,12 +350,41 @@ async def api_manage(plugin):
                 }
             )
         if action == "set_session_override":
-            override = await plugin.storage.set_override(
-                session_id,
-                learn=body.get("learn"),
-                inject=body.get("inject"),
-            )
+            kwargs: dict = {"learn": body.get("learn"), "inject": body.get("inject")}
+            # search 是三态。优先认字符串形式（search_mode），因为面板请求要穿一层宿主桥接，
+            # 传 JSON null 有被过滤掉的风险，一旦丢键就变成「不改」，用户选「跟随全局」会静默失效。
+            if "search_mode" in body:
+                mode = str(body.get("search_mode") or "").strip().lower()
+                kwargs["search"] = None if mode == "inherit" else (mode == "on")
+            elif "search" in body:
+                raw = body.get("search")
+                kwargs["search"] = None if raw is None else bool(raw)
+            override = await plugin.storage.set_override(session_id, **kwargs)
+            if body.get("active") is not None:
+                plugin.active.set_enabled(session_id, bool(body["active"]))
             return jsonify({"success": True, "data": {"session_id": session_id, "override": override}})
+        if action == "set_active":
+            return jsonify(
+                {
+                    "success": True,
+                    "data": plugin.active.set_enabled(session_id, bool(body.get("enabled"))),
+                }
+            )
+        if action == "clear_active":
+            removed = plugin.storage.clear_active(session_id)
+            return jsonify(
+                {
+                    "success": True,
+                    "message": "已重置本群主动回复状态" if removed else "本来就没有状态记录",
+                }
+            )
+        if action == "usage_detail":
+            days = body.get("days")
+            try:
+                days = int(days) if days is not None else 7
+            except (TypeError, ValueError):
+                days = 7
+            return jsonify({"success": True, "data": plugin.usage.snapshot(days=max(1, min(31, days)))})
         if action == "clear_override":
             removed = await plugin.storage.clear_override(session_id)
             return jsonify(
@@ -316,15 +425,26 @@ async def api_preview(plugin):
     body = await request.get_json(silent=True) or {}
     session_id = str(body.get("session_id") or "")
     message = str(body.get("message") or "")
+    # 主动档位也能预览：插话用的强度和被动不一样，只看被动会误判效果
+    active = bool(body.get("active"))
+    injector = plugin.manager.injector
     try:
-        text = await plugin.manager.injector.build_injection_text(session_id, message)
+        strength = injector.strength_of(active=active)
+        text = await injector.build_injection_text(
+            session_id, message, active=active
+        )
         return jsonify(
             {
                 "success": True,
                 "data": {
                     "text": text or "",
                     "would_inject": bool(text),
-                    "should_inject": plugin.manager.injector.should_inject(session_id),
+                    "should_inject": injector.should_inject(session_id),
+                    "active": active,
+                    "strength": strength,
+                    "override_probability": injector.override_probability(strength),
+                    "length_rule": injector.build_length_rule(active) or "",
+                    "limits": injector.limits(strength),
                 },
             }
         )
@@ -407,6 +527,7 @@ async def api_export(plugin):
                 "chat_history": plugin.storage.chat_history,
                 "learn_state": plugin.storage.learn_state,
                 "overrides": plugin.storage.overrides,
+                "active_state": plugin.storage.active,
                 "metrics": plugin.storage.metrics,
             },
         }

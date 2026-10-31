@@ -34,10 +34,23 @@
 
     <section class="card">
       <h2 class="card-title">
+        <span>💸 今日消耗</span>
+        <small>按北京时间自然日，只计本插件发起的请求</small>
+      </h2>
+      <div id="usageTop" class="usage-top"></div>
+      <div id="usageTokens" class="grid"></div>
+      <div id="usageBars" class="bars"></div>
+      <p class="hint" id="usageSearch"></p>
+      <p class="hint usage-note">金额按 DeepSeek 牌价估算，节假日会略微高估；全机消耗是下限值（多轮工具调用中间请求会漏计）。</p>
+    </section>
+
+    <section class="card">
+      <h2 class="card-title">
         <span>⚙️ 运行参数 <small>（改动即时生效，不写回配置文件）</small></span>
         <button id="resetRuntime" class="ghost">恢复配置值</button>
       </h2>
       <div id="settings" class="settings"></div>
+      <p class="hint err" id="settingsMsg"></p>
     </section>
 
     <section class="card">
@@ -46,10 +59,15 @@
         <small>选一个会话，输入一句话，看实际会注入什么</small>
       </h2>
       <div class="preview-bar">
+        <div class="seg" id="previewMode">
+          <button type="button" data-active="0" class="on">被动</button>
+          <button type="button" data-active="1">主动</button>
+        </div>
         <select id="previewSession"></select>
         <input id="previewMessage" type="text" placeholder="输入一条群友可能说的话，例如：笑死我了 666" />
         <button id="previewBtn">预览</button>
       </div>
+      <p class="hint" id="previewNote"></p>
       <pre id="previewOut" class="preview-out empty">尚未预览</pre>
     </section>
 

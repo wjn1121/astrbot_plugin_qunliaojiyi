@@ -13,6 +13,9 @@
 
 额外还有 ``learn_state.json`` 记录每个会话的学习元信息（上次学习时间、累计次数、
 最后一次结果），只供面板展示，不参与注入逻辑，删掉也能自动重建。
+
+``active.json`` 存主动回复的会话状态（最后发言时间、冷却计时等），结构由 active.py
+定义，这里只做透传存取。
 """
 
 from __future__ import annotations
@@ -43,6 +46,10 @@ MANUAL_MAX_PER_SESSION = 50
 # 手动添加时的默认熟练度：略高于学习产出的起步值 5，让新加的条目在注入里能排上号
 DEFAULT_MANUAL_PROFICIENCY = 60
 
+# set_override 需要区分「调用方没传这个参数」和「显式传了 None」：
+# search 是 三态开关，None 本身有含义（跟随全局），不能像 learn/inject 那样用它当缺省。
+_UNSET = object()
+
 
 class Storage:
     """JSON 存储，写盘做 5 秒合并，避免高频小写入。"""
@@ -57,7 +64,11 @@ class Storage:
         self.learn_state: dict[str, LearnState] = self._load("learn_state.json")
         self.metrics: Metrics = self._load("metrics.json")
         # 会话级开关：{"bot1:GroupMessage:123": {"learn": false, "inject": true}}
-        self.overrides: dict[str, dict[str, bool]] = self._load("overrides.json")
+        # search 是三态，值可能是 None（跟随全局），所以类型放宽到 bool | None
+        self.overrides: dict[str, dict[str, bool | None]] = self._load("overrides.json")
+        # 主动回复状态：{"bot1:GroupMessage:123": {...}}，结构由 active.py 定义，
+        # 这里只负责存取，不解释内容
+        self.active: dict[str, dict] = self._load("active.json")
 
         self._lock = asyncio.Lock()
         self._version = 0
@@ -68,6 +79,7 @@ class Storage:
             "learn_state": False,
             "metrics": False,
             "overrides": False,
+            "active": False,
         }
         self._save_task: asyncio.Task | None = None
         self._save_delay = 5.0
@@ -121,6 +133,9 @@ class Storage:
             if self._dirty["overrides"]:
                 await self._write("overrides.json", self.overrides)
                 self._dirty["overrides"] = False
+            if self._dirty["active"]:
+                await self._write("active.json", self.active)
+                self._dirty["active"] = False
 
     async def _write(self, filename: str, data: dict) -> None:
         try:
@@ -132,7 +147,8 @@ class Storage:
 
     # ── 会话级开关 ──────────────────────────────────────────────────────
 
-    def session_override(self, session_id: str) -> dict[str, bool]:
+    def session_override(self, session_id: str) -> dict[str, bool | None]:
+        """原始覆盖记录。缺键表示走默认值，不在这里补默认。"""
         return self.overrides.get(session_id, {})
 
     def learn_allowed(self, session_id: str) -> bool:
@@ -141,27 +157,64 @@ class Storage:
     def inject_allowed(self, session_id: str) -> bool:
         return self.session_override(session_id).get("inject", True)
 
+    def search_allowed(self, session_id: str) -> bool | None:
+        """三态：None 跟随全局，True 本群开，False 本群关。"""
+        value = self.session_override(session_id).get("search")
+        return value if isinstance(value, bool) else None
+
     async def set_override(
-        self, session_id: str, *, learn: bool | None = None, inject: bool | None = None
-    ) -> dict[str, bool]:
+        self,
+        session_id: str,
+        *,
+        learn: bool | None = None,
+        inject: bool | None = None,
+        search: bool | None = _UNSET,
+    ) -> dict[str, bool | None]:
         current = dict(self.overrides.get(session_id, {}))
         if learn is not None:
             current["learn"] = bool(learn)
         if inject is not None:
             current["inject"] = bool(inject)
-        if current.get("learn", True) and current.get("inject", True):
-            # 两项都恢复默认时不留冗余记录
+        # 用哨兵区分「不传」和「传 None」：传 None 是「恢复跟随全局」，要真的写进去
+        if search is not _UNSET:
+            current["search"] = None if search is None else bool(search)
+        if (
+            current.get("learn", True)
+            and current.get("inject", True)
+            and current.get("search") is None
+        ):
+            # 三项都在默认值时才不留冗余记录
             self.overrides.pop(session_id, None)
         else:
             self.overrides[session_id] = current
         self._mark("overrides")
-        # 返回落库后的真实状态：两项都恢复默认时这里是空 dict
+        # 返回落库后的真实状态：全部恢复默认时这里是空 dict
         return self.overrides.get(session_id, {})
 
     async def clear_override(self, session_id: str) -> bool:
         removed = self.overrides.pop(session_id, None) is not None
         if removed:
             self._mark("overrides")
+        return removed
+
+    # ── 主动回复状态（active.json）─────────────────────────────────────
+
+    def active_of(self, session_id: str) -> dict:
+        """读某个群的主动回复状态，没有则返回空 dict。"""
+        return self.active.get(session_id, {})
+
+    def save_active(self, session_id: str, state: dict) -> None:
+        """写入主动回复状态并打脏标记。state 是完整替换。"""
+        self.active[session_id] = state
+        # 这里不动 _version：主动状态只影响调度的节流判断，跟注入缓存无关，
+        # 每次都失效会让 trait 缓存白重建。
+        self._mark("active")
+
+    def clear_active(self, session_id: str) -> bool:
+        """清除某个群的主动回复状态，返回是否真的删除了东西。"""
+        removed = self.active.pop(session_id, None) is not None
+        if removed:
+            self._mark("active")
         return removed
 
     # ── 风格特征 ────────────────────────────────────────────────────────
@@ -469,39 +522,64 @@ class Storage:
         return {**target, "source": SOURCE_MANUAL if hit_key == "manual" else SOURCE_LEARNED}, ""
 
     async def clear_session(self, session_id: str, scope: str = "all") -> bool:
-        """清空会话。scope 控制清哪部分：learned / manual / all。
+        """清空会话。scope 控制清哪部分：learned / manual / history / active / all。
 
         分开清是必要的：手动记忆删掉不可恢复，不该被「清空学习产出」顺手带走。
+        待学习消息（history）也是独立的一项：清掉学习产出后往往想留着消息重新学，
+        所以 learned 不再连带清 chat_history。
         """
+        if scope not in ("learned", "manual", "history", "active", "all"):
+            logger.warning(f"[群聊记忆] clear_session 收到未知 scope: {scope}")
+            return False
+
         changed = False
         if scope in ("all", "learned"):
-            changed = self.universal.pop(session_id, None) is not None
-            self.chat_history.pop(session_id, None)
-            self.learn_state.pop(session_id, None)
-            self._mark("universal", "chat_history", "learn_state")
+            if self.universal.pop(session_id, None) is not None:
+                changed = True
+            if self.learn_state.pop(session_id, None) is not None:
+                changed = True
+            self._mark("universal", "learn_state")
             self._version += 1
         if scope in ("all", "manual"):
             if self.manual.pop(session_id, None) is not None:
                 changed = True
             self._mark("manual")
             self._version += 1
+        if scope in ("all", "history"):
+            if self.chat_history.pop(session_id, None) is not None:
+                changed = True
+            self._mark("chat_history")
+        if scope in ("all", "active"):
+            if self.active.pop(session_id, None) is not None:
+                changed = True
+            self._mark("active")
         return changed
 
     async def clear_all(self, scope: str = "all") -> dict[str, int]:
         """清空所有会话，返回各部分被清掉的会话数。"""
-        result = {"learned": 0, "manual": 0}
+        result = {"learned": 0, "manual": 0, "history": 0, "active": 0}
+        if scope not in ("learned", "manual", "history", "active", "all"):
+            logger.warning(f"[群聊记忆] clear_all 收到未知 scope: {scope}")
+            return result
         if scope in ("all", "learned"):
             result["learned"] = len(self.universal)
             self.universal.clear()
-            self.chat_history.clear()
             self.learn_state.clear()
-            self._mark("universal", "chat_history", "learn_state")
+            self._mark("universal", "learn_state")
             self._version += 1
         if scope in ("all", "manual"):
             result["manual"] = len(self.manual)
             self.manual.clear()
             self._mark("manual")
             self._version += 1
+        if scope in ("all", "history"):
+            result["history"] = len(self.chat_history)
+            self.chat_history.clear()
+            self._mark("chat_history")
+        if scope in ("all", "active"):
+            result["active"] = len(self.active)
+            self.active.clear()
+            self._mark("active")
         return result
 
     # ── 聊天缓冲 ────────────────────────────────────────────────────────
@@ -720,6 +798,7 @@ class Storage:
             "stable": learned_stable + manual_stable,
             "situational": learned_sit + manual_sit,
             "manual_sessions": len(self.manual),
+            "active_sessions": len(self.active),
             "pending_messages": sum(len(v) for v in self.chat_history.values()),
             "metrics": {
                 "learn_calls": int(self.metrics.get("learn_calls", 0)),

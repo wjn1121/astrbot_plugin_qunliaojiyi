@@ -47,6 +47,66 @@ DEFAULTS: dict[str, Any] = {
     "blocked_users": [],
     "debug_mode": False,
     "startup_learn_delay_seconds": 600,
+    # ── 风格强度与人格让位 ──────────────────────────────────────────────
+    # 0 = 完全不注入风格（纯人格）；100 = 全力体现。分档见 injector.scale_quota
+    "style_strength": 100,
+    # 主动插话默认压到 60 —— 默认阈值 100 下，主动回复永远不会推翻人格
+    "active_style_strength": 60,
+    # 强度【严格大于】这个值才允许让位。默认 100 配合默认强度 100 等于「开箱不让位」，
+    # 保持与 1.2.0 一致：满额注入风格，但冲突时人格优先。想让风格赢就把它调低。
+    "style_override_threshold": 100,
+    # 让位时把声明同时追加到 system_prompt。效果更硬，但该轮 DeepSeek 前缀缓存必失效
+    "style_override_deep": False,
+    # ── 回复字数上限 ────────────────────────────────────────────────────
+    # 0 = 不限制。被动默认 0 是为了不改变 1.2.0 的现有行为
+    "reply_max_chars": 0,
+    "active_reply_max_chars": 80,
+    # 硬截断默认关：会切坏 markdown、链接和表情占位符，比啰嗦更难看
+    "reply_max_chars_hard": False,
+    # ── 主动回复 ────────────────────────────────────────────────────────
+    "active_reply_enabled": False,
+    # probability / rule / llm_judge；后两者更容易触发，靠冷却和日限压制
+    "active_reply_mode": "probability",
+    "active_reply_chance": 0.15,
+    "active_reply_cooldown_seconds": 1800,
+    "active_reply_daily_limit": 8,
+    "active_reply_quiet_hours": "01:00-08:00",
+    "active_reply_min_messages": 3,
+    "active_reply_judge_stack": 8,
+    "active_reply_backoff_limit": 3,
+    "active_reply_keywords": [],
+    "active_reply_guidance": (
+        "这是一条由你主动发起的群聊回复，没有人向你提问。\n"
+        "不要使用「有什么可以帮你」「我在」「已收到」这类服务式或召唤式开头；\n"
+        "不要提及自己是主动发言或任何机制；\n"
+        "像普通群友一样简短接话；话题不适合接就少说或不说。"
+    ),
+    "active_reply_provider_id": "",
+    # ── 联网搜索 ────────────────────────────────────────────────────────
+    # inherit = 完全交给 AstrBot（插件不计数、不限额）；plugin = 插件挂工具并限流；off = 全摘
+    "web_search_mode": "plugin",
+    "web_search_provider": "deepseek",
+    "web_search_api_key": "",
+    # 插件 key 为空时自动读 AstrBot 全局同家 key，让 key 只存一处
+    "web_search_reuse_global_key": True,
+    "web_search_max_results": 5,
+    "web_search_timeout": 8,
+    # 开了每条结果带整页正文，一次可能几万 token，成本翻十倍
+    "web_search_need_content": False,
+    # 每群每天的搜索次数上限，跨群独立计算，按日期天然归零
+    "web_search_daily_limit": 20,
+    "web_search_max_per_turn": 2,
+    "web_search_hint": "",
+    # ── 管理员 ──────────────────────────────────────────────────────────
+    "admin_extra_users": [],
+    "admin_tool_enabled": False,
+    # ── 计价（元 / 百万 token，DeepSeek 官方牌价）──────────────────────
+    "token_price_input_cached": 0.05,
+    "token_price_input_miss": 1.5,
+    "token_price_output": 4.5,
+    "token_price_peak_multiplier": 2.0,
+    "token_price_peak_enabled": True,
+    "token_stats_keep_days": 7,
 }
 
 # 允许在面板热调、且会写进 runtime.json 的字段。
@@ -68,12 +128,56 @@ RUNTIME_KEYS = {
     "max_stable_traits",
     "max_situational_traits",
     "debug_mode",
+    # 风格强度与人格让位
+    "style_strength",
+    "active_style_strength",
+    "style_override_threshold",
+    "style_override_deep",
+    # 字数上限
+    "reply_max_chars",
+    "active_reply_max_chars",
+    "reply_max_chars_hard",
+    # 主动回复
+    "active_reply_enabled",
+    "active_reply_mode",
+    "active_reply_chance",
+    "active_reply_cooldown_seconds",
+    "active_reply_daily_limit",
+    "active_reply_quiet_hours",
+    "active_reply_min_messages",
+    "active_reply_judge_stack",
+    "active_reply_backoff_limit",
+    "active_reply_keywords",
+    "active_reply_guidance",
+    "active_reply_provider_id",
+    # 联网搜索
+    "web_search_mode",
+    "web_search_provider",
+    "web_search_api_key",
+    "web_search_reuse_global_key",
+    "web_search_max_results",
+    "web_search_timeout",
+    "web_search_need_content",
+    "web_search_daily_limit",
+    "web_search_max_per_turn",
+    "web_search_hint",
+    # 管理员
+    "admin_extra_users",
+    "admin_tool_enabled",
+    # 计价
+    "token_price_input_cached",
+    "token_price_input_miss",
+    "token_price_output",
+    "token_price_peak_multiplier",
+    "token_price_peak_enabled",
+    "token_stats_keep_days",
 }
 
 _BOOL_KEYS = {k for k, v in DEFAULTS.items() if isinstance(v, bool)}
 _INT_KEYS = {k for k, v in DEFAULTS.items() if isinstance(v, int) and not isinstance(v, bool)}
 _FLOAT_KEYS = {k for k, v in DEFAULTS.items() if isinstance(v, float)}
 _LIST_KEYS = {k for k, v in DEFAULTS.items() if isinstance(v, list)}
+_STR_KEYS = {k for k, v in DEFAULTS.items() if isinstance(v, str)}
 
 
 class Settings:
@@ -149,6 +253,8 @@ class Settings:
                 if isinstance(value, str):
                     return [x.strip() for x in value.split(",") if x.strip()]
                 return list(value or [])
+            if key in _STR_KEYS:
+                return "" if value is None else str(value)
         except (TypeError, ValueError):
             return default
         return value
