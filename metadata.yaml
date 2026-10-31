@@ -1,6 +1,6 @@
 name: astrbot_plugin_qunliaojiyi
 display_name: 群聊记忆
-short_desc: 只做低成本的群聊长期记忆：低频批量学习群聊风格，回复时零网络注入
+short_desc: 低成本群聊长期记忆：学习群聊风格并零网络注入，可选主动接话与按群限次的联网搜索
 desc: >-
   把群聊记录攒起来，定时（默认 6 小时）交给一次 LLM 提炼成「稳定风格」和「场景化表达」，
   回复时以临时内容注入，不改 system prompt、不写会话历史，LLM 前缀缓存仍能命中。
@@ -21,6 +21,9 @@ tags:
   - 风格
   - 人格
   - 记忆
+  - 主动回复
+  - 联网搜索
+  - 成本统计
 support_platforms:
   - aiocqhttp
 views:
