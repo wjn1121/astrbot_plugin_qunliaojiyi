@@ -5,8 +5,10 @@
 - 事后的钩子：调用 :meth:`record` 补记 token。
 
 设计要点：
-- **按天一个文件**，``YYYY-MM-DD.json``，放在 AstrBot data 顶层的 ``qunliao_token/``，
-  而不是插件目录里 —— 换插件版本、重装插件都不会把历史账单带走。
+- **按天一个文件**，``YYYY-MM-DD.json``，放在**插件自己的数据目录**里的 ``token/``
+  （``data/plugin_data/<插件名>/token/``）。市场规范要求持久化数据都在 plugin_data 内，
+  放外面会导致用户迁移数据时漏掉账单。1.4.0 及更早写在 data 顶层的 ``qunliao_token/``，
+  升级后仍能读到，只是不再往里写。
 - 只存数字，不存任何消息内容，文件被看到也不会泄露聊天。
 - 内存累计 + 30 秒防抖落盘（与 ``storage.py`` 一致），异常一律吞掉并记日志：
   统计坏了最多是面板数字难看，绝不能影响正常回复。
@@ -248,30 +250,46 @@ def _ensure_writable(path: Path) -> bool:
 def resolve_dir(plugin_data_dir: str | Path) -> Path:
     """决定统计文件放哪。
 
-    首选 AstrBot data 顶层的 ``qunliao_token/``（插件目录外的相邻位置），
-    取不到或不可写就退回插件自己的 ``token_stats/``。任何异常都不许冒出去，
-    最坏情况返回一个可能写不进去的路径，由写盘处记日志。
+    **必须在插件自己的数据目录里**（``data/plugin_data/<插件名>/token/``）：
+    AstrBot 市场要求持久化数据都落在 plugin_data 内，否则用户迁移数据、
+    审计存储时会漏掉。1.4.0 及更早写到了 data 顶层的 ``qunliao_token/``，
+    那份现在只读不写（见 :func:`resolve_legacy_dir`）。
+
+    任何异常都不许冒出去，最坏返回一个可能写不进去的路径，由写盘处记日志。
     """
     try:
-        plugin_dir = Path(plugin_data_dir)
+        base = Path(plugin_data_dir)
     except (TypeError, ValueError):
-        plugin_dir = Path(".")
+        base = Path(".")
 
-    candidates: list[Path] = []
+    target = base / "token"
+    if _ensure_writable(target):
+        return target
+
+    # 兜底也留在插件目录内，绝不往外写
+    fallback = base / "token_stats"
+    _ensure_writable(fallback)
+    return fallback
+
+
+def resolve_legacy_dir(plugin_data_dir: str | Path) -> Path | None:
+    """1.4.0 及更早的账单目录（``data/qunliao_token/``）。
+
+    只用于读取历史数据，不再往这里写。目录不存在、或数据目录不在标准的
+    ``<data>/plugin_data/<插件名>`` 布局下，就返回 None。
+    """
     try:
-        # 只有标准的 <data>/plugin_data/<插件名> 布局才往 data 顶层放。
-        # 不判断层级的话，自定义数据目录（或拿临时目录跑测试）会一路往上算，
-        # 最坏把统计写到文件系统根目录下。
-        if plugin_dir.parent.name == "plugin_data":
-            candidates.append(plugin_dir.parent.parent / "qunliao_token")
-    except Exception:  # noqa: BLE001
-        pass
-    candidates.append(plugin_dir / "token_stats")
-
-    for candidate in candidates:
-        if _ensure_writable(candidate):
-            return candidate
-    return candidates[-1]
+        base = Path(plugin_data_dir)
+    except (TypeError, ValueError):
+        return None
+    try:
+        # 不判断层级的话，自定义数据目录会一路往上算，读到不该读的地方
+        if base.parent.name != "plugin_data":
+            return None
+        legacy = base.parent.parent / "qunliao_token"
+        return legacy if legacy.is_dir() else None
+    except OSError:
+        return None
 
 
 def _prune_dir(directory: Path, keep_days: int, day: str) -> None:
@@ -308,6 +326,8 @@ class UsageTracker:
     def __init__(self, data_dir: Path, settings) -> None:
         self._settings = settings
         self.dir = resolve_dir(data_dir)
+        # 1.4.0 及更早把账单写在 data 顶层，升级后先读旧位置，不动它
+        self.legacy_dir = resolve_legacy_dir(data_dir)
 
         self._lock = threading.RLock()
         self._flush_lock = asyncio.Lock()
@@ -442,7 +462,11 @@ class UsageTracker:
 
     def _load_day(self, day: str) -> DayDoc:
         path = self._day_path(day)
-        if not path.exists():
+        if not path.is_file() and self.legacy_dir is not None:
+            # 1.4.0 及更早的账单在 data 顶层。升级后先读那边，等这一天再记一笔
+            # （写入永远走新目录）就自然搬过来了，旧文件留着不动。
+            path = self.legacy_dir / f"{day}.json"
+        if not path.is_file():
             return _empty_doc(day)
         try:
             raw = json.loads(path.read_text(encoding="utf-8"))

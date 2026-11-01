@@ -1,8 +1,11 @@
 """群人格档案：把学习库里「已生效」的特征整理成一份可读、可改的 markdown。
 
 为什么单独存文件而不是只放面板里：人格是长期资产，用户会想直接看、想备份、
-想粘到 AstrBot 的人设里。落在插件数据目录之外（``AstrBot/data/qunliao_persona/``），
-插件升级、市场覆盖都碰不到它。
+想粘到 AstrBot 的人设里。文件放在**插件自己的数据目录**里
+（``AstrBot/data/plugin_data/astrbot_plugin_qunliaojiyi/persona/``）：市场规范要求
+持久化数据都在 plugin_data 内，放外面会导致用户迁移、审计时漏掉这份数据。
+1.4.0 及更早写到 data 顶层的 ``qunliao_persona/``，升级后仍能读到（只读不写），
+下一次重建时内容会落到新目录。
 
 文件分成两段，用 HTML 注释隔开：
 
@@ -57,35 +60,43 @@ DIMENSION_ORDER = ("语气", "节奏", "互动", "话题", "黑话")
 def resolve_persona_dir(plugin_data_dir: str | Path) -> Path:
     """人格文件放哪。
 
-    首选 AstrBot data 顶层的 ``qunliao_persona/``（插件目录外），不可写就退回
-    插件数据目录下的 ``persona/``。任何异常都不冒出去，最坏返回一个可能写不进的
-    路径，由写盘处记日志。
+    **必须在插件自己的数据目录里**（``data/plugin_data/<插件名>/persona/``）：
+    AstrBot 市场要求持久化数据都落在 plugin_data 内，否则用户迁移数据、
+    审计存储时会漏掉。1.4.0 及更早写到了 data 顶层的 ``qunliao_persona/``，
+    那份现在只读不写（见 :func:`resolve_legacy_persona_dir`），升级不会丢内容。
+
+    任何异常都不冒出去，最坏返回一个可能写不进的路径，由写盘处记日志。
     """
     try:
-        plugin_dir = Path(plugin_data_dir)
+        base = Path(plugin_data_dir)
     except (TypeError, ValueError):
-        plugin_dir = Path(".")
-    candidates: list[Path] = []
-    try:
-        # 只有标准的 <data>/plugin_data/<插件名> 布局才往 data 顶层放。
-        # 不判断层级的话，自定义数据目录（或拿临时目录跑测试）会一路往上算，
-        # 最坏写到文件系统根目录下。
-        if plugin_dir.parent.name == "plugin_data":
-            candidates.append(plugin_dir.parent.parent / "qunliao_persona")
-    except Exception:  # noqa: BLE001
-        pass
-    candidates.append(plugin_dir / "persona")
+        base = Path(".")
 
-    for candidate in candidates:
-        try:
-            candidate.mkdir(parents=True, exist_ok=True)
-            probe = candidate / ".write_probe"
-            probe.write_text("", encoding="utf-8")
-            probe.unlink(missing_ok=True)
-            return candidate
-        except OSError:
-            continue
-    return candidates[-1]
+    target = base / "persona"
+    try:
+        target.mkdir(parents=True, exist_ok=True)
+        probe = target / ".write_probe"
+        probe.write_text("", encoding="utf-8")
+        probe.unlink(missing_ok=True)
+    except OSError:
+        pass
+    return target
+
+
+def resolve_legacy_persona_dir(plugin_data_dir: str | Path) -> Path | None:
+    """1.4.0 及更早的人格档案目录（``data/qunliao_persona/``）。只读。"""
+    try:
+        base = Path(plugin_data_dir)
+    except (TypeError, ValueError):
+        return None
+    try:
+        # 不判断层级的话，自定义数据目录会一路往上算，读到不该读的地方
+        if base.parent.name != "plugin_data":
+            return None
+        legacy = base.parent.parent / "qunliao_persona"
+        return legacy if legacy.is_dir() else None
+    except OSError:
+        return None
 
 
 def file_stem(session_id: str) -> str:
@@ -194,21 +205,42 @@ class PersonaStore:
 
     def __init__(self, plugin_data_dir: str | Path):
         self.dir = resolve_persona_dir(plugin_data_dir)
+        # 1.4.0 及更早写在 data 顶层，升级后先读旧位置，不动它
+        self.legacy_dir = resolve_legacy_persona_dir(plugin_data_dir)
 
     # ── 路径 ────────────────────────────────────────────────────────────
 
     def path_of(self, session_id: str) -> Path:
+        """写入目标（新目录）。读的时候要走 :meth:`source_path_of`。"""
         return self.dir / f"{file_stem(session_id)}.md"
 
-    def exists(self, session_id: str) -> bool:
+    def source_path_of(self, session_id: str) -> Path | None:
+        """实际该从哪读：新目录优先，没有再退到 1.4.0 的旧目录。
+
+        只读不搬：旧文件留在原地，等这份人格下一次被重建（读旧 + 写新）时，
+        内容自然就落到新目录了，不需要单独写迁移脚本。
+        """
+        target = self.path_of(session_id)
         try:
-            return self.path_of(session_id).is_file()
+            if target.is_file():
+                return target
+            if self.legacy_dir is not None:
+                legacy = self.legacy_dir / target.name
+                if legacy.is_file():
+                    return legacy
         except OSError:
-            return False
+            return None
+        return None
+
+    def exists(self, session_id: str) -> bool:
+        return self.source_path_of(session_id) is not None
 
     def updated_at(self, session_id: str) -> float:
+        path = self.source_path_of(session_id)
+        if path is None:
+            return 0.0
         try:
-            return self.path_of(session_id).stat().st_mtime
+            return path.stat().st_mtime
         except OSError:
             return 0.0
 
@@ -220,20 +252,22 @@ class PersonaStore:
         文件被手改坏了（标记丢了、内容被清空）不抛异常：整体当人工段返回，
         至少不丢用户写的字。
         """
-        path = self.path_of(session_id)
+        target = self.path_of(session_id)
+        path = self.source_path_of(session_id)
         base = {
             "session_id": session_id,
             "display_name": display_name(session_id),
-            "path": str(path),
+            "path": str(target),
+            "legacy": bool(path is not None and path != target),
             "exists": False,
             "auto": "",
             "manual": "",
             "full": "",
             "updated_at": 0.0,
         }
+        if path is None:
+            return base
         try:
-            if not path.is_file():
-                return base
             full = path.read_text(encoding="utf-8")
         except OSError as e:
             logger.warning(f"[群聊记忆] 读取人格档案失败 {session_id}: {e}")

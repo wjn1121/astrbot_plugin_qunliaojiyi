@@ -11,7 +11,7 @@
 
 [![AstrBot](https://img.shields.io/badge/AstrBot-%3E%3D4.29.1-blue)](https://github.com/AstrBotDevs/AstrBot)
 [![Platform](https://img.shields.io/badge/platform-QQ_(aiocqhttp)-green)](#)
-[![Version](https://img.shields.io/badge/version-1.4.0-orange)](metadata.yaml)
+[![Version](https://img.shields.io/badge/version-1.4.1-orange)](metadata.yaml)
 [![Stars](https://img.shields.io/github/stars/wjn1121/astrbot_plugin_qunliaojiyi?label=stars&color=yellow)](https://github.com/wjn1121/astrbot_plugin_qunliaojiyi/stargazers)
 [![Downloads](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fcloud.astrbot.app%2Fapi%2Fv1%2Fmarket%2Fplugins.json&query=%24%5B%27wjn1121%2Fastrbot_plugin_qunliaojiyi%27%5D.download_count&label=downloads&color=green&suffix=%E6%AC%A1&cacheSeconds=3600)](https://cloud.astrbot.app/market)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-9cf)](LICENSE)
@@ -472,9 +472,12 @@ system prompt 末尾。代价是**该轮缓存必然失效**，输入按未命�
 
 ## 💸 消耗统计
 
-位置在 **AstrBot data 顶层的 `qunliao_token/YYYY-MM-DD.json`**，不在插件目录里——
-换版本、重装插件都不会把历史账单带走。保留 7 天（`token_stats_keep_days`），超出的自动删。
-写不进 data 顶层时会退回插件目录下的 `token_stats/`。
+位置在**插件自己的数据目录**里：`AstrBot/data/plugin_data/astrbot_plugin_qunliaojiyi/token/YYYY-MM-DD.json`。
+放在这里而不是 data 顶层，是为了让用户迁移数据、审计存储时不会漏掉这份账单（AstrBot 市场的上架要求）。
+保留 7 天（`token_stats_keep_days`），超出的自动删。
+
+> **从 1.4.0 升级**：老账单在 `AstrBot/data/qunliao_token/`，插件仍能读到，只是不再往里写。
+> 这一天只要再记一笔，账就会合并着写进新位置；旧文件留在原地，确认没问题后可以自己删掉。
 
 **只存数字，不存任何消息内容。** 文件被看到也不会泄露聊天。
 
@@ -784,14 +787,18 @@ astrbot_plugin_qunliaojiyi/
 ### 文件在哪
 
 ```
-AstrBot/data/qunliao_persona/
+AstrBot/data/plugin_data/astrbot_plugin_qunliaojiyi/persona/
 ├── bot1_GroupMessage_1038882918.md
 ├── bot1_GroupMessage_165465552.md
 └── bot1_FriendMessage_8848.md
 ```
 
-放在插件数据目录**之外**，和 `qunliao_token/`（消耗统计）平级。插件升级、从市场重装都碰不到它，
-你也可以直接用文件管理器打开、备份、丢进 Git。
+放在**插件自己的数据目录**里，和 `token/`（消耗统计）平级。这是 AstrBot 市场的上架要求——
+持久化数据必须在 `plugin_data/<插件名>/` 内，否则用户换机器迁移、审计存储时会漏掉它。
+插件升级、从市场重装都碰不到这个目录，你也可以直接用文件管理器打开、备份、丢进 Git。
+
+> **从 1.4.0 升级**：老档案在 `AstrBot/data/qunliao_persona/`，插件仍能读到（面板里那份会标「来自旧位置」）。
+> 对它点一次「重新生成」或保存人工段，内容就会落到新目录，旧文件留在原地不动。
 
 ### 长什么样
 
@@ -865,7 +872,7 @@ AstrBot/data/qunliao_persona/
 
 | 文件 | 内容 |
 |------|------|
-| `universal.json` | 每个会话**自动学到**的特征（每轮学习整表替换） |
+| `universal.json` | 每个会话**自动学到**的特征（默认增量累积；`learn_mode=replace` 时整表替换） |
 | `manual_traits.json` | 每个会话**手动添加**的记忆（学习流程不读不写，只在注入时合并） |
 | `chat_history.json` | 待学习的聊天缓冲（含原文，学完即清空） |
 | `learn_state.json` | 每会话学习元信息与最近 20 次记录，删掉可自动重建 |
@@ -875,15 +882,16 @@ AstrBot/data/qunliao_persona/
 | `pins.json` | 面板里置顶的群号 / QQ 号及其顺序，纯显示偏好，清空记忆不会清它 |
 | `runtime.json` | 面板/管理员工具热调的参数覆盖 |
 
-消耗统计**和人格档案**不在这里，在 AstrBot data 顶层的两个相邻目录：
+消耗统计和人格档案也在这个目录里，各自一个子目录：
 
 | 路径 | 内容 |
 |------|------|
-| `AstrBot/data/qunliao_token/YYYY-MM-DD.json` | 每天一个文件，存 token 数、金额与 24 小时分布，保留 7 天 |
-| `AstrBot/data/qunliao_persona/<会话>.md` | 每个群 / 私聊一份人格档案，见上文「人格档案」 |
+| `token/YYYY-MM-DD.json` | 每天一个文件，存 token 数、金额与 24 小时分布，保留 7 天 |
+| `persona/<会话>.md` | 每个群 / 私聊一份人格档案，见上文「人格档案」 |
 
-这两个目录都写不进时（自定义数据目录、权限不足），会退回插件数据目录下的
-`token_stats/` 与 `persona/`，功能不受影响，只是位置变了。
+> **1.4.0 升级上来的用户**：这两份数据原先在 `AstrBot/data/qunliao_token/` 与
+> `AstrBot/data/qunliao_persona/`（data 顶层，不符合市场的持久化目录要求）。现在写入一律走
+> 上面两个子目录，旧位置仍然只读兼容——读得到、不会再往里写，确认新位置正常后可以把旧目录删掉。
 
 > 📌 特征分两个文件存不是多余的设计：自动学习是「整表替换」语义，如果手动加的
 > 记忆混在同一张表里，下一轮提炼没复述到就会被静默删掉。物理分开后，学习不可能
@@ -959,6 +967,18 @@ AstrBot/data/qunliao_persona/
 ---
 
 ## 🆕 更新日志
+
+### v1.4.1
+
+> 只改数据存放位置，功能没变。已在用的记忆、额度、人格档案都不会丢。
+
+- 📁 **数据搬回插件自己的目录**：人格档案改到
+  `data/plugin_data/astrbot_plugin_qunliaojiyi/persona/`，按天 token 账单改到同目录下的 `token/`。
+  市场要求持久化数据必须留在 `plugin_data/<插件名>/` 内，放 data 顶层会导致用户迁移、审计时漏掉。
+- 🔄 **升级不丢数据**：旧位置（`data/qunliao_persona/`、`data/qunliao_token/`）仍然只读兼容——
+  读得到、不再往里写。人格档案点一次「重新生成」或保存人工段就会落到新目录，
+  账单在当天再记一笔时与新数据合并。确认正常后旧目录可以自己删。
+- ✏️ README 与插件文档同步改了路径说明。
 
 ### v1.4.0
 
@@ -1097,7 +1117,7 @@ AstrBot/data/qunliao_persona/
 ## 🔧 技术栈
 
 - **无额外 pip 依赖**：只用 AstrBot SDK 内置模块和 AI 适配器本来就带的 `aiohttp`，不用 `pip install` 任何东西
-- **纯本地存储**：插件数据目录 8 个 JSON 文件 + 插件目录外一个按天的消耗统计目录，无数据库
+- **纯本地存储**：全部数据都在 `data/plugin_data/<插件名>/` 内——9 个 JSON 文件，外加 `token/` 按天账单与 `persona/` 人格档案，无数据库，也不往插件目录外写任何东西
 - **存储隔离**：自动学习（`universal.json`）与手动记忆（`manual_traits.json`）物理分文件，
   学习流程不存在改动手动记忆的代码路径，不靠标记位或合并逻辑「尽量不覆盖」
 - **注入方式**：`extra_user_content_parts` + `mark_as_temp()`，保护 LLM 前缀缓存
