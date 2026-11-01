@@ -17,7 +17,7 @@ desc: >-
   三重冷却与退避）、被动/主动分开的字数上限、联网搜索接管（按群独立限次，默认 DeepSeek
   搜索，¥0.005/次）、管理员在对话里调参、按天 token 消耗统计。
   仍保留 1.3.x 的整表重写模式，learn_mode 切成 replace 即可一键回退，数据双向兼容。
-version: 1.4.0
+version: 1.4.1
 author: wjn1121
 repo: https://github.com/wjn1121/astrbot_plugin_qunliaojiyi
 astrbot_version: ">=4.29.1,<5"
