@@ -11,7 +11,7 @@
 
 [![AstrBot](https://img.shields.io/badge/AstrBot-%3E%3D4.29.1-blue)](https://github.com/AstrBotDevs/AstrBot)
 [![Platform](https://img.shields.io/badge/platform-QQ_(aiocqhttp)-green)](#)
-[![Version](https://img.shields.io/badge/version-1.4.1-orange)](metadata.yaml)
+[![Version](https://img.shields.io/badge/version-1.4.0-orange)](metadata.yaml)
 [![Stars](https://img.shields.io/github/stars/wjn1121/astrbot_plugin_qunliaojiyi?label=stars&color=yellow)](https://github.com/wjn1121/astrbot_plugin_qunliaojiyi/stargazers)
 [![Downloads](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fcloud.astrbot.app%2Fapi%2Fv1%2Fmarket%2Fplugins.json&query=%24%5B%27wjn1121%2Fastrbot_plugin_qunliaojiyi%27%5D.download_count&label=downloads&color=green&suffix=%E6%AC%A1&cacheSeconds=3600)](https://cloud.astrbot.app/market)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-9cf)](LICENSE)
@@ -968,18 +968,6 @@ AstrBot/data/plugin_data/astrbot_plugin_qunliaojiyi/persona/
 
 ## 🆕 更新日志
 
-### v1.4.1
-
-> 只改数据存放位置，功能没变。已在用的记忆、额度、人格档案都不会丢。
-
-- 📁 **数据搬回插件自己的目录**：人格档案改到
-  `data/plugin_data/astrbot_plugin_qunliaojiyi/persona/`，按天 token 账单改到同目录下的 `token/`。
-  市场要求持久化数据必须留在 `plugin_data/<插件名>/` 内，放 data 顶层会导致用户迁移、审计时漏掉。
-- 🔄 **升级不丢数据**：旧位置（`data/qunliao_persona/`、`data/qunliao_token/`）仍然只读兼容——
-  读得到、不再往里写。人格档案点一次「重新生成」或保存人工段就会落到新目录，
-  账单在当天再记一笔时与新数据合并。确认正常后旧目录可以自己删。
-- ✏️ README 与插件文档同步改了路径说明。
-
 ### v1.4.0
 
 > 市场上一版是 1.3.x。这一版把学习链路、面板、人格档案一起发了，配置项 62 → 75，全部可热调。
@@ -1010,8 +998,8 @@ AstrBot/data/plugin_data/astrbot_plugin_qunliaojiyi/persona/
 - 👥 **学习库按群聊和私聊分组**：一个群一组，标题上写着条数和待审数量，不再一条条平铺混在一起。
 - 📌 **群号 / QQ 号可置顶**：会话列表、学习库分组、预览选择器都能置顶，想置顶几个都行，
   排在列表最前。只影响面板显示顺序，不参与学习和注入，清空记忆也不会清掉。
-- 🧬 **人格档案**：每个群生成一份 markdown 人格文件，存在插件数据目录之外
-  （`AstrBot/data/qunliao_persona/`），插件升级不会覆盖。
+- 🧬 **人格档案**：每个群生成一份 markdown 人格文件，存在
+  `AstrBot/data/plugin_data/astrbot_plugin_qunliaojiyi/persona/`，插件升级不会覆盖。
 - 🔀 **自动段与人工段物理隔离**：自动段由学习库里已批准的特征渲染，学习和审核后自动更新；
   人工段只有你自己写，程序永远不碰。文件里用注释明确隔开，面板里也分开显示，
   人工段可直接编辑、保存即生效，支持一键复制全文或下载 `.md`。
@@ -1034,6 +1022,11 @@ AstrBot/data/plugin_data/astrbot_plugin_qunliaojiyi/persona/
 
 **变更**
 
+- 📁 **数据统一落在插件自己的目录**：人格档案在
+  `data/plugin_data/astrbot_plugin_qunliaojiyi/persona/`，按天 token 账单在 `.../token/`。
+  持久化数据都在 `plugin_data/<插件名>/` 内，迁移或换机时整目录拷走就够，不会漏。
+  旧位置（`data/qunliao_persona/`、`data/qunliao_token/`）仍然只读兼容——读得到、不再往里写，
+  档案点一次「重新生成」或保存人工段、账单当天再记一笔，就会落到新目录，确认后旧目录可自行删除。
 - ✏️ 学习库每条不再重复显示所属群号，已经按群分好组了。
 - ✏️ 学习库搜索命中群号时整组展开，并显示「命中 N 个群 / 共 M 个群」。
 - ✏️ 分时图的「次数」只数模型调用，搜索单独显示，与顶部「今日调用」同口径。
