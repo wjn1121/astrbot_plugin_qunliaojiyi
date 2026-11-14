@@ -35,13 +35,19 @@ from .constants import PLUGIN_AUTHOR, PLUGIN_DESC, PLUGIN_NAME, PLUGIN_VERSION
 from .core import Manager, Settings, Storage
 from .core.active import ActiveReply
 from .core.admin import admin_summary, is_admin
+from .core.bond import BondStore
+from .core.facts import FactStore
+from .core.profile import ProfileStore
 from .core.persona import PersonaStore
 from .core.usage import UsageTracker
 from .hooks import (
+    apply_tone,
     collect_message,
+    detect_correction,
     inject_style,
     maybe_active_reply,
     record_llm_usage,
+    touch_relation,
     truncate_result,
 )
 
@@ -72,6 +78,12 @@ class QunliaoJiyi(Star):
         self.persona = PersonaStore(self.data_dir)
         self.manager = Manager(self, self.storage, self.settings)
         self.active = ActiveReply(self, self.storage, self.settings)
+        # 关系层：只做计算，数据落在 storage.bonds（复用它的 5 秒合并写盘）
+        self.bond = BondStore(self)
+        self.facts = FactStore(self)
+        # 个人画像：数据落在 storage.profiles。装配在 facts 之后，
+        # 因为它要读事实来生成；facts 那边只通过 getattr 取它，不反向依赖
+        self.profile = ProfileStore(self, self.storage, self.settings)
 
         # 待确认的清空操作：{session_id: (scope, 发起时间)}
         self._pending_clear: dict[str, tuple[str, float]] = {}
@@ -104,8 +116,21 @@ class QunliaoJiyi(Star):
         普通 async 函数接不住这个返回值。
         """
         await collect_message(self, event)
+        await detect_correction(self, event)
         async for result in maybe_active_reply(self, event):
             yield result
+
+    @filter.after_message_sent()
+    async def on_after_message_sent(self, event: AstrMessageEvent):
+        """bot 真的把回复发出去了，才算跟这个人发生了一次交互。
+
+        以前挂在「收到消息」上，结果是：群里有人自顾自刷屏、bot 一句没接，
+        好感照样涨——那反映的是谁打字快。挂到这里之后，
+        空消息链、只回个 @ 或引用（管线会提前 return）都不算一次。
+
+        15 分钟冷却 + 每轮去重兜底，分段回复打多遍钩子也只记一次。
+        """
+        await touch_relation(self, event)
 
     @filter.on_llm_request(priority=17)
     async def on_llm_request(self, event: AstrMessageEvent, req):
@@ -117,9 +142,109 @@ class QunliaoJiyi(Star):
 
     @filter.on_decorating_result()
     async def on_decorating_result(self, event: AstrMessageEvent):
+        # 先清理再截断：清理只会让字变少，截断按清理后的长度算才准
+        await apply_tone(self, event)
         await truncate_result(self, event)
 
     # ── 命令 ────────────────────────────────────────────────────────────
+
+    @filter.command("关系")
+    async def cmd_relation(self, event: AstrMessageEvent):
+        """看和当前用户的关系进度。"""
+        if not self.settings.group("bond").get("enabled"):
+            yield event.plain_result(
+                "关系状态没开。管理员可以在插件配置的「关系状态」里打开。"
+            )
+            return
+        try:
+            is_group = not event.is_private_chat()
+        except Exception:  # noqa: BLE001 - 判不出来按群聊算，措辞更保守
+            is_group = True
+        info = self.bond.summary(event.get_sender_id(), is_group=is_group)
+        yield event.plain_result(BondStore.format_summary(info))
+
+    @filter.command("称呼")
+    async def cmd_nickname(self, event: AstrMessageEvent):
+        """设定 bot 怎么称呼你；不带参数则清除。"""
+        cfg = self.settings.group("bond")
+        if not cfg.get("enabled"):
+            yield event.plain_result(
+                "关系状态没开，称呼暂时用不上。管理员可以在插件配置的「关系状态」里打开。"
+            )
+            return
+        if not cfg.get("nickname_enabled", True):
+            yield event.plain_result("管理员关掉了自定义称呼。")
+            return
+
+        raw = str(getattr(event, "message_str", "") or "").strip()
+        parts = raw.replace("/", " ").split()
+        args = [p for p in parts[1:] if p] if parts else []
+        nickname = " ".join(args).strip()
+
+        if not nickname:
+            self.bond.set_nickname(event.get_sender_id(), "")
+            yield event.plain_result("已清除，之后用你的平台昵称。")
+            return
+
+        cleaned = self.bond.set_nickname(event.get_sender_id(), nickname)
+        if not cleaned:
+            yield event.plain_result("这个称呼没存上，换一个短一点的试试。")
+            return
+        yield event.plain_result(f"好，以后叫你「{cleaned}」。")
+
+    @filter.command("记得")
+    async def cmd_facts(self, event: AstrMessageEvent):
+        """看关于自己的记忆；带内容则是手动记一条。
+
+        手动加的直接生效，不要求观察两次——人都明确说了「记一下」，
+        再让他等两轮没道理。
+        """
+        if not self.facts.enabled():
+            yield event.plain_result(
+                "事实记忆没开。管理员可以在插件配置的「事实记忆」里打开。"
+            )
+            return
+        raw = str(getattr(event, "message_str", "") or "").strip()
+        parts = raw.replace("/", " ").split()
+        text = " ".join(parts[1:]).strip() if len(parts) > 1 else ""
+        if text:
+            record = self.facts.remember(
+                event.unified_msg_origin, event.get_sender_id(), text
+            )
+            if record is None:
+                yield event.plain_result(
+                    "这条没记上：要么太长，要么含敏感信息（密码、证件、验证码这类不记）。"
+                )
+                return
+            yield event.plain_result(
+                f"记下了：[{record.get('id')}] {record.get('text')}"
+            )
+            return
+        info = self.facts.summary(event.unified_msg_origin, event.get_sender_id())
+        yield event.plain_result(FactStore.format_summary(info))
+
+    @filter.command("忘掉")
+    async def cmd_forget(self, event: AstrMessageEvent):
+        """删掉一条记忆。按编号或关键词，删完立即生效。"""
+        if not self.facts.enabled():
+            yield event.plain_result("事实记忆没开。")
+            return
+        raw = str(getattr(event, "message_str", "") or "").strip()
+        parts = raw.replace("/", " ").split()
+        token = " ".join(parts[1:]).strip() if len(parts) > 1 else ""
+        if not token:
+            yield event.plain_result(
+                "用法：/忘掉 <编号或关键词>，例如 /忘掉 f_0001 或 /忘掉 论文。\n"
+                "先发 /记得 看全部带编号的记忆。"
+            )
+            return
+        removed = self.facts.forget(
+            event.unified_msg_origin, event.get_sender_id(), token
+        )
+        if not removed:
+            yield event.plain_result(f"没找到匹配「{token}」的记忆。发 /记得 看看有哪些。")
+            return
+        yield event.plain_result(f"删掉了 {removed} 条。")
 
     @filter.command("风格状态")
     async def cmd_status(self, event: AstrMessageEvent):

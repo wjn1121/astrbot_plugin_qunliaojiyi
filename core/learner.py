@@ -26,13 +26,52 @@ from .storage import Storage, normalize_text
 from .types import ChatMessage, ParsedTraits, Trait
 
 # 数字梗 / 短重复串（666、233、哈哈哈）不进稳定风格
-_MEME_DIGIT_RE = re.compile(r"(?<!\d)\d{2,4}(?!\d)")
+# 数字刷屏：666 / 2333 / 233333 都算。
+# 早先限了 2-4 位，导致 233333、666666 这种连打反而识别不出来——
+# 而它们恰恰是最典型的刷屏。
+_MEME_DIGIT_RE = re.compile(r"(?<!\d)\d{2,}(?!\d)")
 _MEME_REPEAT_RE = re.compile(r"^(.)\1{2,}$")
 
 SYSTEM_PROMPT = (
     "你是一个群聊文化分析师，擅长从聊天记录里提炼这个群的说话风格和语言习惯。"
     "你只输出 JSON，不输出解释。"
 )
+
+# 单条消息进 prompt 的最大字数。几百字的长文对「这个群怎么说话」贡献很低，
+# 截断几乎不损失信息，但能省下大量输入 token。
+LEARN_MSG_CHARS = 200
+
+# 单次学习喂进 prompt 的总字符预算。正常群聊 80 条也就一两千字，碰不到上限；
+# 它是给「有人贴长文 / 转长消息」兜底的——没有这层，一次学习可能贵十倍。
+LEARN_CHARS_BUDGET = 4000
+
+# 候选少于这个数就不做入库自检：为 1-2 条候选再发一次请求，
+# 省下的请求比丢掉的那点精度值钱。
+SELF_CHECK_MIN_CANDIDATES = 4
+
+# 人格档案「已更新」日志的节流窗口（秒）。批量审核时这个事件会连着触发，
+# 全打 INFO 只会把日志刷满。
+PERSONA_LOG_INTERVAL = 60.0
+
+
+def _fit_chars_budget(history: list[dict], budget: int) -> list[dict]:
+    """按总字符预算裁历史：从最新往回取，超预算就停。
+
+    保留最新的而不是最早的——学「这个群现在怎么说话」比学半年前怎么说话有用。
+    至少留一条，否则预算极小时会返回空列表让上层误判成「消息不足」。
+    """
+    if budget <= 0:
+        return history
+    kept: list[dict] = []
+    used = 0
+    for msg in reversed(history):
+        text = str(msg.get("content") or "")
+        if kept and used + len(text) > budget:
+            break
+        kept.append(msg)
+        used += len(text)
+    kept.reverse()
+    return kept
 
 
 def looks_like_meme(content: str) -> bool:
@@ -50,6 +89,29 @@ class Learner:
     def __init__(self, plugin, storage: Storage):
         self.plugin = plugin
         self.storage = storage
+        # 人格档案重建在批量审核时会被连着调很多次（实测 22 秒 7 次），
+        # 按会话节流：同一会话一分钟内只打一条 INFO，其余降为 debug。
+        # 档案内容确实每次都变了，但对日志读者来说「又更新了 6 次」没有信息量。
+        self._persona_log_at: dict[str, float] = {}
+        # 画像重写的后台任务。存着是为了让 asyncio 别把没跑完的任务回收掉
+        self._profile_tasks: set = set()
+
+    # ── 个人画像联动 ────────────────────────────────────────────────────
+
+    def _schedule_profile(self, sender_id: str, session_id: str) -> None:
+        """把「重写这个人的画像」丢到后台。失败静默——画像是增强项。"""
+        profile = getattr(self.plugin, "profile", None)
+        if profile is None:
+            return
+        try:
+            task = asyncio.create_task(profile.maybe_rewrite(sender_id, session_id))
+            self._profile_tasks.add(task)
+            task.add_done_callback(self._profile_tasks.discard)
+        except RuntimeError:
+            # 没有事件循环（同步测试里调用）就跳过，下一轮学习还会再触发
+            pass
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"[群聊记忆] 画像重写排队失败（可忽略）: {e}")
 
     # ── 人格档案联动 ────────────────────────────────────────────────────
 
@@ -65,8 +127,14 @@ class Learner:
             return
         try:
             result = store.rebuild(session_id, self.storage.universal.get(session_id, []))
-            if result.get("changed"):
+            if not result.get("changed"):
+                return
+            now = time.monotonic()
+            if now - self._persona_log_at.get(session_id, 0.0) >= PERSONA_LOG_INTERVAL:
+                self._persona_log_at[session_id] = now
                 logger.info(f"[群聊记忆] 人格档案已更新：{session_id}")
+            else:
+                logger.debug(f"[群聊记忆] 人格档案已更新（{session_id}，同类日志已合并）")
         except Exception as e:  # noqa: BLE001 - 档案是附加产物，不能拖垮学习
             logger.warning(f"[群聊记忆] 更新人格档案失败 {session_id}: {e}")
 
@@ -87,16 +155,35 @@ class Learner:
                 "situational": 0,
             }
 
+        # 纯表情、单字刷屏、123 这类没有学习价值，纯粹白花一次请求。
+        # 门槛设 3 条：低于这个数基本可以确定这批就是刷屏，
+        # 再往上提就有误杀正常短句聊天的风险。
+        meaningful = sum(
+            1 for m in history if not looks_like_meme(str(m.get("content") or ""))
+        )
+        if meaningful < 3:
+            return {
+                "ok": False,
+                "reason": f"这批消息里只有 {meaningful} 条有内容（其余是表情或刷屏），跳过",
+                "stable": 0,
+                "situational": 0,
+            }
+
+        # 按总字符预算再裁一次：单条已经截短，但 80 条长文仍是十几万字符的量级。
+        # 不设总预算的话，一次学习可能比平时贵十倍。
+        history = _fit_chars_budget(history, LEARN_CHARS_BUDGET)
+
         # 记录本次分析规模：面板据此展示「这套机制到底花了多少」
         message_count = len(history)
         chars = sum(len(str(m.get("content") or "")) for m in history)
         started = time.monotonic()
         mode = self._learn_mode()
-        prompt = (
-            self._build_prompt_accumulate(session_id, history)
-            if mode != "replace"
-            else self._build_prompt(session_id, history)
-        )
+        code_map: dict[str, str] = {}
+        if mode != "replace":
+            prompt, code_map = self._build_prompt_accumulate(session_id, history)
+        else:
+            # replace 模式不抽事实：它整表重写，和「按人累计」是两套模型
+            prompt = self._build_prompt(session_id, history)
         try:
             provider = await self._resolve_provider(provider_id, session_id)
             if provider is None:
@@ -172,6 +259,12 @@ class Learner:
 
             verified, dropped_evidence = self._verify_evidence(raw_candidates, history)
             kept, dropped_check = await self._self_check(verified, provider, session_id)
+
+            # 事实：同一次输出里顺带抽出来的，按人分桶入库。
+            # 放在自检之后、入库之前——它和风格候选互不影响，
+            # 但失败要能被这一层的 try 兜住。
+            fact_stats = self._ingest_facts(session_id, text, code_map, history)
+
             stats = self.storage.upsert_traits(
                 session_id,
                 kept,
@@ -275,14 +368,36 @@ class Learner:
         mode = str(self.plugin.settings.get("learn_mode") or "accumulate").strip().lower()
         return "replace" if mode == "replace" else "accumulate"
 
-    def _build_prompt_accumulate(self, session_id: str, history: list[ChatMessage]) -> str:
-        """累积链路的提炼 prompt：要求给「什么时候说 + 怎么说 + 原文证据」。"""
+    def _build_prompt_accumulate(
+        self, session_id: str, history: list[ChatMessage]
+    ) -> tuple[str, dict[str, str]]:
+        """累积链路的提炼 prompt：要求给「什么时候说 + 怎么说 + 原文证据」。
+
+        返回 ``(prompt, code_map)``。``code_map`` 是「U1 → 真实 ID」的映射：
+        prompt 里用代号而不是裸 QQ 号，既省字也少一层不必要的暴露，
+        解析 facts 时再靠它翻回真实 ID。
+
+        没有 ``sender_id`` 的老消息（1.5.0 之前采集的）不参与分配代号，
+        那一批也就不抽事实——归属不了人的事实记下来只会污染别人的桶。
+        """
+        code_map: dict[str, str] = {}
+        sender_code: dict[str, str] = {}
         lines = []
         for msg in history:
+            sender_id = str(msg.get("sender_id") or "").strip()
+            code = ""
+            if sender_id:
+                code = sender_code.get(sender_id, "")
+                if not code:
+                    code = f"U{len(code_map) + 1}"
+                    sender_code[sender_id] = code
+                    code_map[code] = sender_id
             sender = str(msg.get("sender") or "?")[:24]
-            content = str(msg.get("content") or "").replace("\n", " ")[:300]
+            content = str(msg.get("content") or "").replace("\n", " ")[:LEARN_MSG_CHARS]
             if content:
-                lines.append(f"{sender}: {content}")
+                # 有 ID 就写成「U1(老王)」：代号给模型做归属，括号里的名字帮它理解语境
+                label = f"{code}({sender})" if code else sender
+                lines.append(f"{label}: {content}")
         history_str = "\n".join(lines)
 
         # 已有特征只给「情境 + 表达 + 权重」，控制 prompt 长度；权重高的排在前面，
@@ -292,7 +407,7 @@ class Learner:
              if t.get("status") != "rejected"),
             key=lambda t: t.get("proficiency", 0),
             reverse=True,
-        )[:30]
+        )[:20]
         hint = ""
         if existing:
             rows = []
@@ -314,6 +429,31 @@ class Learner:
             )
 
         limit = int(self.plugin.settings.get("learn_candidate_max") or 12)
+
+        # 事实抽取合并进同一次请求：同一批消息，一次让它同时输出风格候选和事实候选。
+        # 单独再抽一次等于同一批数据付两遍钱。facts 关着就整段不出现，
+        # 模型也就不会为它多吐 token。
+        facts_block = ""
+        if self._facts_on() and code_map:
+            names = "、".join(f"{c}={m}" for c, m in list(code_map.items())[:12])
+            facts_block = f"""
+
+另外，从同一批记录里找出值得长期记住的、关于某个具体人的事，放进 "facts" 字段。
+只记：稳定的个人信息、明确的安排、重要事件、明确说过的偏好或边界。
+不记：寒暄、临时情绪、评价别人的话、能从上下文直接推回去的内容。
+绝不记：密码、证件号、银行卡、验证码、住址、手机号。
+每条必须有 evidence 且必须是记录里的原话片段，对不上就不要输出。没有就返回 []。
+
+fact 的字段：
+- text：一句话说清，不超过 30 字。写「下周三要交论文初稿」，不写「他提到了论文」
+- kind：fact（长期事实）/ event（有时间的安排）/ preference（偏好）/ boundary（明确说过的边界，如「别叫我老弟」）
+- importance：1-5，5 最重要
+- subject：这件事属于谁，填上面的代号（{names}）。分不清就留空字符串
+- evidence：从记录里原样复制的原话片段，不超过 24 字
+
+格式：
+{{"facts": [{{"text": "下周三要交论文初稿", "kind": "event", "importance": 4, "subject": "U1", "evidence": "我下周三得交论文初稿"}}]}}"""
+
         return f"""分析以下群聊记录，提炼这个群「在什么情况下、用什么方式说话」。
 
 聊天记录：
@@ -327,7 +467,7 @@ class Learner:
    {{"expressions": [{{"situation": "当……时", "style": "怎么说", "evidence": "本轮聊天里的原话片段", "dimension": "语气词", "triggers": ["触发词"]}}]}}
 3. situation 写「什么时候适用」，可以是空字符串（表示任何场合都成立的语气、句式特征）。
    style 写「具体怎么说」，要是能直接照做的表达习惯，10-30 字，不要写「说话随意」这类放到任何群都成立的空话。
-4. evidence 必须从上面的聊天记录里**原样复制**一小段（不超过 40 字，挑最能体现这条风格的那句）。
+4. evidence 必须从上面的聊天记录里原样复制一小段（不超过 24 字，挑最能体现这条风格的那句）。
    找不到对应原话就不要输出这一条。这一条是硬性要求。
 5. dimension 只能取：语气词 / 句式节奏 / 互动方式 / 话题偏好 / 黑话梗。
 6. triggers 只给场景化表达：1-3 个「群友消息里出现就该接这个梗」的短词（2-6 字）。
@@ -340,13 +480,13 @@ class Learner:
 {{"expressions": [
   {{"situation": "", "style": "句末常带喵、qwq 等语气词卖萌", "evidence": "我又歪了喵", "dimension": "语气词", "triggers": []}},
   {{"situation": "有人报抽卡结果时", "style": "用「出货了？」反问，或直接骂欧", "evidence": "出货了属于是", "dimension": "互动方式", "triggers": ["出货", "抽卡"]}}
-]}}"""
+]}}{facts_block}""", code_map
 
     def _build_prompt(self, session_id: str, history: list[ChatMessage]) -> str:
         lines = []
         for msg in history:
             sender = str(msg.get("sender") or "?")[:24]
-            content = str(msg.get("content") or "").replace("\n", " ")[:300]
+            content = str(msg.get("content") or "").replace("\n", " ")[:LEARN_MSG_CHARS]
             if content:
                 lines.append(f"{sender}: {content}")
         history_str = "\n".join(lines)
@@ -442,7 +582,9 @@ class Learner:
                     "context": str(situation or "").strip()[:60],
                     "triggers": self._clean_triggers(triggers),
                     "dimension": str(dimension or "").strip()[:12],
-                    "evidence": str(evidence or "").strip()[:120],
+                    # prompt 要求 24 字，这里放宽到 48：模型偶尔会超一点，
+                    # 多留些余量做证据子串校验，但不再无上限地存整段
+                    "evidence": str(evidence or "").strip()[:48],
                 }
             )
 
@@ -519,6 +661,94 @@ class Learner:
                 dropped += 1
         return kept, dropped
 
+    def _facts_on(self) -> bool:
+        """事实记忆是否开着。读不到配置就当关着——它默认就是关的。"""
+        try:
+            return bool(self.plugin.settings.group("facts").get("enabled"))
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _extract_facts(self, text: str, code_map: dict[str, str]) -> list[dict]:
+        """从同一次输出里解析 facts，并把代号翻回真实 ID。
+
+        归属不了人的条目不记：一条不知道属于谁的事实，最后只会被注进
+        错误对象的 prompt 里，比不记更糟。
+        """
+        if not code_map:
+            return []
+        json_str = self._grab_json(text)
+        if not json_str:
+            return []
+        try:
+            data = json.loads(json_str)
+        except (json.JSONDecodeError, ValueError):
+            return []
+        if not isinstance(data, dict):
+            return []
+        raw = data.get("facts")
+        if not isinstance(raw, list):
+            # 老格式或模型没输出 facts：按空数组处理，不报错不重试
+            return []
+
+        out: list[dict] = []
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            subject = str(item.get("subject") or "").strip()
+            uid = code_map.get(subject, "")
+            if not uid:
+                continue
+            body = str(item.get("text") or "").strip()
+            if not body:
+                continue
+            out.append(
+                {
+                    "text": body,
+                    "kind": str(item.get("kind") or "fact").strip(),
+                    "importance": item.get("importance"),
+                    "evidence": item.get("evidence"),
+                    "_subject": uid,
+                }
+            )
+        return out
+
+    def _ingest_facts(
+        self, session_id: str, text: str, code_map: dict[str, str], history: list[dict]
+    ) -> dict[str, int]:
+        """把这次输出里的事实按人分桶入库。失败只记日志，不影响学习结果。"""
+        total = {"added": 0, "merged": 0, "activated": 0, "dropped": 0, "sensitive": 0}
+        try:
+            store = getattr(self.plugin, "facts", None)
+            if store is None or not self._facts_on():
+                return total
+
+            per_user: dict[str, list[dict]] = {}
+            for cand in self._extract_facts(text, code_map):
+                uid = cand.pop("_subject", "")
+                if uid:
+                    per_user.setdefault(uid, []).append(cand)
+            for uid, candidates in per_user.items():
+                stats = store.ingest(session_id, uid, candidates, history)
+                for key in total:
+                    total[key] += int(stats.get(key) or 0)
+                # 事实变了，画像可能需要重写。**异步排队，不 await**——
+                # 重写要发一次请求，等它就把整轮学习拖长了
+                if stats.get("added") or stats.get("merged"):
+                    self._schedule_profile(uid, session_id)
+
+            if total["added"] or total["activated"]:
+                # 只打数量不打内容：敏感信息那几类连「丢过一条」的具体内容
+                # 都不该出现在日志里，数量本身不泄露任何东西
+                logger.info(
+                    f"[群聊记忆] 事实入库：新增 {total['added']} · 合并 {total['merged']}"
+                    f" · 转生效 {total['activated']} · 校验丢弃 {total['dropped']}"
+                    f" · 敏感跳过 {total['sensitive']}"
+                )
+            return total
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[群聊记忆] 事实入库失败（本次跳过）: {e}")
+            return total
+
     async def _self_check(
         self, candidates: list[dict], provider: Any, session_id: str
     ) -> tuple[list[dict], int]:
@@ -529,6 +759,13 @@ class Learner:
         if not candidates:
             return [], 0
         if not bool(self.plugin.settings.get("learn_self_check")):
+            return candidates, 0
+        # 候选太少时不值得再发一次请求：少留几条的代价，
+        # 比每天都多花一半请求小得多
+        if len(candidates) < SELF_CHECK_MIN_CANDIDATES:
+            logger.debug(
+                f"[群聊记忆] 候选只有 {len(candidates)} 条，跳过入库自检（省一次请求）"
+            )
             return candidates, 0
 
         rows = []

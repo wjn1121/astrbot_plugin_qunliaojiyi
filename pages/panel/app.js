@@ -1,5 +1,64 @@
 const $ = (id) => document.getElementById(id);
 
+// ── 面板自诊断（1.7.x）────────────────────────────────────────────────
+// JS 挂了不能只表现为「这块没刷新」——一片空白，用户没法描述，开发者只能猜。
+// 这里把错误直接画在页面顶部：用户截个图，报错就带过来了。
+// 注意诊断自己绝对不能再抛异常，否则就从「白屏」变成「白屏 + 崩」。
+(function initPanelDiag() {
+  const show = (msg) => {
+    try {
+      let bar = document.getElementById("__panelErr");
+      if (!bar) {
+        bar = document.createElement("div");
+        bar.id = "__panelErr";
+        bar.style.cssText =
+          "position:fixed;left:0;right:0;top:0;z-index:99999;background:#5c1f1f;" +
+          "color:#ffd7d7;padding:8px 12px;font:12px/1.6 ui-monospace,monospace;" +
+          "white-space:pre-wrap;max-height:36vh;overflow:auto";
+        document.body.appendChild(bar);
+      }
+      if (bar.textContent.indexOf(msg) === -1) bar.textContent += msg + "\n";
+    } catch (_) {
+      /* 诊断失败就沉默，不能影响页面本身 */
+    }
+  };
+  window.__panelDiag = show;
+  window.addEventListener("error", (e) =>
+    show(
+      "脚本错误：" +
+        e.message +
+        " @ " +
+        String(e.filename || "").split("/").pop() +
+        ":" +
+        e.lineno,
+    ),
+  );
+  window.addEventListener("unhandledrejection", (e) => {
+    const r = e.reason;
+    show("异步错误：" + ((r && (r.message || r)) || "未知"));
+  });
+})();
+
+// 渲染兜底：某一个面板坏了，至少把原因写在它自己的位置，
+// 别连累旁边的面板（以前一个抛错整页都空）
+function renderGuard(targetId, label, fn) {
+  try {
+    fn();
+  } catch (err) {
+    console.error(label + " 渲染失败:", err);
+    const box = $(targetId);
+    if (box) {
+      box.innerHTML =
+        '<p class="empty">' +
+        label +
+        " 渲染失败：" +
+        esc((err && err.message) || String(err)) +
+        "</p>";
+    }
+    if (window.__panelDiag) window.__panelDiag(label + " 渲染失败：" + ((err && err.message) || err));
+  }
+}
+
 // AstrBot 4.29 的 bridge 主名是 AstrBotPluginView，AstrBotPluginPage 是保留别名；
 // 两种都兼容，避免以后改名导致面板静默失效。
 const Bridge = window.AstrBotPluginView || window.AstrBotPluginPage;
@@ -16,7 +75,8 @@ function escAttr(text) {
 let pendingConfirm = null;
 let lastStatus = null;
 // 列表视图状态：搜索 / 分页 / 排序，翻页与搜索都走服务端
-const view = { q: "", page: 1, sort: "traits", traitStatus: "", traitQuery: "", personaQuery: "" };
+// 学习库的搜索/状态/排序已经移到 TRAIT_GF（列头），这里只剩人格档案和分页
+const view = { q: "", page: 1, sort: "traits", personaQuery: "" };
 // 展开过的会话，刷新后恢复，避免「加完记忆一刷新就收起」的割裂感
 const openSessions = new Set();
 // 预览按哪一档算：主动插话用的强度和被动不是一回事
@@ -108,6 +168,7 @@ const TAB_TEXT = {
   usage: "Token 消费",
   settings: "参数",
   preview: "注入预览",
+  bond: "关系与输出",
   sessions: "会话与特征",
 };
 
@@ -121,6 +182,12 @@ function switchTab(tab) {
   });
   // 人格档案要读磁盘文件，没必要每次刷新都扫一遍，切过去时再加载
   if (tab === "persona") ensurePersona();
+  // 关系数据一直在变（群里聊天就在涨），每次切过来都重拉
+  if (tab === "bond") {
+    ensureBond();
+    syncToneSwitches();
+    loadFacts();
+  }
   try {
     // 在 iframe 里，sessionStorage 可能被宿主的沙箱限制，失败就当没记住
     localStorage.setItem(TAB_KEY, tab);
@@ -170,6 +237,7 @@ async function load() {
     pinnedIds = data.pinned_ids || [];
     $("version").textContent = `v${data.version || "?"} · 从群聊里增量积累说话风格，按语境零网络注入`;
     renderStats(data.stats || {}, data.manager || {});
+    renderOwnerCard(data);
     renderUsage(data);
     renderSettings(data.settings || {});
     renderSessions(data.sessions || []);
@@ -178,6 +246,9 @@ async function load() {
     // 预览会话下拉刚填好，「本群今日搜索」要按它重算
     renderUsageSearch(data);
     await loadTraits();
+    // 输出层调试的开关要用当前配置当初始值；直接停在关系页时
+    // switchTab 早于这里执行，那一次拿不到配置，靠这次补上
+    syncToneSwitches();
   } catch (err) {
     console.error("加载状态失败:", err);
     showToast("加载失败，请查看日志");
@@ -187,6 +258,11 @@ async function load() {
 // ── 学习库（1.4.0 累积链路）──────────────────────────────────────────
 
 let traitGroups = [];
+
+// 学习库拆两条：群聊 / 私聊。默认停群聊（那是主战场）。
+// 私聊默认不学，所以那一页更像「开关面板」——列出来让你逐个开。
+let traitScope = "group";
+const traitMeta = { group: true, private: false, owners: [] };
 // 用户手动折叠 / 展开过的分组。记下来是因为默认只展开「有待审」的组，
 // 十几个群全展开等于没分组，但用户主动点开的那个不该被每次刷新收回去。
 const traitGroupState = new Map();
@@ -198,10 +274,135 @@ const TRAIT_STATUS_TEXT = {
   rejected: "已否决",
 };
 
+// 事实记忆的三档。顺序就是「由生到熟」，面板和按钮都按这个顺序走
+const TIER_TEXT = { shallow: "浅层", deep: "深层", core: "核心" };
+
+// ── 学习库的列定义 ───────────────────────────────────────────────────
+// 状态筛选从「后端过滤」改成「前端多选」：原来一个下拉只能选一种状态，
+// 而实际想看的往往是「待审 + 已生效」这种组合。数据量在几百条以内，
+// 前端过滤比来回请求划算得多。
+const traitFilter = { text: {}, sets: {}, sort: "", dir: "desc" };
+
+function matchTraitFlag(group, flag) {
+  if (flag === "hasPending") return Number((group.counts || {}).pending || 0) > 0;
+  if (flag === "pinned") return !!group.pinned;
+  if (flag === "private") return String(group.session_id || "").startsWith("private");
+  return false;
+}
+
+const TRAIT_FLAG_TEXT = {
+  hasPending: "有待审的群",
+  pinned: "置顶的群",
+  private: "只看私聊",
+};
+
+const TRAIT_GF = {
+  bar: "traitFilterBar",
+  pop: "traitFilterPop",
+  state: traitFilter,
+  items: () => traitGroups.flatMap((g) => g.traits || []),
+  render: () => renderTraits(traitGroups),
+  reset: () => {
+    traitFilter.text = {};
+    traitFilter.sets = {};
+    traitFilter.sort = "";
+    traitFilter.dir = "desc";
+  },
+  columns: [
+    {
+      col: "who",
+      label: "对象",
+      type: "text",
+      title: "按群 / 内容搜索",
+      placeholder: "群号 / 群名 / 特征内容",
+      groups: [
+        {
+          key: "flags",
+          title: "附加条件",
+          options: Object.keys(TRAIT_FLAG_TEXT).map((key) => ({
+            key,
+            label: TRAIT_FLAG_TEXT[key],
+          })),
+          // 这一列筛的是「群」，不是条目，所以计数直接数分组
+          count: (_items, key) => traitGroups.filter((g) => matchTraitFlag(g, key)).length,
+        },
+      ],
+    },
+    {
+      col: "status",
+      label: "状态",
+      groups: [
+        {
+          key: "statuses",
+          title: "按状态（可多选）",
+          options: Object.entries(TRAIT_STATUS_TEXT).map(([key, label]) => ({ key, label })),
+          count: (items, key) => items.filter((t) => String(t.status || "active") === key).length,
+        },
+      ],
+    },
+    {
+      col: "score",
+      label: "权重（有效分）",
+      type: "sort",
+      descLabel: "降序（最可能进注入的）",
+      ascLabel: "升序（最边缘的）",
+    },
+  ],
+};
+
+// 子库切换时同步按钮状态、数量和那句说明。
+// 数量用「有内容的组」而不是全部：群聊列表里那几十个 0 条空壳不显示，
+// 标出来的数字得和列表里能看到的对得上。
+function syncTraitScope(all, scoped) {
+  const gCount = all.filter((g) => !g.is_private && (g.learned || g.total > 0)).length;
+  const pCount = all.filter((g) => g.is_private).length;
+
+  const seg = $("traitScope");
+  if (seg) {
+    seg.querySelectorAll("button[data-scope]").forEach((btn) => {
+      const on = btn.dataset.scope === traitScope;
+      btn.classList.toggle("on", on);
+      const n = btn.dataset.scope === "private" ? pCount : gCount;
+      btn.innerHTML = `${btn.dataset.scope === "private" ? "私聊学习库" : "群聊学习库"}${
+        n ? `<span class="seg-count">${n}</span>` : ""
+      }`;
+    });
+  }
+
+  const note = $("traitScopeNote");
+  if (!note) return;
+  if (traitScope === "private") {
+    note.textContent = traitMeta.private
+      ? `私聊学习已全局开启：所有私聊都会学（这会持续消耗 token）。下面每个会话仍可单独关。`
+      : `私聊默认不学${traitMeta.owners.length ? "（主人自己的私聊例外）" : ""}。` +
+        `想学某个人，在下面那一行点「不学」变成「学习中」即可。`;
+  } else {
+    note.textContent = traitMeta.group
+      ? "群聊学习全部开启（默认）。想关某一个群，点它那一行的「学习中」。"
+      : "群聊学习已全局关闭。单个群仍可以在这里单独打开。";
+  }
+}
+
+// 组内按权重排。用 effective_score（按时效打折后的分）而不是原始权重：
+// 原始分高但半年没出现过的特征，实际进不了注入，按它排会误导。
+function sortTraitsInGroup(traits) {
+  const st = gfState(TRAIT_GF);
+  if (st.sort !== "score") return traits;
+  const mul = st.dir === "asc" ? 1 : -1;
+  const score = (t) => Number(t.effective_score ?? t.proficiency ?? 0);
+  return [...traits].sort((a, b) => mul * (score(a) - score(b)));
+}
+
 async function loadTraits() {
   try {
-    const data = unwrap(await Bridge.apiGet("traits", { status: view.traitStatus || "" }));
+    // 状态过滤在前端做（多选），所以这里始终取全量。
+    // 取全量还有个好处：列头上能显示每种状态各有多少条，
+    // 只取待审的话「已生效 32」这个数字就永远显示不出来
+    const data = unwrap(await Bridge.apiGet("traits", {}));
     traitGroups = data.groups || [];
+    traitMeta.group = data.learn_group_enabled !== false;
+    traitMeta.private = !!data.learn_private_enabled;
+    traitMeta.owners = data.owners || [];
     const stats = data.stats || {};
     const items = [
       ["待审", data.pending_total ?? 0],
@@ -232,64 +433,122 @@ async function loadTraits() {
 // 学习库按会话分组：同一个群 / 私聊的条目聚在一起，置顶的排最前。
 // 分组本身始终渲染（哪怕当前筛选下为空），否则切状态时整组会「消失」，
 // 用户容易以为数据被删了。
+// 在学习库缓存里找一条（判断是不是钉住的那条）。
+// 走缓存而不是再请求一次：这个判断只为了给确认框加一句「已钉住不可删」，
+// 为它发一次 HTTP 不值得。
+function traitItemOf(sessionId, content) {
+  for (const group of traitGroups) {
+    if (group.session_id !== sessionId) continue;
+    for (const item of group.traits || []) {
+      if (String(item.content) === String(content)) return item;
+    }
+  }
+  return null;
+}
+
 function renderTraits(groups) {
   const box = $("traits");
   if (!box) return;
-  const query = (view.traitQuery || "").trim().toLowerCase();
 
-  const visible = groups
+  // 先按「群聊 / 私聊」这一层切，下面的搜索 / 状态 / 排序都只作用在当前这一页
+  const isPrivate = traitScope === "private";
+  const scoped = groups.filter((g) => {
+    if (!!g.is_private !== isPrivate) return false;
+    // 群聊列表过滤掉纯空壳（聊过天但还没学到东西）——几十个 0 条的群只是噪音；
+    // 私聊列表**保留**，因为那是「点开学习」的唯一入口
+    if (!isPrivate && !g.learned && !(g.total > 0)) return false;
+    return true;
+  });
+  syncTraitScope(groups, scoped);
+
+  const st = gfState(TRAIT_GF);
+  const kw = String(st.text.who || "").trim().toLowerCase();
+  const statuses = st.sets.statuses || [];
+  const flags = st.sets.flags || [];
+  const filtered = !!kw || statuses.length > 0 || flags.length > 0;
+
+  const visible = scoped
     .map((g) => {
+      // 附加条件是「群」这一级的：不满足就整组不显示
+      if (flags.length && !flags.some((f) => matchTraitFlag(g, f))) return null;
       // 搜群号 / 群名命中时整组原样保留：搜群号的人想看这个群里的全部内容，
       // 而不是一个标题留下、条目被内容过滤清空的空壳。
-      const bySession = query && `${g.session_id} ${g.display_name}`.toLowerCase().includes(query);
-      return { ...g, traits: bySession ? g.traits || [] : filterTraits(g, query), bySession };
+      const bySession =
+        !!kw && `${g.session_id} ${g.display_name || ""}`.toLowerCase().includes(kw);
+      let traits = g.traits || [];
+      if (kw && !bySession) {
+        traits = traits.filter((t) =>
+          [t.content, t.context, ...(t.triggers || []), ...(t.alias || [])]
+            .join(" ")
+            .toLowerCase()
+            .includes(kw),
+        );
+      }
+      if (statuses.length) {
+        traits = traits.filter((t) => statuses.includes(String(t.status || "active")));
+      }
+      return { ...g, traits: sortTraitsInGroup(traits), bySession };
     })
-    .filter((g) => !query || g.traits.length || g.bySession);
+    .filter(Boolean)
+    // 有筛选时，筛完只剩空壳的组不显示——留着会让列表全是「0 条」
+    .filter(
+      (g) =>
+        !filtered ||
+        g.traits.length > 0 ||
+        // 搜群号命中的组即使条目被状态筛空也要留着，否则用户会以为这个群没数据
+        (g.bySession && !statuses.length && !flags.length),
+    );
 
+  // 「全部批准」只在真有待审条目时出现。注意要看**过滤后**的：
+  // 筛了「已生效」还挂着「全部批准」，点了会批准一批看不见的东西
   const allBtn = $("approveAllBtn");
   if (allBtn) {
-    const hasPending = visible.some((g) => (g.counts && g.counts.pending) > 0);
+    const hasPending = visible.some((g) =>
+      (g.traits || []).some((t) => String(t.status || "active") === "pending"),
+    );
     allBtn.style.display = hasPending ? "" : "none";
   }
 
-  // 搜索时给个命中数，否则「怎么只剩这几个群」会让人以为数据丢了
+  gfPaint(TRAIT_GF);
+
+  // 有筛选时给命中数，否则「怎么只剩这几个群」会让人以为数据丢了
   const note = $("traitSearchNote");
   if (note) {
-    if (query) {
-      const hits = visible.filter((g) => g.traits.length).length;
+    const cond = gfNoteText(TRAIT_GF);
+    if (cond) {
+      const hitGroups = visible.filter((g) => (g.traits || []).length).length;
+      const hitItems = visible.reduce((n, g) => n + (g.traits || []).length, 0);
       note.hidden = false;
-      note.textContent = `搜索「${view.traitQuery.trim()}」：命中 ${hits} 个群 / 共 ${groups.length} 个群，命中群里的条目已全部展开。`;
+      note.textContent = `${cond}：${hitItems} 条 / ${hitGroups} 个${isPrivate ? "私聊" : "群"}（共 ${scoped.length} 个）`;
     } else {
       note.hidden = true;
+      note.textContent = "";
     }
   }
 
   if (!visible.length) {
     box.innerHTML = `<p class="hint">${
-      groups.length ? "没有匹配的条目。" : "还没有学到任何内容，先在群里聊几句。"
+      scoped.length
+        ? "没有匹配的条目。"
+        : isPrivate
+          ? traitMeta.private || traitMeta.owners.length
+            ? "还没有私聊内容。私聊会话聊过天之后会出现在这里，可以逐个开关学习。"
+            : "私聊学习库默认关闭：没有会话会学。想学某个人，先在这个人的私聊里聊几句，"
+              + "他就会出现在这个列表，然后点「开始学习」。"
+          : "还没有学到任何内容，先在群里聊几句。"
     }</p>`;
     return;
   }
   box.innerHTML = visible.map(groupCard).join("");
 }
 
-function filterTraits(group, query) {
-  const traits = group.traits || [];
-  if (!query) return traits;
-  return traits.filter((t) =>
-    [t.content, t.context, ...(t.triggers || []), ...(t.alias || [])]
-      .join(" ")
-      .toLowerCase()
-      .includes(query),
-  );
-}
-
 function groupOpen(group) {
   // 搜索时全部展开：收着的话搜到了也看不见，等于没搜
-  if (view.traitQuery) return true;
+  if (String(gfState(TRAIT_GF).text.who || "").trim()) return true;
   if (traitGroupState.has(group.session_id)) return traitGroupState.get(group.session_id);
-  // 默认只展开有待审条目的组
-  return (group.counts && group.counts.pending) > 0 && (group.traits || []).length > 0;
+  // 默认全收起。以前是「有待审的组自动展开」，但十来个群里有七八个待审时
+  // 等于整页全开，一屏只看得下两个群——现在是折叠列表，点开哪个看哪个
+  return false;
 }
 
 function groupCard(group) {
@@ -302,14 +561,42 @@ function groupCard(group) {
   const body = traits.length
     ? `<div class="trait-body">${traits.map(traitItem).join("")}</div>`
     : '<div class="trait-body"><p class="hint">这个筛选下没有条目。</p></div>';
+  // 「多久没消息」。bot 被踢出群之后插件不会收到通知（拿不到群列表），
+  // 只能靠「这个群已经 N 天零消息」来提示——30 天是很稳的信号
+  const idle = Number(group.inactive_days ?? 0);
+  const staleTag =
+    idle >= 30
+      ? `<span class="trait-stale" title="bot 可能已经不在这个群了">${Math.round(idle)} 天没消息</span>`
+      : "";
+  // 删除整组。**置顶的一律不能删**——用户明确要求，也正好当保护标记用。
+  // 置顶时**整个按钮不渲染**（而不是 disabled）：一个灰着的按钮既难看，
+  // 又容易在窄屏上被误点，直接消失最省事。
+  const delBtn = group.pinned
+    ? ""
+    : `<button type="button" class="pin-btn danger" data-drop="${sid}"
+        data-name="${escAttr(group.display_name || sid)}" data-pinned="0"
+        title="删除这个会话的全部学习数据">删除</button>`;
+
+  // 学习开关。私聊默认不学，所以这一页的每个会话都得能单独开——
+  // 私聊列表里那些「0 条」的组，按钮就是它们唯一的用途
+  const learnOn = group.learn_enabled !== false;
+  const learnBtn = `<button type="button" class="pin-btn learn-btn${learnOn ? " on" : ""}"
+    data-tact="${learnOn ? "learn_off" : "learn_on"}" data-sid="${sid}"
+    title="${learnOn ? "点一下停止学习这个会话" : "点一下开始学习这个会话"}">${
+      learnOn ? "学习中" : "不学"
+    }</button>`;
   return `<details class="trait-group" data-gsid="${sid}"${groupOpen(group) ? " open" : ""}>
     <summary>
       <b>${group.pinned ? "📌 " : ""}${esc(group.display_name)}</b>
       <span class="group-count">${esc(traits.length)} / ${esc(group.total ?? traits.length)} 条</span>
       ${tags.join("")}
-      <button type="button" class="pin-btn${group.pinned ? " on" : ""}" data-pact="pin" data-sid="${sid}">${
+      ${staleTag}
+      ${learnBtn}
+      <button type="button" class="pin-btn${group.pinned ? " on" : ""}" data-pact="pin" data-sid="${sid}"
+        title="${group.pinned ? "取消置顶（置顶时不能删这个会话）" : "置顶这个会话，排在列表最前"}">${
         group.pinned ? "已置顶" : "置顶"
       }</button>
+      ${delBtn}
     </summary>
     ${body}
   </details>`;
@@ -331,16 +618,24 @@ function traitItem(t) {
     : `<span class="hint">暂无原文证据</span>`;
   const btns = [];
   if (status === "pending") {
-    btns.push(`<button class="ghost" data-tact="approve" data-sid="${sid}" data-content="${content}">批准</button>`);
-    btns.push(`<button class="ghost danger" data-tact="reject" data-sid="${sid}" data-content="${content}">否决</button>`);
+    btns.push(`<button class="ghost" data-tact="approve" data-sid="${sid}" data-content="${content}" title="批准：这条从下一轮开始参与注入">批准</button>`);
+    btns.push(`<button class="ghost danger" data-tact="reject" data-sid="${sid}" data-content="${content}" title="否决：不再注入，但留档可恢复">否决</button>`);
   } else if (status === "active") {
     btns.push(
-      `<button class="ghost" data-tact="${t.pinned ? "unpin" : "pin"}" data-sid="${sid}" data-content="${content}">${t.pinned ? "取消钉住" : "钉住"}</button>`,
+      `<button class="ghost" data-tact="${t.pinned ? "unpin" : "pin"}" data-sid="${sid}" data-content="${content}"
+        title="${t.pinned ? "取消钉住，之后可以被删除" : "钉住这条：优先注入，且不能直接删除"}">${t.pinned ? "取消钉住" : "钉住"}</button>`,
     );
-    btns.push(`<button class="ghost danger" data-tact="reject" data-sid="${sid}" data-content="${content}">否决</button>`);
+    btns.push(`<button class="ghost danger" data-tact="reject" data-sid="${sid}" data-content="${content}" title="否决：不再注入，留档可恢复">否决</button>`);
   } else {
-    btns.push(`<button class="ghost" data-tact="restore" data-sid="${sid}" data-content="${content}">恢复</button>`);
+    btns.push(`<button class="ghost" data-tact="restore" data-sid="${sid}" data-content="${content}" title="恢复成生效状态，重新参与注入">恢复</button>`);
   }
+  // 单条删除。钉住的不给按钮——不是隐藏，而是换成一句说明，
+  // 否则用户会以为「这条没有删除功能」而去找别的地方
+  btns.push(
+    t.pinned
+      ? '<span class="hint" title="钉住的一律不能删，先取消钉住">已钉住 · 不可删</span>'
+      : `<button class="ghost danger" data-traitdel="${content}" data-sid="${sid}" title="删掉这条学到的内容（不可恢复）">删除</button>`,
+  );
   return `<div class="trait-row">
     <div class="trait-head">
       <span class="trait-status st-${esc(status)}">${esc(TRAIT_STATUS_TEXT[status] || status)}</span>
@@ -354,6 +649,61 @@ function traitItem(t) {
     ${evidenceHtml}
     <div class="trait-btns">${btns.join("")}</div>
   </div>`;
+}
+
+// 删除一个会话的全部学习数据。
+// 二次确认是硬要求：这个动作会一次性带走学到的东西 + 手动记忆 + 待学习消息。
+// ``alsoSessions`` 给「会话与特征」页用——那一页刷新的是另一份数据。
+async function dropTraitGroup(sid, name, pinned, alsoSessions = false) {
+  if (pinned) {
+    showToast("置顶的一律不能删，先取消置顶");
+    return false;
+  }
+  const ok = await askConfirm(
+    `删除「${name}」的全部学习数据？\n\n` +
+      `会一起清掉：学到的特征、手动记忆、待学习消息、学习状态。\n` +
+      `**不可恢复**，但不会动这个群的聊天记录本身。`,
+  );
+  if (!ok) return false;
+  const res = unpack(await Bridge.apiPost("review", { action: "drop_session", session_id: sid }));
+  showToast(res.message || (res.ok ? "已删除" : "删除失败"));
+  await loadTraits();
+  if (alsoSessions) await load();
+  return res.ok;
+}
+
+// 删除单条学习内容。同样二次确认。
+async function deleteTraitItem(sid, content, pinned) {
+  if (pinned) {
+    showToast("这条已钉住，先取消钉住才能删");
+    return;
+  }
+  const preview = String(content || "").slice(0, 60);
+  const ok = await askConfirm(
+    `删除这条学习内容？\n\n「${preview}」\n\n删除后不可恢复。`,
+  );
+  if (!ok) return;
+  const res = unpack(
+    await Bridge.apiPost("review", { action: "delete_trait", session_id: sid, content }),
+  );
+  showToast(res.message || (res.ok ? "已删除" : "删除失败"));
+  await loadTraits();
+}
+
+// 清理「bot 可能已经不在了」的会话：30 天没有新消息。
+// 插件拿不到平台的群列表，只能这么推测——所以先确认，且置顶的一律跳过。
+async function purgeInactiveTraits() {
+  const ok = await askConfirm(
+    "清理 30 天没有新消息的会话？\n\n" +
+      "通常就是 bot 已经被踢出 / 群已经废弃的那些。\n" +
+      "置顶的会跳过；删除不可恢复。",
+  );
+  if (!ok) return;
+  const res = unpack(
+    await Bridge.apiPost("review", { action: "purge_inactive", days: 30 }),
+  );
+  showToast(res.message || (res.ok ? "已清理" : "清理失败"));
+  await loadTraits();
 }
 
 async function reviewTrait(action, sessionId, content) {
@@ -380,6 +730,60 @@ function renderPager(data) {
   $("pagerInfo").textContent = `共 ${total} 个会话 · 第 ${page}/${pages} 页`;
   $("prevPage").disabled = page <= 1;
   $("nextPage").disabled = page >= pages;
+}
+
+// 概览页的「主人与学习」卡。
+// 这三件事影响四个模块却都藏在配置里，用户回到面板第一眼该看见，
+// 而不是「为什么私聊不学」去翻配置才发现。
+function renderOwnerCard(data) {
+  const box = $("ownerCard");
+  if (!box) return;
+  const owners = data.owners || [];
+  const groupOn = data.learn_group_enabled !== false;
+  const privOn = !!data.learn_private_enabled;
+  const rows = [
+    {
+      icon: "👑",
+      label: "主人 QQ",
+      value: owners.length ? owners.join(" · ") : "未设置",
+      note: owners.length
+        ? "关系不封顶 · 事实上限 300 条 · 私聊默认学 · 一键清理跳过 · 可单独清理"
+        : "去「参数 → 全局」填 QQ 号。填一次，关系 / 事实 / 学习 / 清理四个模块一起生效",
+      cls: owners.length ? "on" : "off",
+    },
+    {
+      icon: "💬",
+      label: "群聊学习库",
+      value: groupOn ? "全部开启" : "已关闭",
+      note: groupOn
+        ? "所有群聊自动学「这个群怎么说话」，进群就开始积累"
+        : "群聊不学风格，只记消息。没有学习请求 = 这块 token 归零",
+      cls: groupOn ? "on" : "off",
+    },
+    {
+      icon: "🔒",
+      label: "私聊学习库",
+      value: privOn ? "全部开启" : owners.length ? "仅主人" : "全部关闭",
+      note: privOn
+        ? "所有私聊都会学，token 消耗会明显增加"
+        : owners.length
+          ? "私聊默认不学；主人自己的私聊例外。其余可在「学习库 → 私聊」单独开某一个"
+          : "私聊默认不学。要学某个人，去「学习库 → 私聊」单独开",
+      cls: privOn ? "warn" : "on",
+    },
+  ];
+  box.innerHTML = rows
+    .map(
+      (r) => `<div class="owner-row ${r.cls}">
+        <span class="owner-icon">${r.icon}</span>
+        <div class="owner-main">
+          <b>${esc(r.label)}</b>
+          <span class="owner-value">${esc(r.value)}</span>
+          <p class="owner-note">${esc(r.note)}</p>
+        </div>
+      </div>`,
+    )
+    .join("");
 }
 
 function renderStats(stats, manager) {
@@ -569,27 +973,65 @@ function renderUsageSearch(data) {
 // 六组新参数 + 一组原有的运行参数。hint 一律写清成本影响。
 const SETTING_GROUPS = [
   {
+    id: "global",
+    title: "👑 全局",
+    sub: "主人 QQ 与学习库总开关。改一次，关系 / 事实 / 学习 / 清理一起生效",
+    items: [
+      {
+        key: "owner_ids",
+        label: "主人 QQ",
+        type: "text",
+        default: "",
+        hint:
+          "填 QQ 号，多个用逗号分隔（中英文逗号、空格都行）。\n" +
+          "一处生效、四个模块共用：关系（群聊不封顶 + 记忆配额最高）、" +
+          "事实（存储上限 300 条 + 一键清理跳过）、学习（私聊默认开启）、" +
+          "清理（可单独清理主人记忆）。\n" +
+          "以前这一项藏在「关系状态」分组里，但它不只影响关系。影响：token 0。",
+      },
+      {
+        key: "learn_group_enabled",
+        label: "群聊学习库",
+        type: "bool",
+        default: true,
+        hint:
+          "所有群聊自动学「这个群怎么说话」，默认开。\n" +
+          "关掉后群聊只记消息、不学风格——学习请求归零，省 token。影响：token ↓。",
+      },
+      {
+        key: "learn_private_enabled",
+        label: "私聊学习库",
+        type: "bool",
+        default: false,
+        hint:
+          "私聊默认不学：私聊是私域，默认把一对一聊天送去提炼不合适。\n" +
+          "**主人自己的私聊自动开启**，不受这个开关影响。\n" +
+          "想学所有人的私聊就打开它；只想学某个人，去「学习库 → 私聊」单独开。影响：token ↑（打开后）。",
+      },
+    ],
+  },
+  {
     id: "base",
     title: "⚙️ 运行与学习",
     sub: "原有参数，改动同样即时生效",
     items: [
-      { key: "enabled", label: "启用群聊记忆", type: "bool", default: true, hint: "总开关。关掉后不收集、不学习、不注入，完全静默。影响：token 归零。" },
-      { key: "inject_enabled", label: "启用风格注入", type: "bool", default: true, hint: "关闭后不再注入风格，字数上限也一起失效（两者在同一个钩子里）。学习照常、仍有消耗。影响：token ↓（每条回复少几十字）。" },
-      { key: "analysis_interval_seconds", label: "学习间隔（秒）", type: "int", min: 60, max: 604800, step: 60, default: 21600, hint: "默认 21600（6 小时）≈ 一天最多 4 次，这是「几乎零消耗」的核心。影响：token ↑（调小）。" },
-      { key: "min_history_for_analysis", label: "触发学习的最少消息数", type: "int", min: 1, max: 1000, step: 1, default: 10, hint: "攒够这么多条新消息才送去提炼，不够直接跳过不发请求。影响：token ↓（调大）。" },
-      { key: "max_messages_per_learn", label: "单次提炼最多消息数", type: "int", min: 1, max: 500, step: 10, default: 80, hint: "单次最多带多少条消息进 prompt。影响：token ↑（调大）。" },
-      { key: "max_stable_inject", label: "最多注入学习风格", type: "int", min: 0, max: 20, step: 1, default: 5, hint: "每轮按熟练度取前 N 条学习风格注入。影响：token ↑（调大）。" },
-      { key: "max_manual_inject", label: "最多注入手动记忆", type: "int", min: 0, max: 20, step: 1, default: 3, hint: "手动记忆单独占名额，和学习名额各算各的。设 0 = 只存不注入。" },
+      { key: "enabled", label: "启用群聊记忆", type: "bool", default: true, hint: "总开关。关掉后不收集、不学习、不注入，完全静默。影响：token 0。" },
+      { key: "inject_enabled", label: "启用风格注入", type: "bool", default: true, hint: "关闭后不再注入风格，字数上限也一起失效（两者在同一个钩子里）。学习照常、仍有消耗。影响：token ↓↓（关掉后每条回复少几十到一百多字，这是最大的单项开销）。" },
+      { key: "analysis_interval_seconds", label: "学习间隔（秒）", type: "int", min: 60, max: 604800, step: 60, default: 21600, hint: "默认 21600（6 小时）≈ 一天最多 4 次，这是「几乎零消耗」的核心。影响：token ↑↑（调小等于按倍数变贵）。" },
+      { key: "min_history_for_analysis", label: "触发学习的最少消息数", type: "int", min: 1, max: 1000, step: 1, default: 10, hint: "攒够这么多条新消息才送去提炼，不够直接跳过不发请求。默认 30：10 条太容易学到「嗯」「哈」这类噪音。影响：token ↓（调大）。" },
+      { key: "max_messages_per_learn", label: "单次提炼最多消息数", type: "int", min: 1, max: 500, step: 10, default: 80, hint: "单次最多带多少条消息进 prompt。影响：token ↑↑（学一次的钱几乎全在这里）。" },
+      { key: "max_stable_inject", label: "最多注入学习风格", type: "int", min: 0, max: 20, step: 1, default: 5, hint: "每轮按熟练度取前 N 条学习风格注入。影响：token ↑↑（每加一条就多一段文本，且每轮都带）。" },
+      { key: "max_manual_inject", label: "最多注入手动记忆", type: "int", min: 0, max: 20, step: 1, default: 3, hint: "手动记忆单独占名额，和学习名额各算各的。设 0 = 只存不注入。影响：token ↑（调大，每轮多带几条）。" },
       { key: "max_stable_traits", label: "学习风格存储上限", type: "int", min: 0, max: 200, step: 5, default: 40, hint: "超出按熟练度淘汰。特征越多，每次学习的 prompt 越长。影响：token ↑（调大）。" },
-      { key: "enable_situational_inject", label: "启用场景化表达注入", type: "bool", default: true, hint: "只在语境匹配时才注入，成本影响很小；关掉主要损失接梗能力。" },
+      { key: "enable_situational_inject", label: "启用场景化表达注入", type: "bool", default: true, hint: "只在语境匹配时才注入，成本影响很小；关掉主要损失接梗能力。影响：token ↑（开启时，幅度小——多数轮次匹配不到不注入）。" },
       { key: "max_situational_inject", label: "最多注入场景化表达", type: "int", min: 0, max: 20, step: 1, default: 2, hint: "每轮最多带几条语境匹配的表达。影响：token ↑（调大）。" },
-      { key: "max_situational_traits", label: "场景化表达存储上限", type: "int", min: 0, max: 100, step: 5, default: 20, hint: "同上，针对存储。设 0 = 不再保留这类特征。" },
+      { key: "max_situational_traits", label: "场景化表达存储上限", type: "int", min: 0, max: 100, step: 5, default: 20, hint: "同上，针对存储。设 0 = 不再保留这类特征。影响：token 0（只影响存储，不影响每轮注入）。" },
       { key: "enable_trigger_matching", label: "启用触发词匹配", type: "bool", default: true, hint: "先做纯本地字符串匹配，命中就不发向量请求——省钱的关键开关。影响：token ↓（保持开启）。" },
-      { key: "situational_similarity_threshold", label: "场景化相似度阈值", type: "float", min: 0, max: 1, step: 0.05, default: 0.4, hint: "向量匹配阈值，越低越容易注入。影响：token 轻微 ↑（调低）。" },
-      { key: "embedding_timeout_seconds", label: "嵌入请求超时（秒）", type: "float", min: 0.5, max: 30, step: 0.5, default: 2, hint: "向量请求跑在回复链路上，超时降级为关键词匹配。影响：token 不变，只影响延迟。" },
-      { key: "enable_cross_group", label: "启用跨群风格参考", type: "bool", default: false, hint: "把别群的稳定风格也注入进来。影响：token ↑，收益有限，默认关。" },
+      { key: "situational_similarity_threshold", label: "场景化相似度阈值", type: "float", min: 0, max: 1, step: 0.05, default: 0.4, hint: "向量匹配阈值，越低越容易注入。影响：token ↑（调低后）。" },
+      { key: "embedding_timeout_seconds", label: "嵌入请求超时（秒）", type: "float", min: 0.5, max: 30, step: 0.5, default: 2, hint: "向量请求跑在回复链路上，超时降级为关键词匹配。影响：token 0（只影响延迟）。" },
+      { key: "enable_cross_group", label: "启用跨群风格参考", type: "bool", default: false, hint: "把别群的稳定风格也注入进来。影响：token ↑↑，收益有限，默认关。" },
       { key: "max_global_styles", label: "最多注入全局风格", type: "int", min: 0, max: 20, step: 1, default: 3, hint: "跨群开启时最多注入几条别群风格。影响：token ↑（调大）。" },
-      { key: "debug_mode", label: "调试日志", type: "bool", default: false, hint: "日志里输出完整注入内容和学习结果。只增加日志量，排查完关掉。" },
+      { key: "debug_mode", label: "调试日志", type: "bool", default: false, hint: "日志里输出完整注入内容和学习结果。只增加日志量，排查完关掉。影响：token 0。" },
     ],
   },
   {
@@ -599,7 +1041,7 @@ const SETTING_GROUPS = [
     items: [
       {
         key: "style_strength", label: "被动回复风格强度", type: "slider", min: 0, max: 100, step: 5, default: 100,
-        hint: "0 = 完全不注入（纯人格）；1-30 只留 1 条且措辞很弱；31-69 名额减半；70-99 名额四分之三；100 满额，且必定让位（100 时不再掷骰，每轮都按风格走）。强度和注入名额一起降。影响：token ↓（调低，每轮少带几十到一百多字）。",
+        hint: "0 = 完全不注入（纯人格）；1-30 只留 1 条且措辞很弱；31-69 名额减半；70-99 名额四分之三；100 满额，且必定让位（100 时不再掷骰，每轮都按风格走）。强度和注入名额一起降。影响：token ↓↓（调低，每轮少带几十到一百多字）。",
       },
       {
         key: "active_style_strength", label: "主动插话风格强度", type: "slider", min: 0, max: 100, step: 5, default: 60,
@@ -607,11 +1049,11 @@ const SETTING_GROUPS = [
       },
       {
         key: "style_override_threshold", label: "风格压过人格的起始强度", type: "slider", min: 0, max: 100, step: 5, default: 100,
-        hint: "强度【严格大于】这个值才让位。默认 100 + 强度 100 → 开箱不让位，和 1.2.0 行为一致。想让群风格压过人设就调低它，例如 70 配强度 100 = 每轮都按风格走。只是指令层优先级，不是真删人格。影响：token 不变。",
+        hint: "强度【严格大于】这个值才让位。默认 100 + 强度 100 → 开箱不让位，和 1.2.0 行为一致。想让群风格压过人设就调低它，例如 70 配强度 100 = 每轮都按风格走。只是指令层优先级，不是真删人格。影响：token 0。",
       },
       {
         key: "style_override_deep", label: "深度覆盖人格（会击穿缓存）", type: "bool", warn: true, default: false,
-        hint: "会让该轮缓存失效：每次命中都改 system prompt，DeepSeek 前缀缓存必然失效，输入价从 ¥0.05 跳到 ¥1.5/百万（30 倍）。默认关闭。",
+        hint: "会让该轮缓存失效：每次命中都改 system prompt，DeepSeek 前缀缓存必然失效，输入价从 ¥0.05 跳到 ¥1.5/百万（30 倍）。默认关闭。影响：token ↑↑（打开后每轮都可能击穿缓存）。",
       },
     ],
   },
@@ -624,38 +1066,73 @@ const SETTING_GROUPS = [
       { key: "active_reply_max_chars", label: "主动插话字数上限", type: "int", min: 0, max: 2000, step: 10, default: 80, hint: "插话本来就该路过接一句，三行字容易变成抢话。同样只是倾向。影响：token ↓。" },
       {
         key: "reply_max_chars_hard", label: "超限时硬截断", type: "bool", warn: true, default: false,
-        hint: "会切坏 markdown：按句末标点硬切，表格、链接、代码块和表情占位符都可能被切残。不建议开。影响：token 不变。",
+        hint: "会切坏 markdown：按句末标点硬切，表格、链接、代码块和表情占位符都可能被切残。不建议开。影响：token 0。",
+      },
+    ],
+  },
+  {
+    id: "facts",
+    title: "🧠 事实记忆与个人画像",
+    sub: "上面三个是遗忘节奏（多久没提就忘），下面是画像（这个人是谁）",
+    items: [
+      {
+        key: "fact_shallow_days", label: "浅层遗忘（天）", type: "int", min: 1, max: 90, step: 1, default: 15,
+        hint: "只提过一次的事，这么多天没再提到就归档（不再注入，面板里还查得到）。默认 15 天：7 天剩 78%、10 天剩 55%、15 天归零。影响：token 0（只改记忆寿命）。",
+      },
+      {
+        key: "fact_deep_days", label: "深层降档（天）", type: "int", min: 1, max: 180, step: 1, default: 30,
+        hint: "深层记忆这么多天没再提到，就掉回浅层（下一轮再按浅层的天数归档）。默认 30 天。要比浅层大，否则深层没意义。影响：token 0。",
+      },
+      {
+        key: "fact_core_days", label: "核心降档（天）", type: "int", min: 1, max: 365, step: 1, default: 60,
+        hint: "核心记忆这么多天没再提到，就掉成深层。默认 60 天。核心只是忘得慢，不是永不遗忘。影响：token 0。",
+      },
+      {
+        key: "profile_enabled", label: "启用个人画像", type: "bool", default: true,
+        hint: "从事实里提炼一段「这个人是谁」，按好感给字数（陌生 60 → 老友 180，**主人 260**），每轮注入时单独一段。\n不待见档不生成也不注入；关掉等于回到「只有事实、没有画像」。影响：token ↑（每轮多几十到两百多字）。",
+      },
+      {
+        key: "profile_min_facts", label: "画像最少几条事实", type: "int", min: 1, max: 50, step: 1, default: 3,
+        hint: "攒够这么多条才写第一版。太少写出来只是复述，没有提炼价值。默认 3 条。影响：token 0（只决定什么时候写）。",
+      },
+      {
+        key: "profile_rewrite_hours", label: "画像重写间隔（小时）", type: "int", min: 1, max: 720, step: 1, default: 24,
+        hint: "两次重写至少隔多久。画像本来就该稳定，天天改写会来回抖。默认 24 小时，而且必须「新增 ≥2 条事实」才会触发。影响：token ↑（调小）。",
+      },
+      {
+        key: "profile_daily_cap", label: "每天最多重写几人", type: "int", min: 0, max: 100, step: 1, default: 6,
+        hint: "一次学习可能同时触发好几个人的画像，这个上限把「一天最坏开销」钉死。默认 6 人 ≈ 5000 token/天。0 = 全禁（只用手动重新生成）。影响：token ↑（调大）。",
       },
     ],
   },
   {
     id: "active",
     title: "🗣 主动回复",
-    sub: "唯一会凭空产生请求的功能，默认关闭",
+    sub: "唯一会凭空产生请求的功能。顶部五档一键切换，改完还能单独微调",
     items: [
       { key: "active_reply_enabled", label: "启用主动回复", type: "bool", default: false, hint: "开启后机器人自己找时机接话。影响：token ↑（一天最多日限那么多次）。" },
+      {
+        key: "active_reply_chance", label: "每个窗口的参与概率", type: "slider", min: 0, max: 1, step: 0.05, default: 0.15,
+        hint: "仅 probability 模式。0.15 ≈ 一天约 7 次，正好落在日限 8 以内。骰子按窗口掷，不按消息——否则群越热闹越容易被插话。影响：token ↑↑（每次插话都是一次完整请求）。",
+      },
+      { key: "active_reply_cooldown_seconds", label: "冷却时间（秒）", type: "int", min: 60, max: 86400, step: 60, default: 1800, hint: "两次评估至少隔多久，默认 1800 ≈ 一天 48 个窗口。影响：token ↓（调大）。" },
+      { key: "active_reply_daily_limit", label: "每日上限（每群）", type: "int", min: 0, max: 100, step: 1, default: 8, hint: "每群每天最多主动说几次，自然日重置，**这是最硬的一道闸门**——概率写得再高也超不过它。每次约 1500 token：8 次 ≈ 1.2 万、40 次 ≈ 6 万、70 次 ≈ 10 万 token/天。30 以上要留意平台风控和被嫌吵。影响：token ↑↑（每多一次就是一次完整请求）。" },
+      { key: "active_reply_quiet_hours", label: "静默时段", type: "text", default: "01:00-08:00", hint: "格式 01:00-08:00，支持跨天（如 22:00-06:00）。这段时间零消耗。留空 = 不静默。影响：token ↓（静默时段完全不发请求）。" },
+      { key: "active_reply_min_messages", label: "冷清阈值", type: "int", min: 0, max: 100, step: 1, default: 3, hint: "最近 10 分钟少于这么多条就不插话，避免对着空气说话。0 = 关闭检测。影响：token ↓。" },
       {
         key: "active_reply_mode", label: "触发方式", type: "select", default: "probability",
         options: [["probability", "概率掷骰（零额外消耗）"], ["rule", "关键词规则（零额外消耗）"], ["llm_judge", "让模型判定（有消耗）"]],
         hint: "probability 每个冷却窗口掷一次骰；rule 命中提问句式/关键词才接；llm_judge 攒够消息问一次模型，判定本身就有消耗。影响：llm_judge 的 token ↑↑。",
       },
-      {
-        key: "active_reply_chance", label: "每个窗口的参与概率", type: "slider", min: 0, max: 1, step: 0.05, default: 0.15,
-        hint: "仅 probability 模式。0.15 ≈ 一天约 7 次，正好落在日限 8 以内。骰子按窗口掷，不按消息——否则群越热闹越容易被插话。",
-      },
-      { key: "active_reply_cooldown_seconds", label: "冷却时间（秒）", type: "int", min: 60, max: 86400, step: 60, default: 1800, hint: "两次评估至少隔多久，默认 1800 ≈ 一天 48 个窗口。影响：token ↓（调大）。" },
-      { key: "active_reply_daily_limit", label: "每日上限（每群）", type: "int", min: 0, max: 50, step: 1, default: 8, hint: "每群每天最多主动说几次，自然日重置。默认 8 ≈ 1.2 万 token/天。20 以上有平台风控和被嫌吵的风险。" },
-      { key: "active_reply_quiet_hours", label: "静默时段", type: "text", default: "01:00-08:00", hint: "格式 01:00-08:00，支持跨天（如 22:00-06:00）。这段时间零消耗。留空 = 不静默。" },
-      { key: "active_reply_min_messages", label: "冷清阈值", type: "int", min: 0, max: 100, step: 1, default: 3, hint: "最近 10 分钟少于这么多条就不插话，避免对着空气说话。0 = 关闭检测。影响：token ↓。" },
       { key: "active_reply_judge_stack", label: "判定攒消息数", type: "int", min: 1, max: 100, step: 1, default: 8, hint: "仅 llm_judge：攒够多少条才问一次模型。默认 8，一天 200 条 ≈ 25 次判定 ≈ 1.5 万 token/天。影响：token ↑（调小）。" },
       { key: "active_reply_backoff_limit", label: "连击退避阈值", type: "int", min: 0, max: 20, step: 1, default: 3, hint: "连续这么多次插话没人接就把冷却放大，防止自嗨（设计上限 4 倍）。0 = 关闭退避。一旦有人说话立刻清零。影响：token ↓。" },
-      { key: "active_reply_keywords", label: "额外触发词", type: "list", default: [], hint: "仅 rule 模式：逗号分隔，命中就接话。留空只用内置提问句式。影响：token 与命中次数成正比。" },
+      { key: "active_reply_keywords", label: "额外触发词", type: "list", default: [], hint: "仅 rule 模式：逗号分隔，命中就接话。留空只用内置提问句式。影响：token ↑（命中越多越贵）。" },
       {
         key: "active_reply_guidance", label: "语气引导", type: "textarea", default:
           "这是一条由你主动发起的群聊回复，没有人向你提问。\n不要使用「有什么可以帮你」「我在」「已收到」这类服务式或召唤式开头；\n不要提及自己是主动发言或任何机制；\n像普通群友一样简短接话；话题不适合接就少说或不说。",
-        hint: "告诉模型这是主动发言、别用客服腔。留空则完全不注入这段。影响：token 轻微 ↑（多几十字）。",
+        hint: "告诉模型这是主动发言、别用客服腔。留空则完全不注入这段。影响：token ↑（多几十字）。",
       },
-      { key: "active_reply_provider_id", label: "使用的 Provider ID", type: "text", default: "", hint: "判定和插话共用这个模型，留空用当前会话默认。换成便宜的 flash 可显著降低单次成本。" },
+      { key: "active_reply_provider_id", label: "使用的 Provider ID", type: "text", default: "", hint: "判定和插话共用这个模型，留空用当前会话默认。换成便宜的 flash 可显著降低单次成本。影响：token ↓（换便宜模型）。" },
     ],
   },
   {
@@ -671,19 +1148,19 @@ const SETTING_GROUPS = [
       {
         key: "web_search_provider", label: "服务商", type: "select", default: "deepseek",
         options: [["deepseek", "DeepSeek（¥0.005/次，复用模型 key）"], ["tavily", "Tavily（免费 1000 次/月）"], ["bocha", "博查 Bocha"], ["brave", "Brave（需要梯子）"]],
-        hint: "deepseek 最划算：¥0.005/次、复用模型 key、失败不计费。tavily/bocha 有月额度，20 次/群/天 × 10 群一个月就会烧穿。影响：直接决定每次搜索的钱。",
+        hint: "deepseek 最划算：¥0.005/次、复用模型 key、失败不计费。tavily/bocha 有月额度，20 次/群/天 × 10 群一个月就会烧穿。影响：token 0（搜索按次单独计费，不占对话 token）。",
       },
-      { key: "web_search_api_key", label: "API Key", type: "password", default: "", hint: "留空 + 下面复用全局 key 开着时会自动读 AstrBot 里同家的 key，多数情况不用填。填了会明文写进 runtime.json。影响：只影响能不能搜。" },
-      { key: "web_search_reuse_global_key", label: "复用 AstrBot 全局 key", type: "bool", default: true, hint: "key 只存一处，插件目录不留明文。DeepSeek 的搜索 key 和模型 key 是同一个。影响：token 不变。" },
+      { key: "web_search_api_key", label: "API Key", type: "password", default: "", hint: "留空 + 下面复用全局 key 开着时会自动读 AstrBot 里同家的 key，多数情况不用填。填了会明文写进 runtime.json。影响：token 0。" },
+      { key: "web_search_reuse_global_key", label: "复用 AstrBot 全局 key", type: "bool", default: true, hint: "key 只存一处，插件目录不留明文。DeepSeek 的搜索 key 和模型 key 是同一个。影响：token 0。" },
       { key: "web_search_daily_limit", label: "每日上限（每群）", type: "int", min: 0, max: 200, step: 1, default: 20, hint: "每群每天最多搜几次，跨群独立，第二天归零。20 次 ≈ ¥0.15/群/天。正常群一天真正需要实时信息不超过 5 次。影响：token ↑（调大）。" },
       { key: "web_search_max_per_turn", label: "单轮上限", type: "int", min: 0, max: 10, step: 1, default: 2, hint: "一轮最多搜几次，防止模型连环搜把当天配额烧完。0 = 不限（不建议）。影响：token ↑（调大）。" },
       { key: "web_search_max_results", label: "返回条数", type: "int", min: 1, max: 50, step: 1, default: 5, hint: "一次搜几条。5 条约 1200 token，调到 10 大约翻倍。影响：token ↑（调大）。" },
       {
         key: "web_search_need_content", label: "返回网页正文", type: "bool", warn: true, default: false,
-        hint: "成本翻十倍：每条结果都带整页正文，5 条可能 3-5 万 token，一次搜索顶一天的学习消耗。默认的 summary 已有 600-800 字概要，够用。",
+        hint: "成本翻十倍：每条结果都带整页正文，5 条可能 3-5 万 token，一次搜索顶一天的学习消耗。默认的 summary 已有 600-800 字概要，够用。影响：token ↑↑↑。",
       },
-      { key: "web_search_timeout", label: "超时（秒）", type: "int", min: 1, max: 60, step: 1, default: 8, hint: "超过就放弃搜索按失败处理（不阻塞、不计费）。调大会让群里等回复更久。影响：token 不变。" },
-      { key: "web_search_hint", label: "搜索提示语", type: "textarea", default: "", hint: "留空完全不注入。填了会提示模型「需要实时信息先搜一下」，但可能搜得太勤把配额提前用完。影响：token 轻微 ↑，且可能显著增加搜索次数。" },
+      { key: "web_search_timeout", label: "超时（秒）", type: "int", min: 1, max: 60, step: 1, default: 8, hint: "超过就放弃搜索按失败处理（不阻塞、不计费）。调大会让群里等回复更久。影响：token 0。" },
+      { key: "web_search_hint", label: "搜索提示语", type: "textarea", default: "", hint: "留空完全不注入。填了会提示模型「需要实时信息先搜一下」，但可能搜得太勤把配额提前用完。影响：token ↑（且显著增加搜索次数）。" },
     ],
   },
   {
@@ -691,8 +1168,8 @@ const SETTING_GROUPS = [
     title: "🛡 管理员",
     sub: "让管理员在群里直接改参数",
     items: [
-      { key: "admin_extra_users", label: "额外管理员 QQ", type: "list", default: [], hint: "除 AstrBot 全局管理员外还能管理这个插件的人，逗号分隔。他们能在群里调参数、加记忆、查消耗。影响：token 不变。" },
-      { key: "admin_tool_enabled", label: "允许对话调参", type: "bool", default: false, hint: "开启后管理员在群里说话就能改设置、加记忆。非管理员群里这个工具根本不挂给模型。影响：token 轻微 ↑（约 200 token 的工具定义）。" },
+      { key: "admin_extra_users", label: "额外管理员 QQ", type: "list", default: [], hint: "除 AstrBot 全局管理员外还能管理这个插件的人，逗号分隔。他们能在群里调参数、加记忆、查消耗。影响：token 0。" },
+      { key: "admin_tool_enabled", label: "允许对话调参", type: "bool", default: false, hint: "开启后管理员在群里说话就能改设置、加记忆。非管理员群里这个工具根本不挂给模型。影响：token ↑（约 200 token 的工具定义）。" },
     ],
   },
   {
@@ -700,12 +1177,12 @@ const SETTING_GROUPS = [
     title: "💰 计价",
     sub: "只影响面板估的金额，不影响真实扣费",
     items: [
-      { key: "token_price_input_cached", label: "缓存命中输入价（元/百万）", type: "float", min: 0, max: 1000, step: 0.01, default: 0.05, hint: "DeepSeek 官方牌价，调价了就改这里，不用等插件更新。" },
-      { key: "token_price_input_miss", label: "未命中输入价（元/百万）", type: "float", min: 0, max: 1000, step: 0.01, default: 1.5, hint: "缓存没命中时的价格，是命中价的 30 倍——这就是插件坚持不改 system prompt 的原因。" },
-      { key: "token_price_output", label: "输出价（元/百万）", type: "float", min: 0, max: 1000, step: 0.01, default: 4.5, hint: "每百万输出 token 的价格。" },
-      { key: "token_price_peak_multiplier", label: "高峰倍率", type: "float", min: 1, max: 10, step: 0.1, default: 2, hint: "高峰时段（工作日 09:00-12:00、14:00-18:00 北京时间）按这个倍率算。DeepSeek 目前 2 倍。" },
-      { key: "token_price_peak_enabled", label: "区分峰谷价", type: "bool", default: true, hint: "关掉就全按空闲价算。节假日不单独处理，会略微高估。" },
-      { key: "token_stats_keep_days", label: "消耗记录保留天数", type: "int", min: 1, max: 60, step: 1, default: 7, hint: "按天存文件，超出的自动删。只存数字不存聊天内容，泄露也不含隐私。影响：只占磁盘。" },
+      { key: "token_price_input_cached", label: "缓存命中输入价（元/百万）", type: "float", min: 0, max: 1000, step: 0.01, default: 0.05, hint: "DeepSeek 官方牌价，调价了就改这里，不用等插件更新。影响：token 0（只影响金额换算）。" },
+      { key: "token_price_input_miss", label: "未命中输入价（元/百万）", type: "float", min: 0, max: 1000, step: 0.01, default: 1.5, hint: "缓存没命中时的价格，是命中价的 30 倍——这就是插件坚持不改 system prompt 的原因。影响：token 0（只影响金额换算）。" },
+      { key: "token_price_output", label: "输出价（元/百万）", type: "float", min: 0, max: 1000, step: 0.01, default: 4.5, hint: "每百万输出 token 的价格。影响：token 0（只影响金额换算）。" },
+      { key: "token_price_peak_multiplier", label: "高峰倍率", type: "float", min: 1, max: 10, step: 0.1, default: 2, hint: "高峰时段（工作日 09:00-12:00、14:00-18:00 北京时间）按这个倍率算。DeepSeek 目前 2 倍。影响：token 0（只影响金额换算）。" },
+      { key: "token_price_peak_enabled", label: "区分峰谷价", type: "bool", default: true, hint: "关掉就全按空闲价算。节假日不单独处理，会略微高估。影响：token 0（只影响金额换算）。" },
+      { key: "token_stats_keep_days", label: "消耗记录保留天数", type: "int", min: 1, max: 60, step: 1, default: 7, hint: "按天存文件，超出的自动删。只存数字不存聊天内容，泄露也不含隐私。影响：token 0（只占磁盘）。" },
     ],
   },
 ];
@@ -722,23 +1199,116 @@ const SEARCH_LOCKED_KEYS = [
   "web_search_timeout",
 ];
 
+// 参数页搜索关键词 + 最后一次拿到的配置（改筛选时不用重新请求）
+let settingQuery = "";
+let lastSettingsData = null;
+
+// 一条预设是否与当前配置完全吻合。数值留 1e-6 容差——
+// 概率是浮点，0.15 存进去再读出来可能带尾数
+function profileMatches(profile, settings) {
+  const values = (profile && profile.values) || {};
+  return Object.entries(values).every(([key, want]) => {
+    const cur = settings[key];
+    if (typeof want === "number") return Math.abs(Number(cur) - want) < 1e-6;
+    return String(cur ?? "") === String(want);
+  });
+}
+
+// 「强度预设」那一排。点一下把 5 个参数整组写进去，改完还能继续单独微调——
+// 微调到不匹配任何预设时，右边那句提示会说「已单独改过」
+function activeProfileBar(settings) {
+  const profiles = (lastStatus && lastStatus.active_profiles) || [];
+  if (!profiles.length) return "";
+  const current = profiles.find((p) => profileMatches(p, settings));
+  const buttons = profiles
+    .map(
+      (p) =>
+        `<button type="button" data-profile="${escAttr(p.id)}"${
+          current && current.id === p.id ? ' class="on"' : ""
+        } title="${escAttr(p.desc)}">${esc(p.label)}</button>`,
+    )
+    .join("");
+  const note = current
+    ? esc(current.desc)
+    : "下面这几个参数被单独改过，已经不属于任何预设";
+  return `<div class="profile-bar">
+    <span class="profile-label">强度预设</span>
+    <div class="seg" id="activeProfileSeg">${buttons}</div>
+    <span class="hint">${note}</span>
+  </div>`;
+}
+
 function renderSettings(settings) {
+  lastSettingsData = settings;
   const overrides = settings._runtime_overrides || {};
-  $("settings").innerHTML = SETTING_GROUPS.map((group) => {
-    const rows = group.items.map((def) => settingRow(def, settings, overrides)).join("");
+  const q = settingQuery.trim().toLowerCase();
+  let hitCount = 0;
+
+  const blocks = SETTING_GROUPS.map((group) => {
+    // 搜索时按「参数名 / key / 说明」过滤，一整组都没命中就整组不渲染——
+    // 67 项参数一屏放不下，用户要的是「直接定位到那一条」
+    const defs = q
+      ? group.items.filter((def) =>
+          `${def.label || ""} ${def.key} ${def.hint || ""}`.toLowerCase().includes(q),
+        )
+      : group.items;
+    if (!defs.length) return "";
+    hitCount += defs.length;
+    const rows = defs.map((def) => settingRow(def, settings, overrides)).join("");
     const sub = group.sub ? `<small>${esc(group.sub)}</small>` : "";
     // 搜索组的联动提示挂在标题旁，选模式时立刻能看到
     const note = group.id === "search" ? '<span class="group-note" id="searchNote"></span>' : "";
     const footer = group.id === "style" ? '<p class="hint compute" id="styleNote"></p>' : "";
+    // 主动回复组顶部是「三档一键切换」：这几个参数互相咬合，
+    // 单独改一个看不出效果，所以给整体档位
+    const head = group.id === "active" ? activeProfileBar(settings) : "";
     return `<section class="set-group">
       <h3>${esc(group.title)}${sub}${note}</h3>
+      ${head}
       <div class="set-grid">${rows}</div>
       ${footer}
     </section>`;
-  }).join("");
+  });
+
+  const note = $("settingFilterNote");
+  if (note) {
+    note.textContent = q ? `匹配 ${hitCount} 项` : "";
+  }
+  $("settings").innerHTML =
+    blocks.join("") ||
+    `<p class="empty">没有匹配「${esc(settingQuery.trim())}」的参数</p>`;
   clearSettingMsg();
   updateStyleNote();
   applySearchMode(settings.web_search_mode || "plugin");
+}
+
+// token 影响标签：从 hint 里那句「影响：token ↑」提取出来单独渲染。
+//
+// 为什么要单独做成标签：hint 是几十字的一段话，躺在里面根本看不见；
+// 做成彩色标签挂在标题旁，扫一眼就知道这个选项动不动钱。
+// 箭头数量就是影响大小：↑↑ = 每轮都变、↑ = 有影响、0 = 不改 token。
+function tokenTag(hint) {
+  const m = /token\s*([↑↓]{1,3}|0)/.exec(String(hint || ""));
+  if (!m) return "";
+  const raw = m[1];
+  if (raw === "0") return '<i class="set-tok zero" title="不影响 token 消耗">token 0</i>';
+  const up = raw.startsWith("↑");
+  const level = raw.length >= 2 ? "big" : "small";
+  const arrow = up ? "↑".repeat(raw.length) : "↓".repeat(raw.length);
+  return `<i class="set-tok ${up ? "up" : "down"} ${level}" title="对 token 的影响：${
+    up ? "调大/开启会变贵" : "调大/开启会变便宜"
+  }">${arrow}</i>`;
+}
+
+// 「默认：xxx」徽标。bool 显示开/关——直接写 true/false 对非技术用户是噪音。
+function fmtDefault(def) {
+  const v = def.default;
+  if (v === undefined || v === null) return "";
+  if (typeof v === "boolean") return v ? "开" : "关";
+  if (Array.isArray(v)) return v.length ? v.join(",") : "空";
+  if (typeof v === "string") return v.trim() || "空";
+  if (def.type === "slider" || def.type === "float") return String(v);
+  return String(v);
 }
 
 function settingRow(def, settings, overrides) {
@@ -746,13 +1316,15 @@ function settingRow(def, settings, overrides) {
     ? def.default
     : settings[def.key];
   const hot = def.key in overrides ? '<i class="hot">已热调</i>' : "";
+  const defText = fmtDefault(def);
+  const defBadge = defText === "" ? "" : `<i class="set-def">默认 ${esc(defText)}</i>`;
   const hint = def.hint
     ? `<p class="set-hint${def.warn ? " warn" : ""}">${esc(def.hint)}</p>`
     : "";
   const wide = def.type === "textarea" || def.type === "list" ? " wide" : "";
   const warn = def.warn ? " warn-row" : "";
   return `<label class="set-row${warn}${wide}" data-row="${def.key}">
-    <span class="set-label">${esc(def.label)} ${hot}</span>
+    <span class="set-label">${esc(def.label)} ${defBadge}${tokenTag(def.hint)} ${hot}</span>
     <span class="set-control">${settingControl(def, raw)}</span>
     ${hint}
   </label>`;
@@ -1008,9 +1580,18 @@ function sessionCard(s) {
     <summary>
       <b>${s.pinned ? "📌 " : ""}${esc(s.display_name)}</b>
       <span>学习 ${learnedCount} · 手动 ${manual.length} · 待学习 ${s.history_count ?? 0}</span>
-      <button type="button" class="pin-btn${s.pinned ? " on" : ""}" data-act="pin" data-sid="${sid}">${
+      <button type="button" class="pin-btn${s.pinned ? " on" : ""}" data-act="pin" data-sid="${sid}"
+        title="${s.pinned ? "取消置顶（置顶时不能删这个会话）" : "置顶这个会话，排在列表最前"}">${
         s.pinned ? "已置顶" : "置顶"
       }</button>
+      ${
+        // 置顶的一律不给删除按钮（和学习库同一套规矩）：不是灰掉，是整块不渲染
+        s.pinned
+          ? ""
+          : `<button type="button" class="pin-btn danger" data-act="drop_session" data-sid="${sid}"
+              data-name="${escAttr(s.display_name || sid)}"
+              title="删除这个会话的全部记忆（学到的东西 + 手动记忆 + 待学习消息）">删除</button>`
+      }
     </summary>
     <div class="body">
       <p class="hint">${esc(stateLine)}<br>${esc(quota)}</p>
@@ -1031,11 +1612,11 @@ function sessionCard(s) {
         <span class="sw-note">${esc(searchLine)}</span>
       </div>
       <div class="session-actions">
-        <button data-act="add_trait" data-sid="${sid}">+ 手动记忆</button>
-        <button data-act="learn" data-sid="${sid}">立即学习</button>
-        <button class="ghost" data-act="clear_history" data-sid="${sid}">清待学习记录</button>
-        <button class="ghost danger" data-act="clear_learned" data-sid="${sid}">清学习产出</button>
-        <button class="ghost danger" data-act="clear_manual" data-sid="${sid}">清手动记忆</button>
+        <button data-act="add_trait" data-sid="${sid}" title="人工加一条记忆：不看聊天记录，学习也删不掉它">+ 手动记忆</button>
+        <button data-act="learn" data-sid="${sid}" title="立刻对这个会话跑一次学习（会发一次请求）">立即学习</button>
+        <button class="ghost" data-act="clear_history" data-sid="${sid}" title="只清「待学习消息」缓冲，已学到的东西不动">清待学习记录</button>
+        <button class="ghost danger" data-act="clear_learned" data-sid="${sid}" title="清这个会话学到的特征和待审条目，手动记忆保留">清学习产出</button>
+        <button class="ghost danger" data-act="clear_manual" data-sid="${sid}" title="清这个会话所有人工添加的记忆，学习产出不受影响">清手动记忆</button>
       </div>
       ${manual.length ? `<h3>✋ 手动记忆（${manual.length}）<small>不看聊天记录，学习也删不掉它</small></h3><ul class="sublist">${manualRows}</ul>` : ""}
       ${stable.length ? `<h3>稳定风格（${stable.length}）</h3><ul class="sublist">${stableRows}</ul>` : ""}
@@ -1198,7 +1779,8 @@ function renderPersonaList() {
       return `<div class="persona-item${on}" data-sid="${escAttr(s.session_id)}">
         <span class="pi-name">${s.pinned ? "📌 " : ""}${esc(s.display_name)}</span>
         <span class="pi-meta">${esc(s.trait_active ?? 0)}/${esc(s.trait_total ?? 0)} 条生效 · ${state}</span>
-        <button type="button" class="pin-btn${s.pinned ? " on" : ""}" data-pact="pin" data-sid="${escAttr(s.session_id)}">${
+        <button type="button" class="pin-btn${s.pinned ? " on" : ""}" data-pact="pin" data-sid="${escAttr(s.session_id)}"
+          title="${s.pinned ? "取消置顶" : "置顶这个会话（会排在会话列表最前）"}">${
           s.pinned ? "已置顶" : "置顶"
         }</button>
       </div>`;
@@ -1364,15 +1946,1310 @@ async function preview() {
     return;
   }
   const out = $("previewOut");
-  out.textContent = payload.text || (payload.would_inject ? "" : "（该会话当前不会注入任何内容）");
-  out.classList.toggle("empty", !payload.text);
+  // 显示完整注入（风格段 + 关系段 + 字数要求），而不是只显示风格段：
+  // 只显示一段的话，看到的和实际发出去的不是一回事
+  const body = payload.combined || payload.text || "";
+  out.textContent = body || "（该会话当前不会注入任何内容）";
+  out.classList.toggle("empty", !body);
 
   const parts = [];
   if (payload.strength !== undefined) {
     parts.push(`本次${previewActive ? "主动" : "被动"}强度 ${payload.strength}，让位概率 ${payload.override_probability ?? 0}%`);
   }
   if (payload.length_rule) parts.push("已带字数要求");
+  parts.push("关系段按人不同，去「关系与输出」页看某个人实际会注入什么");
   $("previewNote").textContent = parts.join(" · ");
+}
+
+// ── 关系状态与输出层（1.5.0）─────────────────────────────────────────
+
+const STAGE_TEXT = {
+  hostile: "不待见",
+  stranger: "陌生",
+  familiar: "熟悉",
+  close: "亲近",
+  intimate: "老友",
+};
+const bondData = { items: [], settings: {}, groups: {}, enabled: false };
+
+// 切到关系页时调。数据一直在变（群里聊着天就在涨），所以每次都重拉，
+// 不做缓存——缓存的数字只会误导人。
+async function ensureBond() {
+  await loadBond();
+}
+
+// 拉关系数据并渲染。**这个函数上一版被我整段误删过**：
+// 替换代码块时范围算大了，把 ensureBond 和 loadBond 一起带走了，
+// 结果是页面上一片空白——列头在、统计和列表没有，
+// 因为根本没人去拉数据。教训：大段替换后要 grep 一遍被替换区里的函数名。
+async function loadBond() {
+  try {
+    const data = unwrap(await Bridge.apiGet("bond", {}));
+    bondData.items = data.items || [];
+    bondData.settings = data.settings || {};
+    bondData.groups = data.groups || {};
+    bondData.enabled = !!data.enabled;
+    renderBond();
+  } catch (err) {
+    console.error("加载关系状态失败:", err);
+    showToast("加载关系状态失败，请查看日志");
+  }
+}
+
+// ── 通用列头筛选（Excel 式）──────────────────────────────────────────
+//
+// 关系 / 事实 / 学习库三个列表共用这一套。之前每个列表各写一遍：关系面板是
+// 「排序下拉 + 阶段下拉」并排，事实面板是「搜索框 + 状态下拉 + 排序下拉」，
+// 学习库塞在标题栏里。同一个产品里三种筛选交互，用户每换一页都要重新学一遍。
+//
+// 现在统一成列头：**每个字段一个按钮，点开是它自己的面板**——和 Excel 的
+// 自动筛选一致。列头上直接标状态（有筛选挂 ●，排序中显示 ↑↓），
+// 不用点开就知道当前是什么组合。
+//
+// 列定义支持三种能力，可以叠加：
+//   type: "text"  关键词输入框
+//   groups        多组复选框（组内「或」、组间也「或」：都是「我要看这些」）
+//   type: "sort"  排序方向
+//
+// state 统一形状：{ text: {}, sets: {}, sort: "", dir: "desc" }
+// 各面板只写自己的 columns 和 match 逻辑，交互全部由这里管。
+
+function gfState(cfg) {
+  const st = cfg.state;
+  if (!st.text) st.text = {};
+  if (!st.sets) st.sets = {};
+  if (st.sort === undefined) st.sort = "";
+  if (!st.dir) st.dir = "desc";
+  return st;
+}
+
+function gfCol(cfg, col) {
+  return (cfg.columns || []).find((c) => c.col === col);
+}
+
+function gfHasFilter(cfg, def) {
+  const st = gfState(cfg);
+  if (def.type === "text" && String(st.text[def.col] || "").trim()) return true;
+  return (def.groups || []).some((g) => (st.sets[g.key] || []).length > 0);
+}
+
+// 列头上的状态：筛选挂 ●，排序显示箭头。就这么两件事，但必须画——
+// 不画的话用户点完面板收起来，就看不出列表为什么只剩三个人了。
+function gfPaint(cfg) {
+  const bar = $(cfg.bar);
+  if (!bar) return;
+  const st = gfState(cfg);
+  bar.querySelectorAll(".gf-head").forEach((btn) => {
+    const def = gfCol(cfg, btn.dataset.col);
+    if (!def) return;
+    const caret = btn.querySelector(".gf-caret");
+    const sorted = def.type === "sort" && st.sort === def.col;
+    const filtered = gfHasFilter(cfg, def);
+    btn.classList.toggle("sorted", sorted);
+    btn.classList.toggle("filtered", filtered && !sorted);
+    if (caret) {
+      caret.textContent = sorted ? (st.dir === "asc" ? "↑" : "↓") : filtered ? "●" : "▼";
+    }
+  });
+}
+
+// 当前筛选组合的一句话摘要，挂在工具条右边。
+// 比逐个列头看箭头直白：「熟悉 / 亲近 · 好感 ↓：12 / 66 人」。
+function gfNoteText(cfg) {
+  const st = gfState(cfg);
+  const parts = [];
+  (cfg.columns || []).forEach((def) => {
+    const kw = String(st.text[def.col] || "").trim();
+    if (def.type === "text" && kw) parts.push(`搜「${kw}」`);
+    (def.groups || []).forEach((g) => {
+      const cur = st.sets[g.key] || [];
+      if (!cur.length) return;
+      const opts = typeof g.options === "function" ? g.options() : g.options || [];
+      parts.push(
+        cur.map((k) => (opts.find((o) => o.key === k) || {}).label || k).join("/"),
+      );
+    });
+    if (def.type === "sort" && st.sort === def.col) {
+      parts.push(`${def.label} ${st.dir === "asc" ? "↑" : "↓"}`);
+    }
+  });
+  return parts.join(" · ");
+}
+
+const GF_TEXT_ID = "gfText";
+
+function gfPopHtml(cfg, col) {
+  const def = gfCol(cfg, col);
+  if (!def) return "";
+  const st = gfState(cfg);
+  const items = cfg.items ? cfg.items() : [];
+  const blocks = [];
+
+  if (def.type === "text") {
+    blocks.push(
+      `<p class="gf-title">${esc(def.title || "按对象筛选")}</p>` +
+        `<input id="${GF_TEXT_ID}" type="search" placeholder="${escAttr(
+          def.placeholder || "",
+        )}" value="${escAttr(st.text[col] || "")}" />`,
+    );
+  }
+
+  (def.groups || []).forEach((g) => {
+    const opts = typeof g.options === "function" ? g.options() : g.options || [];
+    const cur = st.sets[g.key] || [];
+    const rows = opts
+      .map((o) => {
+        const on = cur.includes(o.key);
+        const n = g.count ? Number(g.count(items, o.key) || 0) : null;
+        // 0 人且没勾的置灰：勾上等于筛出空列表，看着像坏了
+        const dead = n === 0 && !on;
+        return `<label class="gf-opt${dead ? " disabled" : ""}">
+          <input type="checkbox" data-set="${escAttr(g.key)}" value="${escAttr(
+            o.key,
+          )}"${on ? " checked" : ""}${dead ? " disabled" : ""} /> ${esc(o.label)}${
+            n === null ? "" : `<span class="gf-count">${n}</span>`
+          }
+        </label>`;
+      })
+      .join("");
+    blocks.push(
+      `<p class="gf-title"${
+        blocks.length ? ' style="margin-top:10px"' : ""
+      }>${esc(g.title || "筛选")}</p>${rows}`,
+    );
+  });
+
+  if (def.type === "sort") {
+    const on = st.sort === col;
+    blocks.push(
+      `<p class="gf-title"${
+        blocks.length ? ' style="margin-top:10px"' : ""
+      }>按${esc(def.label || "值")}排序</p>
+      <label class="gf-opt"><input type="radio" name="gfsort" value="desc"${
+        on && st.dir === "desc" ? " checked" : ""
+      } /> ${esc(def.descLabel || "降序（大的在前）")}</label>
+      <label class="gf-opt"><input type="radio" name="gfsort" value="asc"${
+        on && st.dir === "asc" ? " checked" : ""
+      } /> ${esc(def.ascLabel || "升序（小的在前）")}</label>`,
+    );
+  }
+
+  // 只清这一列，整表重置在工具条上——两个粒度都要有，
+  // 只想撤掉「状态」的人不该被迫连搜索词一起丢
+  const acts = ['<button class="ghost tiny" data-gf="clear" title="只清掉这一列的筛选条件">清空这列</button>'];
+  if (def.type === "sort") {
+    acts.push(
+      `<button class="ghost tiny" data-gf="${
+        st.sort === col ? "sortoff" : "sortdesc"
+      }">${st.sort === col ? "不按这列排" : "按降序排"}</button>`,
+    );
+  }
+  blocks.push(`<div class="gf-actions">${acts.join("")}</div>`);
+  return blocks.join("");
+}
+
+function gfBind(cfg, col, pop) {
+  const def = gfCol(cfg, col);
+  const st = gfState(cfg);
+
+  // 面板内容每次都是重写的，所以没有「局部更新」——任何操作都是
+  // 改 state → 重渲染列表 → 重开面板（顺带把输入框焦点放回去）
+  const again = () => {
+    const bar = $(cfg.bar);
+    const btn = bar ? bar.querySelector(`[data-col="${col}"]`) : null;
+    gfOpen(cfg, col, btn);
+  };
+
+  const text = pop.querySelector("#" + GF_TEXT_ID);
+  if (text) {
+    text.addEventListener("input", (e) => {
+      st.text[col] = e.target.value || "";
+      cfg.render();
+      again();
+      // 重渲染会把面板重建，光标就丢了。打一个字跳一次焦点没法用。
+      const box = $(cfg.pop).querySelector("#" + GF_TEXT_ID);
+      if (box) {
+        box.focus();
+        box.setSelectionRange(box.value.length, box.value.length);
+      }
+    });
+  }
+
+  pop.querySelectorAll("input[data-set]").forEach((box) => {
+    box.addEventListener("change", () => {
+      const key = box.dataset.set;
+      const cur = st.sets[key] || [];
+      st.sets[key] = box.checked
+        ? [...new Set([...cur, box.value])]
+        : cur.filter((v) => v !== box.value);
+      cfg.render();
+      again();
+    });
+  });
+
+  pop.querySelectorAll('input[name="gfsort"]').forEach((radio) => {
+    radio.addEventListener("change", () => {
+      st.sort = col;
+      st.dir = radio.value;
+      cfg.render();
+      again();
+    });
+  });
+
+  pop.querySelectorAll("button[data-gf]").forEach((btn) => {
+    btn.addEventListener("click", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      const act = btn.dataset.gf;
+      if (act === "clear") {
+        if (def.type === "text") st.text[col] = "";
+        (def.groups || []).forEach((g) => {
+          st.sets[g.key] = [];
+        });
+      } else if (act === "sortoff") {
+        st.sort = "";
+      } else if (act === "sortdesc") {
+        st.sort = col;
+        st.dir = "desc";
+      }
+      cfg.render();
+      again();
+    });
+  });
+}
+
+function gfClose(cfg) {
+  const pop = $(cfg.pop);
+  if (!pop) return;
+  pop.hidden = true;
+  pop.dataset.col = "";
+  pop.innerHTML = "";
+}
+
+// ``toggle`` 只有点列头时才传：勾复选框、打字这些「面板内部的操作」
+// 不该把面板收起来——Excel 里也不这样。
+function gfOpen(cfg, col, btn, { toggle = false } = {}) {
+  const pop = $(cfg.pop);
+  if (!pop || !btn) return;
+  if (toggle && !pop.hidden && pop.dataset.col === col) {
+    gfClose(cfg);
+    return;
+  }
+  pop.dataset.col = col;
+  pop.innerHTML = gfPopHtml(cfg, col);
+  pop.hidden = false;
+  // 跟被点的列左对齐；靠右的列往回拉一点，别顶出容器
+  const width = pop.offsetWidth || 240;
+  const limit = (btn.parentElement?.clientWidth || 600) - width - 8;
+  pop.style.left = `${Math.max(0, Math.min(btn.offsetLeft, limit))}px`;
+  gfBind(cfg, col, pop);
+}
+
+// 一个工具条只初始化一次：页面切来切去不会把监听器叠成一堆
+function gfInitBar(cfg) {
+  const bar = $(cfg.bar);
+  if (!bar || bar.dataset.gfInit) return;
+  bar.dataset.gfInit = "1";
+  bar.addEventListener("click", (e) => {
+    const head = e.target.closest(".gf-head");
+    if (!head) return;
+    e.preventDefault();
+    e.stopPropagation();
+    gfOpen(cfg, head.dataset.col, head, { toggle: true });
+  });
+  const reset = bar.querySelector("[data-gf-reset]");
+  if (reset) {
+    reset.addEventListener("click", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      cfg.reset();
+      gfClose(cfg);
+      cfg.render();
+    });
+  }
+  // 点面板以外收起。用 mousedown 而不是 click：点另一个列头时
+  // document 的 click 会先到，把刚打开的面板立刻关掉。
+  document.addEventListener("mousedown", (e) => {
+    if (!e.target.closest("#" + cfg.bar)) gfClose(cfg);
+  });
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") gfClose(cfg);
+  });
+}
+
+// ── 关系面板的列定义 ─────────────────────────────────────────────────
+
+const bondFilter = { text: {}, sets: {}, sort: "", dir: "desc" };
+
+const FLAG_TEXT = {
+  idle: "7 天以上没聊",
+  owner: "只看主人",
+  pinned: "只看置顶",
+};
+
+function matchFlag(item, flag) {
+  if (flag === "idle") return (item.idle_days || 0) >= 7;
+  if (flag === "owner") return !!item.is_owner;
+  if (flag === "pinned") return !!(item.pinned || item.is_owner);
+  return false;
+}
+
+const BOND_GF = {
+  bar: "bondFilterBar",
+  pop: "bondFilterPop",
+  state: bondFilter,
+  items: () => bondData.items,
+  render: renderBond,
+  reset: () => {
+    bondFilter.text = {};
+    bondFilter.sets = {};
+    bondFilter.sort = "";
+    bondFilter.dir = "desc";
+  },
+  columns: [
+    {
+      col: "who",
+      label: "对象",
+      type: "text",
+      title: "按对象筛选",
+      placeholder: "QQ 号 / 昵称 / 群号",
+      groups: [
+        {
+          key: "flags",
+          title: "附加条件",
+          options: Object.keys(FLAG_TEXT).map((key) => ({ key, label: FLAG_TEXT[key] })),
+          count: (items, key) => items.filter((i) => matchFlag(i, key)).length,
+        },
+      ],
+    },
+    {
+      col: "stage",
+      label: "阶段",
+      groups: [
+        {
+          key: "stages",
+          title: "按阶段（可多选）",
+          options: Object.entries(STAGE_TEXT).map(([key, label]) => ({ key, label })),
+          count: (items, key) => items.filter((i) => i.stage === key).length,
+        },
+      ],
+    },
+    { col: "intimacy", label: "好感", type: "sort" },
+    { col: "turns", label: "轮次", type: "sort" },
+    {
+      col: "idle",
+      label: "最近聊天",
+      type: "sort",
+      descLabel: "降序（最久没聊的在前）",
+      ascLabel: "升序（刚聊过的在前）",
+    },
+  ],
+};
+
+function matchBond(item) {
+  const st = gfState(BOND_GF);
+  const kw = String(st.text.who || "").trim().toLowerCase();
+  if (kw) {
+    const hay = [item.sender_id, item.sender_name, item.nickname, item.session_label, item.key]
+      .filter(Boolean)
+      .join(" ")
+      .toLowerCase();
+    if (!hay.includes(kw)) return false;
+  }
+  // 阶段和附加条件同属「阶段」这一列，用「或」：
+  // 勾了「熟悉」又勾了「7 天没聊」，意思是这两拨人我都要看。
+  const stages = st.sets.stages || [];
+  const flags = st.sets.flags || [];
+  if (stages.length || flags.length) {
+    const hitStage = stages.includes(item.stage);
+    const hitFlag = flags.some((f) => matchFlag(item, f));
+    if (!hitStage && !hitFlag) return false;
+  }
+  return true;
+}
+
+function isPinnedBond(item) {
+  return !!(item.is_owner || item.pinned);
+}
+
+function sortBond(list) {
+  const st = gfState(BOND_GF);
+  if (!st.sort) return list;
+  const pick = {
+    intimacy: (i) => Number(i.intimacy || 0),
+    turns: (i) => Number(i.turns || 0),
+    idle: (i) => Number(i.idle_days || 0),
+  }[st.sort];
+  if (!pick) return list;
+  const mul = st.dir === "asc" ? 1 : -1;
+  const cmp = (a, b) => mul * (pick(a) - pick(b));
+  // 分三段：主人永远第一，手动置顶的次之，其余最后。
+  //
+  // 只分「钉住 / 不钉住」两段是不够的：把一个「不待见」的人钉上去，
+  // 再按好感升序排，他会排到主人前面——「主人默认置顶」就不成立了。
+  // 段内仍然按当前排序走（主人有好几个时也用得上）。
+  const owner = list.filter((i) => i.is_owner).sort(cmp);
+  const pinned = list.filter((i) => !i.is_owner && i.pinned).sort(cmp);
+  const rest = list.filter((i) => !i.is_owner && !i.pinned).sort(cmp);
+  return owner.concat(pinned, rest);
+}
+
+// 壳：真正的渲染逻辑在 renderBondBody，这里只负责接住异常。
+// 包在这一层是因为调用点有十来个（切页、刷新、筛选、置顶、改数值…），
+// 逐个加 try 一定会漏，漏掉的那个就是下次的「一片空白」。
+function renderBond() {
+  renderGuard("bondList", "关系列表", renderBondBody);
+}
+
+function renderBondBody() {
+  const { items, settings, groups, enabled } = bondData;
+  const capText = settings.group_cap_familiar
+    ? "群聊封顶在「熟悉」，只有私聊会到「亲近」"
+    : "群聊也能到「亲近」";
+  const tierText = settings.tiered_memory === false
+    ? "记忆量不分档（按配置固定上限）"
+    : "记忆量按好感分档，越熟记得越多";
+  $("bondNote").textContent = enabled
+    ? `共 ${groups.total ?? 0} 人 · ${groups.familiar_or_more ?? 0} 人已「熟悉」以上 · ` +
+      `${groups.hostile ?? 0} 人负好感 · ${tierText} · ${capText}`
+    : "关系状态没开。开启后才会记录每个人和 bot 的相处进度，每轮注入一小段，不产生额外 LLM 调用。";
+
+  $("bondStats").innerHTML = [
+    ["关系人数", groups.total ?? 0],
+    ["已熟悉以上", groups.familiar_or_more ?? 0],
+    ["负好感", groups.hostile ?? 0],
+    ["7 天没聊", groups.idle ?? 0],
+    ["状态", enabled ? "已开启" : "已关闭"],
+  ]
+    .map(([k, v]) => `<div class="stat"><span>${esc(k)}</span><b>${esc(String(v))}</b></div>`)
+    .join("");
+
+  // 列头状态先画：数据变了，各档的计数和箭头也要跟着变
+  gfPaint(BOND_GF);
+
+  if (!items.length) {
+    $("bondFilterNote").textContent = "";
+    $("bondList").innerHTML = `<p class="empty">${
+      enabled ? "还没有记录到关系——群里正常聊几句就有了" : "开启后这里会列出每个人和 bot 的相处进度"
+    }</p>`;
+    return;
+  }
+
+  const visible = sortBond(items.filter(matchBond));
+  const note = gfNoteText(BOND_GF);
+  $("bondFilterNote").textContent = note
+    ? `${note}：${visible.length} / ${items.length} 人`
+    : `${visible.length} 人`;
+  if (!visible.length) {
+    $("bondList").innerHTML = `<p class="empty">没有符合条件的记录</p>`;
+    return;
+  }
+  $("bondList").innerHTML = visible.map(bondCard).join("");
+}
+
+function bondCard(item) {
+  const stage = item.stage || "stranger";
+  const who = item.sender_name
+    ? `${item.sender_name}（${item.sender_id}）`
+    : item.sender_id;
+  const progress = item.capped
+    ? "群聊已封顶"
+    : item.next_label
+      ? `差 ${item.need} 点到「${item.next_label}」`
+      : "已到最高档";
+  const nick = item.nickname
+    ? `称呼「${item.nickname}」`
+    : `未设称呼${item.sender_name ? `（按平台昵称「${item.sender_name}」）` : ""}`;
+  // 注入文本是这条记录真正的样子，包括「被整段丢弃」这种情况
+  const inject = item.inject_text
+    ? esc(item.inject_text)
+    : "（这条现在不会注入：可能关系总开关关着，或字数超上限被整段丢弃）";
+  const stageName = STAGE_TEXT[stage] || stage;
+  // 主人单独标出来：他的阶段不会停在「熟悉」，不标的话会被当成配置没生效
+  const ownerTag = item.is_owner ? "👑 " : "";
+  const ownerNote = item.is_owner ? " · 主人（群聊不封顶）" : "";
+  // 主人恒定排在最前，不需要也不能取消；其余人给一个手动钉的开关
+  const pinBtn = item.is_owner
+    ? `<span class="bond-pin owner">默认置顶</span>`
+    : `<button class="ghost tiny bond-pin-btn" data-bond="${
+        item.pinned ? "unpin" : "pin"
+      }" data-key="${escAttr(item.key)}">${item.pinned ? "📌 取消置顶" : "置顶"}</button>`;
+  const pinnedTag = !item.is_owner && item.pinned ? "📌 " : "";
+  // 这一档实际会注入多少记忆：把「省钱省在哪」直接写在卡片上，
+  // 否则用户看到陌生人只有 120 字，会怀疑是 bug
+  const tier = Array.isArray(item.tier)
+    ? `记忆配额：关系段 ${item.tier[0]} 字 · 事实 ${item.tier[1]} 条 / ${item.tier[2]} 字`
+    : "记忆配额：不分档（按配置固定上限）";
+  const idleDays = item.idle_days || 0;
+  // 衰减只在「已经掉过」的时候提示，0 天不刷屏
+  const idleNote =
+    idleDays >= 1
+      ? ` · ${idleDays} 天没聊，衰减后保留 ${Math.round(Number(item.keep_ratio ?? 1) * 100)}%`
+      : "";
+  // 冷却中说明下一次变动还要等多久。不写这句的话，
+  // 用户在群里说完话回来看点数没动，会以为插件坏了
+  const cdLeft = Number(item.cooldown_left || 0);
+  const cdNote = cdLeft > 0 ? ` · 冷却中，还要 ${Math.ceil(cdLeft / 60)} 分钟才会再变` : "";
+  const value = Number(item.intimacy || 0);
+  // 千分制下 300.0 显示成「300.0 点」很别扭；只有真的带小数（群聊 +1.5）才留一位
+  const valueText = Number.isInteger(value) ? String(value) : value.toFixed(1);
+  return `<details class="session">
+    <summary>
+      <b>${ownerTag}${pinnedTag}${esc(who)}</b>
+      <span>最近 ${esc(item.session_label)} · ${esc(stageName)} · ${item.turns} 轮 · ${
+        item.days
+      } 天 · ${esc(valueText)} 点${ownerNote}</span>
+      ${pinBtn}
+    </summary>
+    <div class="body">
+      <p class="hint">${esc(nick)} · ${esc(progress)} · 上次 ${esc(
+        item.last_talk_text || "—",
+      )}${esc(idleNote)}${esc(cdNote)}</p>
+      <p class="hint">${esc(tier)}</p>
+      <div class="bond-adjust">
+        <span>亲密度</span>
+        <input type="number" class="bond-value" data-key="${escAttr(item.key)}"
+          min="-100" max="1000" step="10" value="${value}" />
+        <button class="ghost tiny" data-bond="set_intimacy" data-key="${escAttr(
+          item.key,
+        )}" title="把亲密度改成输入框里的值（不改变聊过多少轮、认识多少天）">应用</button>
+        <span class="hint">范围 -100 ~ 1000，改完立刻生效</span>
+      </div>
+      <div class="bond-adjust">
+        <span>称呼</span>
+        <input type="text" class="bond-nickname" data-key="${escAttr(item.key)}"
+          value="${escAttr(item.nickname || "")}"
+          placeholder="留空 = 用平台昵称${item.sender_name ? `（${escAttr(item.sender_name)}）` : ""}" />
+        <button class="ghost tiny" data-bond="set_nickname" data-key="${escAttr(
+          item.key,
+        )}" title="保存称呼。多个称呼用逗号分隔，注入时会告诉模型「你叫他 A 或 B」">保存</button>
+        <span class="hint">多个称呼用逗号 / 顿号分隔，最多 40 字；不影响自动判定，只覆盖叫法</span>
+      </div>
+      <div class="session-actions">
+        <button class="ghost" data-bond="clear_nickname" data-key="${escAttr(item.key)}"
+          title="清掉给 bot 指定的叫法，之后按默认方式称呼"${
+          item.nickname ? "" : " disabled"
+        }>清称呼</button>
+        <button class="ghost" data-bond="reset" data-key="${escAttr(item.key)}"
+          title="把好感归零（回到陌生起点），关系记录还在">亲密度归零</button>
+        <button class="ghost danger" data-bond="delete" data-key="${escAttr(item.key)}"
+          title="删掉这个人的关系记录（好感、称呼一起没，不可恢复）">删除</button>
+      </div>
+      <p class="hint">这条关系现在会注入的内容：</p>
+      <pre class="preview-out">${inject}</pre>
+    </div>
+  </details>`;
+}
+
+async function bondAction(action, key, value) {
+  if (action === "delete") {
+    const ok = await askConfirm("删掉这条关系记录？亲密度、轮次、称呼会一起没，无法恢复。");
+    if (!ok) return;
+  }
+  const body = { action, key };
+  if (action === "set_intimacy") {
+    const num = Number(value);
+    if (value === "" || !Number.isFinite(num)) {
+      showToast("亲密度要填个数字");
+      return;
+    }
+    body.value = Math.max(-100, Math.min(1000, num));
+  }
+  if (action === "set_nickname") {
+    body.nickname = String(value ?? "").slice(0, 40);
+  }
+  const payload = unwrap(await Bridge.apiPost("bond", body));
+  if (payload && payload.success === false) {
+    showToast(payload.message || "操作失败");
+    return;
+  }
+  showToast(payload.message || "已处理");
+  await loadBond();
+}
+
+// ── 输出层调试 ──────────────────────────────────────────────────────
+
+let toneReady = false;
+
+function syncToneSwitches() {
+  // 用当前配置当初始值，之后改开关只影响这次预览，不写回配置
+  if (toneReady) return;
+  const groups = (lastStatus && lastStatus.groups) || {};
+  const toneCfg = groups.tone;
+  if (!toneCfg) return;
+  $("toneClean").checked = !!toneCfg.clean;
+  $("toneSqueeze").checked = !!toneCfg.squeeze;
+  $("toneMarkdown").checked = !!toneCfg.markdown;
+  $("toneSegment").checked = !!toneCfg.segment;
+  $("toneChars").value = toneCfg.segment_chars || 60;
+  $("toneParts").value = toneCfg.segment_parts || 4;
+  toneReady = true;
+}
+
+async function runTone() {
+  const text = $("toneInput").value;
+  if (!text.trim()) {
+    showToast("先粘一段回复进去");
+    return;
+  }
+  const body = {
+    text,
+    clean: $("toneClean").checked,
+    squeeze: $("toneSqueeze").checked,
+    markdown: $("toneMarkdown").checked,
+    segment: $("toneSegment").checked,
+    segment_chars: Number($("toneChars").value) || 60,
+    segment_parts: Number($("toneParts").value) || 4,
+  };
+  const payload = unwrap(await Bridge.apiPost("tone", body));
+  if (payload && payload.success === false) {
+    showToast(payload.message || "解析失败");
+    return;
+  }
+
+  const saved = payload.chars_saved ?? 0;
+  const savedText = saved > 0 ? `省了 ${saved} 字` : saved < 0 ? `多了 ${-saved} 字` : "字数没变";
+  const segs = payload.segments || [];
+  const segHtml = segs.length
+    ? `<div class="tone-segs">${segs
+        .map(
+          (s, i) =>
+            `<div class="tone-seg"><i>第 ${i + 1} 条 · ${s.chars} 字</i><span>${esc(s.text)}</span></div>`,
+        )
+        .join("")}</div>`
+    : `<p class="empty">拆条没产出内容</p>`;
+  const blocked = payload.segment_blocked
+    ? `<p class="hint">这段里有代码块或链接，按规则不拆条——切开会把格式切坏。</p>`
+    : "";
+
+  $("toneOut").innerHTML = `
+    <p class="hint">原 ${payload.chars_before ?? 0} 字 → 处理后 ${payload.chars_after ?? 0} 字 · ${savedText}</p>
+    <p class="hint">清理后的完整回复：</p>
+    <pre class="preview-out">${esc(payload.cleaned || "")}</pre>
+    ${blocked}
+    <p class="hint">如果宿主开了「分段回复」，实际会按这样发出去：</p>
+    ${segHtml}
+  `;
+}
+
+// ── 事实记忆（1.5.0）─────────────────────────────────────────────────
+
+const factData = { items: [], settings: {}, stats: {}, enabled: false };
+
+async function loadFacts() {
+  try {
+    const data = unwrap(await Bridge.apiGet("facts", {}));
+    factData.items = data.items || [];
+    factData.settings = data.settings || {};
+    factData.stats = data.stats || {};
+    factData.enabled = !!data.enabled;
+    renderFacts();
+  } catch (err) {
+    console.error("加载事实记忆失败:", err);
+    showToast("加载事实记忆失败，请查看日志");
+  }
+}
+
+// ── 事实面板的列定义 ─────────────────────────────────────────────────
+
+const factFilter = { text: {}, sets: {}, sort: "", dir: "desc" };
+
+// 「还记着几条」：不含已否决。清理过的人如果按 total 算，
+// 清完一遍显示的还是 12 条，用户会以为按钮没生效。
+function factAlive(row) {
+  if (row.alive !== undefined && row.alive !== null) return Number(row.alive);
+  return (row.items || []).filter((i) => i.status_key !== "rejected").length;
+}
+
+// 最近一次被提到的时间
+function factLastSeen(row) {
+  return Math.max(0, ...(row.items || []).map((i) => Number(i.last_seen || 0)));
+}
+
+// 这个人记忆里最低的保留度：一键清理该不该动他，看这个最直观
+function factMinKeep(row) {
+  const vals = (row.items || []).map((i) => Number(i.keep ?? 1));
+  return vals.length ? Math.min(...vals) : 1;
+}
+
+// 附加条件的判定。写成函数而不是内联在 matchFact 里，是因为列头的计数
+// 也要用它——两处各写一遍，早晚会不一致（显示 3 人，点开只剩 2 人）。
+function matchFactFlag(row, flag) {
+  if (flag === "owner") return !!row.is_owner;
+  // 「接近上限」用 80%：剩不到两成额度时，下一条新事实进来就要淘汰旧的，
+  // 这时候该主动清一次，而不是等系统按分数偷偷扔
+  if (flag === "full") return factAlive(row) >= Number(row.limit || 0) * 0.8;
+  // 「一键清理会动」：现在条数超过这个档位的保留目标，且不是主人
+  if (flag === "prunable") {
+    return !row.is_owner && Number(row.keep_target || 0) > 0 &&
+      factAlive(row) > Number(row.keep_target || 0);
+  }
+  if (flag === "nopin") return !(row.items || []).some((i) => i.pinned);
+  return false;
+}
+
+const FACT_GF = {
+  bar: "factFilterBar",
+  pop: "factFilterPop",
+  state: factFilter,
+  items: () => factData.items,
+  render: renderFacts,
+  reset: () => {
+    factFilter.text = {};
+    factFilter.sets = {};
+    factFilter.sort = "";
+    factFilter.dir = "desc";
+  },
+  columns: [
+    {
+      col: "who",
+      label: "对象",
+      type: "text",
+      title: "按对象筛选",
+      placeholder: "QQ 号 / 昵称 / 记忆内容",
+      groups: [
+        {
+          key: "flags",
+          title: "附加条件",
+          options: [
+            { key: "owner", label: "只看主人" },
+            { key: "full", label: "接近上限（≥80%）" },
+            { key: "prunable", label: "一键清理会动" },
+            { key: "nopin", label: "没有钉住的" },
+          ],
+          count: (items, key) => items.filter((i) => matchFactFlag(i, key)).length,
+        },
+      ],
+    },
+    {
+      col: "stage",
+      label: "档位",
+      groups: [
+        {
+          key: "stages",
+          title: "按好感档位（存储上限跟着档位走）",
+          options: Object.entries(STAGE_TEXT).map(([key, label]) => ({ key, label })),
+          count: (items, key) => items.filter((i) => i.stage === key).length,
+        },
+      ],
+    },
+    {
+      col: "status",
+      label: "状态",
+      groups: [
+        {
+          key: "statuses",
+          title: "按记忆状态（可多选）",
+          options: [
+            { key: "active", label: "已生效" },
+            { key: "pending", label: "待观察" },
+            { key: "suspect", label: "疑似记错" },
+            { key: "archived", label: "已归档" },
+            { key: "rejected", label: "已否决" },
+          ],
+          // 状态是条目级的，行是「人」：只要这个人有一条处于该状态就算命中，
+          // 展开时也只显示那些条目
+          count: (items, key) =>
+            items.filter((i) => (i.items || []).some((x) => x.status_key === key)).length,
+        },
+      ],
+    },
+    { col: "total", label: "条数", type: "sort" },
+    {
+      col: "keep",
+      label: "保留度",
+      type: "sort",
+      descLabel: "降序（记得最牢的）",
+      ascLabel: "升序（快忘光的在前）",
+    },
+  ],
+};
+
+function matchFact(row) {
+  const st = gfState(FACT_GF);
+
+  // 行级条件先过：档位、附加条件都是「这个人」的属性
+  const stages = st.sets.stages || [];
+  const flags = st.sets.flags || [];
+  if (stages.length || flags.length) {
+    const hitStage = stages.includes(row.stage);
+    const hitFlag = flags.some((f) => matchFactFlag(row, f));
+    if (!hitStage && !hitFlag) return null;
+  }
+
+  let items = row.items || [];
+
+  const kw = String(st.text.who || "").trim().toLowerCase();
+  if (kw) {
+    const meta = [row.sender_id, row.sender_name, row.session_label, row.key]
+      .filter(Boolean)
+      .join(" ")
+      .toLowerCase();
+    if (!meta.includes(kw)) {
+      // 只命中内容时，只留命中的那几条：否则会出现「搜到了但看不出是哪条」
+      items = items.filter((i) => String(i.text || "").toLowerCase().includes(kw));
+      if (!items.length) return null;
+    }
+  }
+
+  const statuses = st.sets.statuses || [];
+  if (statuses.length) {
+    items = items.filter((i) => statuses.includes(i.status_key));
+    if (!items.length) return null;
+  }
+  return { ...row, items };
+}
+
+function sortFacts(list) {
+  const st = gfState(FACT_GF);
+  const copy = [...list];
+  const mul = st.dir === "asc" ? 1 : -1;
+  if (st.sort === "total") {
+    copy.sort((a, b) => mul * (Number(a.total || 0) - Number(b.total || 0)));
+  } else if (st.sort === "keep") {
+    // 升序时「快忘光的」排前面：要清理记忆时先看到最该清的那几条
+    copy.sort((a, b) => mul * (factMinKeep(a) - factMinKeep(b)));
+  } else {
+    // 没选排序时按条数降序：和原来的默认一致，不改变习惯
+    copy.sort((a, b) => Number(b.total || 0) - Number(a.total || 0));
+  }
+  return copy;
+}
+
+function renderFacts() {
+  renderGuard("factsList", "事实记忆", renderFactsBody);
+}
+
+function renderFactsBody() {
+  const { items, settings, stats, enabled } = factData;
+  const ownerFacts = stats.owner_facts ?? 0;
+  // 写「存储上限按档位」而不是「每轮注入多少字」：前者是这一版的新规则，
+  // 用户看到「这个人上限 20、那个 300」时会想知道为什么
+  $("factsNote").textContent = enabled
+    ? `共 ${stats.alive ?? stats.facts ?? 0} 条，分属 ${stats.people ?? 0} 个人 · 生效 ${stats.active ?? 0} · ` +
+      `已归档 ${stats.archived ?? 0} · 按 QQ 号唯一（跨群共享）· 存储上限按好感档位（陌生 20 → 老友 100）` +
+      ` · 三档按熟练度自动分，可手动升降` +
+      (ownerFacts ? ` · 主人 ${ownerFacts} 条不受清理影响` : "")
+    : "事实记忆没开。开启后会记住「关于某个人的具体事」，按 QQ 号存，A 的私事不会注入到回复 B 里。";
+
+  // 「一键清理后」比「已生效」有用得多：前者是「点一下会变成什么」，
+  // 后者只有点开每张卡才看得出效果。
+  // 中间那格是三档分布：核心 / 深层 / 浅层，顺序固定，和条目上的徽标一致
+  const tiers = stats.tiers || {};
+  $("factStats").innerHTML = [
+    ["记忆条数", stats.alive ?? stats.facts ?? 0],
+    ["覆盖人数", stats.people ?? 0],
+    ["核心 / 深层 / 浅层", `${tiers.core ?? 0} / ${tiers.deep ?? 0} / ${tiers.shallow ?? 0}`],
+    ["一键清理后", stats.keep_after ?? stats.alive ?? stats.facts ?? 0],
+    ["主人（不清）", ownerFacts],
+  ]
+    .map(([k, v]) => `<div class="stat"><span>${esc(k)}</span><b>${esc(String(v))}</b></div>`)
+    .join("");
+
+  // 列头状态先画：数据变了，各档人数和箭头也要跟着变
+  gfPaint(FACT_GF);
+
+  // 「清理主人」只在真有主人记忆时出现。文案带保留量，用户点之前就知道会剩几条
+  const pruneOwnerBtn = $("factPruneOwner");
+  if (pruneOwnerBtn) {
+    const ownerRow = items.find((r) => r.is_owner);
+    const keep = ownerRow ? Number(ownerRow.keep_target || 0) : 0;
+    pruneOwnerBtn.hidden = !ownerRow;
+    if (ownerRow) {
+      // 主人单独清理的保留量（150），和一键清理的档位表无关
+      pruneOwnerBtn.textContent = keep ? `清理主人（留 ${keep}）` : "清理主人";
+      pruneOwnerBtn.disabled = !(Number(ownerRow.alive || 0) > keep);
+    }
+  }
+
+  if (!items.length) {
+    $("factsList").innerHTML = `<p class="empty">${
+      enabled ? "还没有记住任何事——群友聊到具体的安排、偏好时会自动抽取" : "开启后这里会列出每个人被记住的事"
+    }</p>`;
+    if ($("factFilterNote")) $("factFilterNote").textContent = "";
+    return;
+  }
+
+  const visible = sortFacts(items.map(matchFact).filter(Boolean));
+  const cond = gfNoteText(FACT_GF);
+  const note = $("factFilterNote");
+  if (note) {
+    note.textContent = cond
+      ? `${cond}：${visible.length} / ${items.length} 人`
+      : `${visible.length} / ${items.length} 人`;
+  }
+  if (!visible.length) {
+    $("factsList").innerHTML = `<p class="empty">没有符合条件的记忆</p>`;
+    return;
+  }
+  $("factsList").innerHTML = visible.map(factBucketCard).join("");
+}
+
+function factBucketCard(row) {
+  const who = row.is_owner ? `👑 ${row.sender_id}` : row.sender_id;
+  // 「最近在哪个群」只是展示信息：事实按 QQ 号存，跨群共享，
+  // 写在这里是为了让人知道这个人主要在哪儿出现过
+  const where = row.session ? `最近在 ${esc(row.session_label)}` : "会话未知";
+  const cap = row.limit ? ` / ${row.limit}` : "";
+  const archived = row.archived ? ` · 归档 ${row.archived}` : "";
+  // 已否决的单独标出来：它们还在文件里留档（能恢复），但不算「记着」
+  const rejected = row.rejected ? ` · 已否决 ${row.rejected}` : "";
+  const alive = factAlive(row);
+  // 档位决定上限：写出来用户才知道「为什么这个人只能存 5 条」
+  const stage = row.stage_label ? ` · ${esc(row.stage_label)}档` : "";
+  const keepNote = row.is_owner
+    ? " · 主人不参与清理"
+    : row.keep_target
+      ? ` · 清理后留 ${row.keep_target} 条`
+      : "";
+  // 档位计数：让用户知道「这个人最多能写死几条、中间那层现在有几条」，
+  // 而不是看到核心数量莫名其妙。深层没有名额限制，所以只显示数字
+  const coreNote = row.core_quota
+    ? ` · 核心 ${row.core_count ?? 0}/${row.core_quota} · 深层 ${row.deep_count ?? 0}`
+    : "";
+  // 快到上限时才提示，平时不刷屏
+  const full = alive >= Number(row.limit || 0) * 0.8;
+  const fullTag = full ? '<span class="fact-full">接近上限</span>' : "";
+  // 单人清理按钮：条数没超过保留目标时禁用，点了也是「不用清」
+  const canPrune = !row.is_owner && alive > Number(row.keep_target || 0);
+  const pruneBtn = `<button class="ghost tiny" data-fact-prune="${escAttr(row.key)}"${
+    canPrune ? "" : " disabled"
+  }>按档位瘦身${row.keep_target ? `（留 ${row.keep_target}）` : ""}</button>`;
+  const clearBtn = row.total
+    ? `<button class="ghost tiny danger" data-fact-clear="${escAttr(row.key)}"
+        title="把这个人的记忆全部删掉（不可恢复，画像也一起清）">清空这人</button>`
+    : "";
+  const rows = (row.items || [])
+    .map((it) => {
+      // 保留度：30 天归零。低于 60% 标黄，归零标红——一眼看出哪些快忘了
+      const keep = Number(it.keep ?? 1);
+      const pct = Math.round(keep * 100);
+      const cls = keep <= 0 ? "gone" : keep < 0.6 ? "low" : "";
+      const tier = it.tier || "shallow";
+      const label = it.tier_label || TIER_TEXT[tier] || "浅层";
+      // 熟练度：三档就是按它分的，所以必须显示出来——
+      // 不然用户看到「这条是浅层、那条是核心」会不知道依据是什么
+      const prof = Math.round(Number(it.prof ?? 0));
+      const manual = it.tier_manual ? " · 手动" : "";
+      const tierTag = `<span class="fact-tier ${esc(tier)}" data-fact-auto="${escAttr(it.id)}"
+        data-fact-key="${escAttr(row.key)}"
+        title="${esc(
+          `${label}记忆 · 熟练度 ${prof}${manual}。熟练度 = 提到次数 60% + 重要性 25% + 新鲜度 15%` +
+            `\n点一下交回自动判定`,
+        )}">${esc(label)} <b>${prof}</b></span>`;
+      // ↑ / ↓ 各挪一档，点错了再点回来，所以不做二次确认
+      const upBtn = `<button class="ghost tiny" data-fact-tier="${escAttr(it.id)}"
+        data-fact-dir="1" data-fact-key="${escAttr(row.key)}"
+        title="升一级（浅层 → 深层 → 核心）"
+        ${tier === "core" ? "disabled" : ""}>↑</button>`;
+      const downBtn = `<button class="ghost tiny" data-fact-tier="${escAttr(it.id)}"
+        data-fact-dir="-1" data-fact-key="${escAttr(row.key)}"
+        title="降一级（核心 → 深层 → 浅层）"
+        ${tier === "shallow" ? "disabled" : ""}>↓</button>`;
+      const variant = (it.variants || []).length
+        ? `<span class="fact-variant" title="${escAttr((it.variants || []).join("\n"))}">还有 ${
+            (it.variants || []).length
+          } 种说法</span>`
+        : "";
+      return `<li class="fact-row${it.pinned ? " pinned" : ""}">
+        <span class="fact-tag${it.active ? " on" : ""}">${esc(it.status)}</span>
+        <span class="fact-kind">${esc(it.kind)}</span>
+        ${tierTag}
+        <span class="fact-text">${esc(it.text)}</span>
+        ${variant}
+        <span class="fact-keep ${cls}" title="按遗忘曲线还剩多少：到了就归零并归档">${
+          keep <= 0 ? "忘光" : `${pct}%`
+        }</span>
+        <span class="fact-tier-btns">${upBtn}${downBtn}</span>
+        <button class="ghost tiny" data-fact-del="${escAttr(it.id)}" data-fact-key="${escAttr(row.key)}"
+          title="删掉这条记忆（不可恢复）">删</button>
+      </li>`;
+    })
+    .join("");
+  // 个人画像：一段连续的「这个人是谁」，和下面的事实明细分工不同——
+  // 画像答「他是谁」，事实答「他最近在干嘛」。字数上限按好感档位给
+  const prof = row.profile || {};
+  const profQuota = Number(prof.quota || 0);
+  const profStageQuota = Number(prof.stage_quota || profQuota || 0);
+  const profBasis = Number(prof.basis || 0);
+  const profUpd = prof.updated_at ? ` · ${fmtTime(prof.updated_at)} 更新` : "";
+  const profileBox =
+    profQuota > 0
+      ? `<div class="profile-box">
+      <div class="profile-head">
+        <b>🧬 画像</b>
+        <label class="profile-quota" title="改这个 QQ 的画像字数上限；填 0 恢复档位默认 ${profStageQuota} 字">
+          上限
+          <input type="number" data-prof-chars="${escAttr(row.key)}" value="${profQuota}"
+            min="0" max="800" step="10" />
+          字
+        </label>
+        <span class="hint">${profBasis ? `基于 ${profBasis} 条事实` : ""}${
+          prof.chars ? ` · 已手调（档位默认 ${profStageQuota}）` : ` · 档位默认 ${profStageQuota}`
+        }${profUpd}</span>
+        <button class="ghost tiny" data-prof-rewrite="${escAttr(row.key)}"
+          title="让模型重写这段画像。会发一次请求（约 800 token），每天有次数上限">重新生成</button>
+      </div>
+      <p class="profile-text">${
+        prof.text ? esc(prof.text) : '<span class="hint">还没有画像——事实攒到 3 条会自动生成</span>'
+      }</p>
+      <details class="profile-edit">
+        <summary>人工补充${prof.manual ? "（已填）" : ""}</summary>
+        <textarea data-prof-manual="${escAttr(row.key)}" rows="2"
+          placeholder="例如：他是我室友，别调侃他学历">${esc(prof.manual || "")}</textarea>
+        <button class="ghost tiny" data-prof-save="${escAttr(row.key)}">保存</button>
+      </details>
+    </div>`
+      : "";
+
+  // 人级别的「置顶」放在标题栏：控制的是这个人在列表里的位置，
+  // 和里面每条记忆的档位、钉住是两回事
+  const pinUserBtn = `<button type="button" class="ghost tiny${row.pinned ? " pinned" : ""}"
+    data-fact-pin-user="${escAttr(row.key)}" data-fact-pinned="${row.pinned ? "0" : "1"}"
+    title="${row.pinned ? "取消置顶" : "置顶这个人，排在事实列表最前"}">${row.pinned ? "已置顶" : "置顶"}</button>`;
+
+  return `<details class="session">
+    <summary>
+      <b>${row.pinned ? "📌 " : ""}${esc(who)}</b>
+      <span>${where}${stage}${coreNote} · ${alive}${cap} 条（生效 ${row.active} · 待观察 ${row.pending} · 疑似记错 ${row.suspect}${archived}${rejected}）${keepNote}</span>
+      ${fullTag}
+      ${pinUserBtn}
+    </summary>
+    <div class="body">
+      ${profileBox}
+      <ul class="fact-list">${rows}</ul>
+      <div class="fact-actions">${pruneBtn}${clearBtn}</div>
+    </div>
+  </details>`;
+}
+
+// 重新生成画像：会发一次请求，所以先确认一句
+async function rewriteProfile(key) {
+  const ok = await askConfirm(
+    "让模型重写这个人的画像？\n\n" +
+      "会把现在记住的事实重新提炼成一段描述，约 800 token（一次不到一分钱）。\n" +
+      "人工补充不会被覆盖。每天有重写次数上限。",
+  );
+  if (!ok) return;
+  const res = unpack(await Bridge.apiPost("facts", { action: "rewrite_profile", key }));
+  showToast(res.message || (res.ok ? "已重新生成" : "生成失败"));
+  if (res.ok) await loadFacts();
+}
+
+// 给单个 QQ 单独设画像字数上限。填 0 = 回到档位默认
+async function saveProfileChars(key, chars) {
+  const res = unpack(
+    await Bridge.apiPost("facts", { action: "set_profile_chars", key, chars }),
+  );
+  showToast(res.message || (res.ok ? "已更新" : "更新失败"));
+  if (res.ok) await loadFacts();
+}
+
+// 人物级别的置顶：只影响列表顺序
+async function pinFactUser(key, pinned) {
+  const res = unpack(
+    await Bridge.apiPost("facts", { action: "pin_user", key, pinned }),
+  );
+  showToast(res.message || (res.ok ? "已更新" : "更新失败"));
+  if (res.ok) await loadFacts();
+}
+
+// 保存人工补充段。手工写的比模型总结的可靠，注入时排在最前
+async function saveProfile(key, text) {
+  const res = unpack(
+    await Bridge.apiPost("facts", { action: "save_profile", key, manual: text }),
+  );
+  showToast(res.message || (res.ok ? "已保存" : "保存失败"));
+  if (res.ok) await loadFacts();
+}
+
+async function deleteFact(key, id) {
+  const ok = await askConfirm("删掉这条记忆？删了就真的不记得了，无法恢复。");
+  if (!ok) return;
+  const payload = unwrap(await Bridge.apiPost("facts", { action: "delete", key, id }));
+  if (payload && payload.success === false) {
+    showToast(payload.message || "删除失败");
+    return;
+  }
+  showToast(payload.message || "已删除");
+  await loadFacts();
+}
+
+// 同时要 data 和 message：data 用来显示「清掉几条」，message 是给人看的一句话。
+// unwrap 只返回 data，成功时的文案就拿不到了。
+function unpack(payload) {
+  if (payload && typeof payload === "object" && "success" in payload) {
+    return {
+      ok: payload.success !== false,
+      message: payload.message || "",
+      data: payload.data || {},
+    };
+  }
+  return { ok: true, message: "", data: payload || {} };
+}
+
+// 手动升降记忆档位。``dir``：1 升一级 / -1 降一级 / 0 交回自动判定。
+// 可逆操作，不做二次确认——点错了再点回来就行，为它弹一次确认框反而烦。
+async function setFactTier(key, id, dir) {
+  try {
+    const res = unpack(
+      await Bridge.apiPost("facts", { action: "set_tier", key, id, dir }),
+    );
+    showToast(res.message || (res.ok ? "已更新" : "更新失败"));
+    if (res.ok) await loadFacts();
+  } catch (err) {
+    console.error("改记忆档位失败:", err);
+    showToast("操作失败，请查看日志");
+  }
+}
+
+// 整理合并：把「同一件事的不同说法」并成一条。
+// 先 dry_run 问一句「会合几条」再执行——这个动作会改动整库，
+// 不能点了就跑。纯本地比对，不花 token。
+async function mergeFacts() {
+  try {
+    const prev = unpack(await Bridge.apiPost("facts", { action: "merge", dry_run: true }));
+    if (!prev.ok) {
+      showToast(prev.message || "预览失败");
+      return;
+    }
+    const d = prev.data || {};
+    if (!d.merged) {
+      showToast("没有发现可以合并的重复记忆");
+      return;
+    }
+    const ok = await askConfirm(
+      `整理合并：涉及 ${d.people} 人，共 ${d.merged} 组重复\n\n` +
+        `每组只留最熟的那条（提到次数多的），其余并进它的「别的说法」里，` +
+        `标成「已归档」留档，180 天后才真删。\n\n` +
+        `熟练度、重要性、最近提到时间都会合并过去，不会因为合并而变生。`,
+    );
+    if (!ok) return;
+    const res = unpack(await Bridge.apiPost("facts", { action: "merge" }));
+    showToast(res.message || "已合并");
+    if (res.ok) await loadFacts();
+  } catch (err) {
+    console.error("整理合并失败:", err);
+    showToast("操作失败，请查看日志");
+  }
+}
+
+// 单人按档位瘦身。**先预览再确认**：这会改动数据，
+// 不能点了就直接执行——用户得先看到「10 → 5 条」这个数字。
+async function pruneFact(key) {
+  try {
+    const prev = unpack(
+      await Bridge.apiPost("facts", { action: "prune", key, dry_run: true }),
+    );
+    if (!prev.ok) {
+      showToast(prev.message || "预览失败");
+      return;
+    }
+    const d = prev.data || {};
+    if (!d.removed) {
+      showToast(`这个人现在 ${d.before ?? 0} 条，没超过 ${d.target ?? 0} 条的目标，不用清`);
+      return;
+    }
+    const ok = await askConfirm(
+      `按档位瘦身：${d.before} → ${d.after} 条（保留 ${d.target} 条）\n\n` +
+        `会清掉 ${d.removed} 条。清掉的不删除，标成「已否决」留档，` +
+        `在「状态」列勾「已否决」还能看到。\n\n` +
+        `保留顺序：钉住的、亲口说过的边界永远留；其余按重要性和最近提到的排。`,
+    );
+    if (!ok) return;
+    const res = unpack(await Bridge.apiPost("facts", { action: "prune", key }));
+    showToast(res.message || "已清理");
+    await loadFacts();
+  } catch (err) {
+    console.error("清理失败:", err);
+    showToast("清理失败，请查看日志");
+  }
+}
+
+// 一键清理：所有非主人各自按档位瘦身。主人跳过——
+// 「养得越久记得越多」是这套玩法的核心，主人这条线不该被清。
+async function pruneAllFacts() {
+  try {
+    const prev = unpack(
+      await Bridge.apiPost("facts", { action: "prune_all", dry_run: true }),
+    );
+    if (!prev.ok) {
+      showToast(prev.message || "预览失败");
+      return;
+    }
+    const d = prev.data || {};
+    if (!d.removed && !d.purged) {
+      showToast(
+        `没有需要清理的（${d.skipped_owner || 0} 个主人已跳过，其余都没超过档位目标）`,
+      );
+      return;
+    }
+    // 按档位列出会动几个人，让用户点确认前心里有数
+    const rows = (d.rows || []).slice(0, 6).map((r) => `  ${r.key}：${r.before} → ${r.after} 条`);
+    const more = (d.rows || []).length > 6 ? `\n  ……还有 ${d.rows.length - 6} 人` : "";
+    const ok = await askConfirm(
+      `一键清理会整理 ${d.people} 个人的记忆，清掉 ${d.removed} 条` +
+        (d.purged ? `，另删 ${d.purged} 条超期归档` : "") +
+        `。\n\n按好感档位保留：不待见 2 / 陌生 5 / 熟悉 12 / 亲近 20 / 老友 30 条。\n` +
+        `${d.skipped_owner || 0} 个主人不受影响。\n\n` +
+        `${rows.join("\n")}${more}\n\n` +
+        `清掉的不删除，标「已否决」留档，随时能筛出来看。`,
+    );
+    if (!ok) return;
+    const res = unpack(await Bridge.apiPost("facts", { action: "prune_all" }));
+    showToast(res.message || "已清理");
+    await loadFacts();
+  } catch (err) {
+    console.error("一键清理失败:", err);
+    showToast("一键清理失败，请查看日志");
+  }
+}
+
+// 主人单独清理。和一键清理**刻意分开**：
+// 一键清理是日常维护（跳过主人），这个是「主人这份也太长了，我主动收一收」。
+async function pruneOwnerFacts() {
+  try {
+    const prev = unpack(
+      await Bridge.apiPost("facts", { action: "prune_owner", dry_run: true }),
+    );
+    if (!prev.ok) {
+      showToast(prev.message || "预览失败");
+      return;
+    }
+    const d = prev.data || {};
+    if (!d.removed) {
+      showToast(prev.message || "主人现在没超过保留量，不用清");
+      return;
+    }
+    const first = (d.rows || [])[0] || {};
+    const ok = await askConfirm(
+      `清理主人记忆：${first.before ?? 0} → ${first.after ?? 0} 条` +
+        `（保留 ${d.keep} 条，清掉 ${d.removed} 条）\n\n` +
+        `主人**不参与一键清理**，这个是单独给你的入口。\n` +
+        `保留顺序和普通人一样：钉住的、亲口说过的边界先留，其余按重要性和最近提到的排。\n` +
+        `清掉的不删除，标「已否决」留档，随时能筛出来看。`,
+    );
+    if (!ok) return;
+    const res = unpack(await Bridge.apiPost("facts", { action: "prune_owner" }));
+    showToast(res.message || "已清理");
+    await loadFacts();
+  } catch (err) {
+    console.error("清理主人失败:", err);
+    showToast("清理主人失败，请查看日志");
+  }
+}
+
+// 清空一个人的全部记忆。真删，不可恢复——和上面的「瘦身」不是一回事，
+// 所以文案里要写清楚，别让用户以为也能从「已否决」里找回来。
+async function clearFacts(key) {
+  const ok = await askConfirm(
+    "清空这个人的全部记忆？\n\n这是**真删**，不是瘦身——删了就找不回来了。" +
+      "如果只是想省 token，用「按档位瘦身」就够了。",
+  );
+  if (!ok) return;
+  const res = unpack(await Bridge.apiPost("facts", { action: "clear", key }));
+  showToast(res.message || "已清空");
+  await loadFacts();
 }
 
 async function importBackup() {
@@ -1599,7 +3476,8 @@ async function submitNewSession() {
 
 // ── 启动 ────────────────────────────────────────────────────────────
 
-Bridge.ready().then(() => {
+Bridge.ready()
+  .then(() => {
   restoreTab();
   $("nav").addEventListener("click", (e) => {
     const btn = e.target.closest(".nav-item");
@@ -1610,6 +3488,105 @@ Bridge.ready().then(() => {
   $("exportBtn").addEventListener("click", exportData);
   $("newSessionBtn").addEventListener("click", openNewSession);
   $("previewBtn").addEventListener("click", preview);
+
+  // 关系面板：刷新、搜索、逐条操作（事件委托，列表是动态渲染的）
+  if ($("bondRefresh")) $("bondRefresh").addEventListener("click", loadBond);
+  // 三个列表的列头筛选（关系 / 事实 / 学习库）走同一套初始化和交互，
+  // 每个只传自己的配置——所以要改「点列头怎么展开」「重置怎么清」，
+  // 只改 gfInitBar 一处，不会出现三个面板行为不一样
+  gfInitBar(BOND_GF);
+  gfInitBar(FACT_GF);
+  gfInitBar(TRAIT_GF);
+  if ($("bondList")) {
+    $("bondList").addEventListener("click", (e) => {
+      const btn = e.target.closest("button[data-bond]");
+      if (!btn) return;
+      const action = btn.dataset.bond;
+      // 置顶按钮挂在 summary 里，不拦的话点一下会把整块收起来
+      if (action === "pin" || action === "unpin") {
+        e.preventDefault();
+        e.stopPropagation();
+      }
+      // 手动改亲密度 / 称呼都要读同一行里的输入框，值不在按钮上
+      let value;
+      if (action === "set_intimacy" || action === "set_nickname") {
+        const box = btn.closest(".bond-adjust");
+        const input = box ? box.querySelector("input") : null;
+        value = input ? input.value : "";
+      }
+      bondAction(action, btn.dataset.key, value);
+    });
+  }
+  if ($("settingSearch")) {
+    // 参数项是纯本地渲染，搜索不必请求接口，直接拿上次的快照重排
+    $("settingSearch").addEventListener("input", (e) => {
+      settingQuery = e.target.value || "";
+      if (lastSettingsData) renderSettings(lastSettingsData);
+    });
+  }
+  if ($("factsRefresh")) $("factsRefresh").addEventListener("click", loadFacts);
+  if ($("factsList")) {
+    // 画像字数上限：输入框失焦或回车才提交，避免每敲一位就发一次请求
+    $("factsList").addEventListener("change", (e) => {
+      const input = e.target.closest("input[data-prof-chars]");
+      if (!input) return;
+      const key = input.dataset.profChars;
+      const value = Number(input.value || 0);
+      if (!Number.isFinite(value) || value < 0) {
+        showToast("字数要填 0 或正整数");
+        return;
+      }
+      saveProfileChars(key, Math.min(800, Math.round(value)));
+    });
+  }
+  if ($("factPruneAll")) $("factPruneAll").addEventListener("click", pruneAllFacts);
+  if ($("factPruneOwner")) $("factPruneOwner").addEventListener("click", pruneOwnerFacts);
+  if ($("factMerge")) $("factMerge").addEventListener("click", mergeFacts);
+  if ($("factsList")) {
+    // 四种按钮共用一个委托：删一条、按档位瘦身、清空这个人、升降档位。
+    // 分开写要挂四次监听，而且每加一个按钮就得再改一次这里。
+    $("factsList").addEventListener("click", (e) => {
+      const del = e.target.closest("button[data-fact-del]");
+      const prune = e.target.closest("button[data-fact-prune]");
+      const clear = e.target.closest("button[data-fact-clear]");
+      const tier = e.target.closest("button[data-fact-tier]");
+      // 档位徽标本身就是「交回自动」按钮
+      const auto = e.target.closest("[data-fact-auto]");
+      const rewrite = e.target.closest("button[data-prof-rewrite]");
+      const saveProf = e.target.closest("button[data-prof-save]");
+      const pin = e.target.closest("button[data-fact-pin-user]");
+      const btn = del || prune || clear || tier || auto || rewrite || saveProf || pin;
+      if (!btn) return;
+      // 按钮在 details 里，不拦的话点一下会把整块收起来
+      e.preventDefault();
+      e.stopPropagation();
+      if (del) deleteFact(del.dataset.factKey, del.dataset.factDel);
+      else if (prune) pruneFact(prune.dataset.factPrune);
+      else if (tier) {
+        setFactTier(tier.dataset.factKey, tier.dataset.factTier, Number(tier.dataset.factDir || 1));
+      } else if (auto) {
+        setFactTier(auto.dataset.factKey, auto.dataset.factAuto, 0);
+      } else if (pin) {
+        pinFactUser(pin.dataset.factPinUser, pin.dataset.factPinned === "1");
+      } else if (rewrite) {
+        rewriteProfile(rewrite.dataset.profRewrite);
+      } else if (saveProf) {
+        const box = saveProf.closest(".profile-edit");
+        const area = box && box.querySelector("textarea");
+        saveProfile(saveProf.dataset.profSave, area ? area.value : "");
+      } else clearFacts(clear.dataset.factClear);
+    });
+  }
+  if ($("toneBtn")) $("toneBtn").addEventListener("click", runTone);
+  if ($("toneInput")) {
+    // Ctrl/Cmd + 回车直接跑，不用去够按钮
+    $("toneInput").addEventListener("keydown", (e) => {
+      if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
+        e.preventDefault();
+        runTone();
+      }
+    });
+  }
   // 预览会话选择器：输入群号即过滤，回车选第一条，Esc 取消
   const previewInput = $("previewSessionInput");
   const previewMenu = $("previewMenu");
@@ -1747,6 +3724,27 @@ Bridge.ready().then(() => {
     if (STYLE_KEYS.includes(el.dataset.key)) updateStyleNote();
   });
 
+  // 主动回复的「强度预设」：点一下整套参数一起写，不用逐个调
+  $("settings").addEventListener("click", async (e) => {
+    const btn = e.target.closest("button[data-profile]");
+    if (!btn) return;
+    e.preventDefault();
+    const id = btn.dataset.profile;
+    btn.disabled = true;
+    try {
+      const res = unpack(
+        await Bridge.apiPost("manage", { action: "apply_active_profile", profile: id }),
+      );
+      showToast(res.message || (res.ok ? "已切换" : "切换失败"));
+      if (res.ok) await load();
+    } catch (err) {
+      console.error("切换主动回复预设失败:", err);
+      showToast("切换失败，请查看日志");
+    } finally {
+      btn.disabled = false;
+    }
+  });
+
   $("settings").addEventListener("change", async (e) => {
     const el = e.target;
     if (!el.dataset || !el.dataset.key) return;
@@ -1787,6 +3785,12 @@ Bridge.ready().then(() => {
       // 按钮在 <summary> 里，不拦默认行为会把会话卡片一起折叠
       e.preventDefault();
       return togglePin(sid);
+    }
+    if (act === "drop_session") {
+      // 按钮在 <summary> 里，不拦默认行为会把整张卡折叠一下
+      e.preventDefault();
+      await dropTraitGroup(sid, btn.dataset.name || sid, false, true);
+      return;
     }
     if (act === "learn") return learn(sid);
     if (act === "add_trait") return openAdd(sid);
@@ -1847,6 +3851,25 @@ Bridge.ready().then(() => {
         await togglePin(pin.dataset.sid);
         return;
       }
+      const drop = e.target.closest("[data-drop]");
+      if (drop) {
+        e.preventDefault();
+        e.stopPropagation();
+        await dropTraitGroup(drop.dataset.drop, drop.dataset.name, drop.dataset.pinned === "1");
+        return;
+      }
+      const delItem = e.target.closest("[data-traitdel]");
+      if (delItem) {
+        e.preventDefault();
+        e.stopPropagation();
+        const item = traitItemOf(delItem.dataset.sid, delItem.dataset.traitdel);
+        await deleteTraitItem(
+          delItem.dataset.sid,
+          delItem.dataset.traitdel,
+          !!(item && item.pinned),
+        );
+        return;
+      }
       const btn = e.target.closest("[data-tact]");
       if (btn) {
         await reviewTrait(btn.dataset.tact, btn.dataset.sid, btn.dataset.content);
@@ -1861,20 +3884,17 @@ Bridge.ready().then(() => {
     });
   }
 
-  const traitSearch = $("traitSearch");
-  if (traitSearch) {
-    traitSearch.addEventListener("input", (e) => {
-      // 纯本地过滤：学习库一次最多几百条，没必要为搜索再跑一趟服务端
-      view.traitQuery = e.target.value;
-      renderTraits(traitGroups);
-    });
-  }
+  // 学习库：群聊 / 私聊两条子库。切换只重渲染，不重新请求——
+  // 数据是一次拿全的，切一下没必要再跑一趟接口
+  if ($("traitPurge")) $("traitPurge").addEventListener("click", purgeInactiveTraits);
 
-  const traitStatusSelect = $("traitStatus");
-  if (traitStatusSelect) {
-    traitStatusSelect.addEventListener("change", async (e) => {
-      view.traitStatus = e.target.value || "";
-      await loadTraits();
+  const traitScopeBox = $("traitScope");
+  if (traitScopeBox) {
+    traitScopeBox.addEventListener("click", (e) => {
+      const btn = e.target.closest("button[data-scope]");
+      if (!btn) return;
+      traitScope = btn.dataset.scope === "private" ? "private" : "group";
+      renderTraits(traitGroups);
     });
   }
 
@@ -1962,5 +3982,12 @@ Bridge.ready().then(() => {
     }
   });
 
-  load();
-});
+    load();
+  })
+  .catch((err) => {
+    // 宿主桥接没起来 / 初始化抛错：把原因写在页面顶部，而不是留一片空白
+    if (window.__panelDiag) {
+      window.__panelDiag("面板初始化失败：" + ((err && err.message) || err));
+    }
+    console.error("面板初始化失败:", err);
+  });

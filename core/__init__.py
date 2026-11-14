@@ -5,6 +5,7 @@ from .admin import admin_summary, build_admin_tool, is_admin
 from .injector import Injector, override_roll, scale_quota
 from .learner import Learner
 from .manager import Manager
+from .profile import ProfileStore
 from .search import build_search_tool, resolve_key
 from .settings import Settings
 from .storage import Storage
@@ -15,6 +16,7 @@ __all__ = [
     "Injector",
     "Learner",
     "Manager",
+    "ProfileStore",
     "Settings",
     "Storage",
     "UsageTracker",

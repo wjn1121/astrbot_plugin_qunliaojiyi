@@ -160,10 +160,12 @@ button.del {
   flex-direction: column;
   gap: 18px;
 }
-/* 每组内部才用栅格排卡片 */
+/* 每组内部才用栅格排卡片。
+   340 而不是更小：一张卡里「标题 + 200px 输入框」并排，列宽低于 340 时
+   标题会被压成竖排（一个字一行），比单列还难读。宁可少排一列。 */
 .set-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
   gap: 10px;
 }
 .set-group + .set-group {
@@ -197,14 +199,93 @@ button.del {
 .set-row.locked { opacity: 0.45; }
 .set-label { line-height: 1.4; }
 .set-control { display: flex; align-items: center; gap: 8px; min-width: 0; }
+/* 参数说明：灰色小字，跨满整行。
+   pre-line 是为了让 hint 里的 \n 真的换行——「主人 QQ」那条有三段说明，
+   折叠成一行之后是一堵墙，扫都扫不动。 */
 .set-hint {
   grid-column: 1 / -1;
   margin: 0;
   color: var(--muted);
   font-size: 11px;
   line-height: 1.5;
+  white-space: pre-line;
 }
 .set-hint.warn { color: var(--danger); }
+
+/* ── 参数行上的两个徽标：默认值 + token 影响 ────────────────────────
+   以前这两件事都埋在几十字的 hint 里，用户扫一遍根本看不见。
+   做成徽标挂在标题旁：一眼知道「原来是多少」「动不动钱」。 */
+.set-def {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: #1a1f28;
+  border: 1px solid #2a3140;
+  color: #8d9aab;
+  font-size: 10px;
+  font-style: normal;
+  font-weight: 400;
+  line-height: 15px;
+  vertical-align: 1px;
+}
+.set-tok {
+  display: inline-block;
+  margin-left: 4px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  font-size: 10px;
+  font-style: normal;
+  font-weight: 700;
+  line-height: 15px;
+  vertical-align: 1px;
+  letter-spacing: 0.5px;
+}
+/* 涨价用暖色、省钱用绿色——和面板其余地方的语义保持一致 */
+.set-tok.up { color: #e0895a; background: rgba(224, 137, 90, 0.12); border: 1px solid #5a3a24; }
+.set-tok.down { color: var(--ok); background: rgba(107, 178, 138, 0.12); border: 1px solid #2f5c45; }
+.set-tok.zero { color: #6f7a8a; background: #1a1e26; border: 1px solid #2a3140; font-weight: 400; }
+.set-tok.big { box-shadow: 0 0 0 1px rgba(224, 137, 90, 0.25); }
+
+/* 「这个群可能已经不在了」——30 天没消息 */
+.trait-stale {
+  padding: 1px 7px;
+  border-radius: 999px;
+  border: 1px solid #5a4a2a;
+  background: #241d10;
+  color: #d8a26a;
+  font-size: 10px;
+}
+/* 事实记忆的三档徽标：核心 / 深层 / 浅层。
+   颜色按「温度」走：核心是暖金（最不能记错），深层是冷蓝，浅层是灰。
+   徽标本身就是按钮：点一下把这条交回自动判定（title 里写了） */
+.fact-tier {
+  padding: 1px 7px;
+  border-radius: 999px;
+  font-size: 10px;
+  white-space: nowrap;
+  border: 1px solid #2a3140;
+  color: #8d9aab;
+  cursor: pointer;
+  user-select: none;
+}
+.fact-tier b { font-weight: 700; margin-left: 3px; }
+.fact-tier.core { color: #d8b45a; border-color: #5a4a24; background: rgba(216, 180, 90, 0.12); }
+.fact-tier.deep { color: #8fb3d9; border-color: #2f4a66; background: rgba(120, 170, 220, 0.10); }
+.fact-tier.shallow { color: #8d9aab; border-color: #2a3140; background: #1a1f28; }
+.fact-tier:hover { border-color: var(--accent); }
+.fact-tier-btns { flex: 0 0 auto; display: flex; gap: 2px; }
+.fact-tier-btns button { padding: 0 6px; line-height: 18px; font-size: 11px; }
+.fact-tier-btns button:disabled { opacity: 0.3; }
+/* 「还有 N 种说法」：合并过的条目才有，悬停看全部 */
+.fact-variant {
+  flex: 0 0 auto;
+  color: var(--muted);
+  font-size: 11px;
+  cursor: help;
+  border-bottom: 1px dotted #3a4150;
+}
+
 .set-row input[type="number"],
 .set-row input[type="text"],
 .set-row input[type="password"],
@@ -598,6 +679,86 @@ h3 small { font-weight: 400; font-size: 11px; color: #6c7484; margin-left: 6px; 
 }
 .seg button + button { border-left: 1px solid var(--line); }
 .seg button.on { background: #232838; color: var(--accent); }
+
+/* 主动回复的「强度预设」条：三个档位 + 一句当前说明。
+   放在参数组最上方，因为它改的是一整组参数，不是一个字段 */
+.profile-bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin: 0 0 10px;
+  padding: 8px 12px;
+  background: #12151c;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+}
+.profile-label {
+  color: var(--muted);
+  font-size: 12px;
+  flex: none;
+}
+.profile-bar .seg { margin: 0; }
+.profile-bar .hint {
+  margin: 0;
+  flex: 1 1 220px;
+  min-width: 0;
+}
+/* 子库按钮上的数量：切换前就知道每条各有多少个会话 */
+.seg-count {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 0 5px;
+  border-radius: 999px;
+  background: #2a303d;
+  color: #9fb0c8;
+  font-size: 10px;
+  line-height: 15px;
+  vertical-align: 1px;
+}
+.seg button.on .seg-count { background: rgba(110, 168, 254, 0.22); color: #bcd4ff; }
+
+/* ── 概览：主人与学习 ─────────────────────────────────────────────
+   三行说清「主人是谁 / 群聊学不学 / 私聊学不学」。
+   这三件事影响四个模块，但平时都藏在配置里，不摆出来用户会以为功能没生效。 */
+.owner-card { display: flex; flex-direction: column; gap: 8px; }
+.owner-row {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  padding: 10px 12px;
+  border-radius: 9px;
+  border: 1px solid var(--line);
+  background: #12151c;
+}
+.owner-row.off { border-color: #3a2b2b; background: #171213; }
+.owner-row.warn { border-color: #4a3a22; background: #1a150f; }
+.owner-icon { font-size: 15px; line-height: 1.3; }
+.owner-main { flex: 1 1 auto; min-width: 0; }
+.owner-main b { font-size: 12px; }
+.owner-value {
+  margin-left: 8px;
+  font-size: 12px;
+  color: var(--accent);
+  word-break: break-all;
+}
+.owner-row.off .owner-value { color: #c08a8a; }
+.owner-row.warn .owner-value { color: #d8a26a; }
+.owner-note {
+  margin: 4px 0 0;
+  font-size: 11px;
+  color: var(--muted);
+  line-height: 1.65;
+}
+
+/* 学习库每个会话的学习开关。和置顶按钮同一套外观，但用绿色表示「在学」——
+   一眼能分出「这个群在学」和「这个群只是置顶了」 */
+.learn-btn.on {
+  color: var(--ok);
+  border-color: #2f5c45;
+  background: rgba(107, 178, 138, 0.12);
+}
+.learn-btn:not(.on) { color: #8a6a4a; border-color: #3d332a; }
 
 /* ── 会话卡片里的附加开关 ───────────────────────────────────── */
 .session-switches select {
@@ -1106,4 +1267,434 @@ h3 small { font-weight: 400; font-size: 11px; color: #6c7484; margin-left: 6px; 
 @media (max-width: 860px) {
   .persona-layout { grid-template-columns: 1fr; }
   .persona-list { max-height: 220px; }
+}
+
+/* ── 关系与输出（1.5.0）──────────────────────────────────────────────── */
+
+.tone-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 14px;
+  margin: 2px 0 10px;
+}
+.tone-check,
+.tone-num {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 13px;
+  cursor: pointer;
+}
+.tone-num { cursor: default; }
+.tone-check input { accent-color: var(--accent); cursor: pointer; }
+.tone-num input {
+  width: 62px;
+  padding: 4px 6px;
+  border-radius: 6px;
+  border: 1px solid var(--line);
+  background: #0d1016;
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+}
+#toneInput {
+  width: 100%;
+  resize: vertical;
+  min-height: 92px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid var(--line);
+  background: #0d1016;
+  color: var(--text);
+  font: inherit;
+  line-height: 1.6;
+}
+#toneInput:focus { outline: none; border-color: var(--accent); }
+#toneInput::placeholder { color: #5b6473; }
+
+.tone-out { margin-top: 12px; max-height: 420px; overflow-y: auto; }
+.tone-segs { display: flex; flex-direction: column; gap: 8px; margin-top: 6px; }
+.tone-seg {
+  border: 1px dashed #20242e;
+  border-radius: 10px;
+  padding: 8px 12px;
+  background: #0d1016;
+}
+.tone-seg i {
+  display: block;
+  color: var(--muted);
+  font-size: 12px;
+  font-style: normal;
+  margin-bottom: 4px;
+}
+.tone-seg span { white-space: pre-wrap; word-break: break-word; }
+
+/* 关系卡里的注入文本块：比预览页那个矮，列表才不会一条就占满屏 */
+#bondList .preview-out { max-height: 200px; margin: 6px 0 0; }
+#bondList .hint { margin: 8px 0 0; }
+#bondList .session-actions button[disabled] { opacity: .4; cursor: not-allowed; }
+
+/* ── 事实记忆（1.5.0）────────────────────────────────────────────────── */
+
+/* 个人画像：一段连续的「这个人是谁」。
+   和下面的事实明细刻意分开两块——画像答「他是谁」，事实答「他最近在干嘛」 */
+.profile-box {
+  margin: 0 0 8px;
+  padding: 8px 10px;
+  background: #10131a;
+  border: 1px solid var(--line);
+  border-left: 2px solid #4a6a8a;
+  border-radius: 8px;
+}
+.profile-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.profile-head b { font-size: 12px; font-weight: 600; }
+/* 画像字数上限：直接做成输入框。做成弹窗反而多一步，
+   而「给这个 QQ 多写点」是个会反复微调的值 */
+.profile-quota {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--muted);
+  flex: none;
+}
+.profile-quota input {
+  width: 62px;
+  background: #0d1016;
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 2px 6px;
+  font: inherit;
+  font-size: 12px;
+}
+.profile-quota input:focus { border-color: var(--accent); outline: none; }
+.profile-head .hint { flex: 1 1 180px; margin: 0; min-width: 0; }
+.profile-text {
+  margin: 6px 0 0;
+  line-height: 1.6;
+  font-size: 13px;
+  word-break: break-word;
+}
+.profile-edit { margin-top: 6px; }
+.profile-edit summary {
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 12px;
+}
+.profile-edit textarea {
+  width: 100%;
+  margin-top: 6px;
+  background: #0d1016;
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 6px 8px;
+  font: inherit;
+  font-size: 13px;
+  resize: vertical;
+}
+
+.fact-list { list-style: none; margin: 6px 0 0; padding: 0; }
+.fact-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 6px 0;
+  border-bottom: 1px dashed #20242e;
+  font-size: 13px;
+}
+.fact-row:last-child { border-bottom: none; }
+/* 钉住的条目：左侧一道细绿边，扫一眼就知道这条是被保住的 */
+.fact-row.pinned {
+  box-shadow: inset 2px 0 0 #3f6b52;
+  background: rgba(107, 178, 138, 0.05);
+}
+.ghost.tiny.pinned {
+  color: var(--accent);
+  border-color: #3a4a5c;
+}
+.fact-tag {
+  flex: 0 0 auto;
+  padding: 1px 7px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 11px;
+}
+/* 生效的才给实色，待观察/疑似记错的保持灰，一眼能看出哪条真的在用 */
+.fact-tag.on { border-color: #2f5c45; color: var(--ok); }
+.fact-kind { flex: 0 0 auto; color: var(--muted); font-size: 11px; }
+.fact-text { flex: 1 1 auto; word-break: break-word; }
+.ghost.tiny { padding: 2px 8px; font-size: 12px; }
+
+/* ── 长列表统一限高（1.7.x）────────────────────────────────────────────
+   之前只有关系列表限了高，学习库 / 事实 / 参数 / 会话都是无限拉长：
+   几十个群、几百条特征就能把整页变成一条一直往下滚的带子，
+   越往下越找不到东西，而且左侧导航会跟着滚出视野。
+   统一成「超过一屏多就在框里滚」，页面本身保持稳定高度。 */
+
+.scroll-box {
+  max-height: 560px;
+  overflow-y: auto;
+  padding-right: 6px;
+  overscroll-behavior: contain;
+}
+/* 学习库和会话列表条目更高，给多一点高度，否则一屏看不到三条 */
+.scroll-box.tall { max-height: 640px; }
+.scroll-box::-webkit-scrollbar { width: 8px; }
+.scroll-box::-webkit-scrollbar-track { background: transparent; }
+.scroll-box::-webkit-scrollbar-thumb { background: #2a2f3a; border-radius: 4px; }
+.scroll-box::-webkit-scrollbar-thumb:hover { background: #3a4150; }
+
+/* 分组内部也要限：一个群 32 条特征全展开会把整块撑满，
+   别的群直接被挤出视野——「按群号/QQ 号控制大小」说的就是这个。
+   外层管「有多少个群」，内层管「一个群里有多少条」。 */
+.trait-group .trait-body,
+#factsList .fact-list {
+  max-height: 340px;
+  overflow-y: auto;
+  padding-right: 6px;
+  overscroll-behavior: contain;
+}
+.trait-group .trait-body::-webkit-scrollbar,
+#factsList .fact-list::-webkit-scrollbar { width: 8px; }
+.trait-group .trait-body::-webkit-scrollbar-track,
+#factsList .fact-list::-webkit-scrollbar-track { background: transparent; }
+.trait-group .trait-body::-webkit-scrollbar-thumb,
+#factsList .fact-list::-webkit-scrollbar-thumb { background: #2a2f3a; border-radius: 4px; }
+.trait-group .trait-body::-webkit-scrollbar-thumb:hover,
+#factsList .fact-list::-webkit-scrollbar-thumb:hover { background: #3a4150; }
+/* 触屏 / 窄屏下不锁高度：手机上框内滚动很难点，宁可让页面自己长 */
+@media (max-width: 720px) {
+  .scroll-box, .scroll-box.tall { max-height: none; overflow: visible; padding-right: 0; }
+  .trait-group .trait-body, #factsList .fact-list { max-height: none; overflow: visible; padding-right: 0; }
+}
+
+/* ── 关系列表：搜索 + 置顶 + 限高滚动（1.5.0）──────────────────────── */
+
+/* ── 列头筛选（像 Excel 的自动筛选）──────────────────────────────────
+   之前是「一个排序下拉 + 一个阶段下拉」并排放着：两个控件在一行里抢位置，
+   而且互相不知道对方在筛什么——用户选完排序再看阶段，看不出
+   「现在是按好感降序，只看熟悉以上」这个组合状态。
+
+   改成列头：每个字段一个按钮，各自展开自己的面板。
+   排序直接在列头按钮上点（降序 → 升序 → 取消），筛选取值在面板里勾选。
+   这样「哪一列开着筛选、哪一列在排序」一眼能看出来。 */
+
+.gf-bar {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin: 12px 0 8px;
+}
+
+.gf-head {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 6px 10px;
+  border-radius: 7px;
+  border: 1px solid var(--line);
+  background: #0d1016;
+  color: var(--muted);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.gf-head:hover { border-color: #364152; color: var(--text); }
+/* 这一列有筛选条件 */
+.gf-head.filtered {
+  border-color: var(--accent);
+  color: #bcd4ff;
+  background: rgba(110, 168, 254, 0.08);
+}
+/* 这一列正在排序：用箭头指方向，不用再点开面板看 */
+.gf-head.sorted {
+  border-color: #4a5568;
+  color: var(--text);
+}
+.gf-caret { font-size: 9px; opacity: 0.55; }
+.gf-caret::after { content: "▼"; }
+
+.gf-pop {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  z-index: 60;
+  min-width: 232px;
+  max-width: 300px;
+  padding: 10px;
+  border-radius: 10px;
+  border: 1px solid var(--line);
+  background: #12151b;
+  box-shadow: 0 12px 34px rgba(0, 0, 0, 0.5);
+}
+.gf-pop[hidden] { display: none; }
+.gf-pop .gf-title {
+  font-size: 11px;
+  color: #6f7a8a;
+  margin: 0 0 8px;
+  letter-spacing: 0.04em;
+}
+.gf-pop input[type="search"] {
+  width: 100%;
+  padding: 6px 10px;
+  margin-bottom: 8px;
+  border-radius: 6px;
+  border: 1px solid var(--line);
+  background: #0d1016;
+  color: var(--text);
+  font: inherit;
+  font-size: 12px;
+}
+.gf-pop input[type="search"]:focus { outline: none; border-color: var(--accent); }
+.gf-pop input[type="search"]::placeholder { color: #5b6473; }
+
+.gf-opt {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 6px;
+  border-radius: 5px;
+  font-size: 12px;
+  color: var(--text);
+  cursor: pointer;
+  user-select: none;
+}
+.gf-opt:hover { background: #1a1f28; }
+.gf-opt input { margin: 0; accent-color: var(--accent); }
+.gf-opt .gf-count { margin-left: auto; color: #5f6b7c; font-size: 11px; }
+.gf-opt.disabled { opacity: 0.4; cursor: default; }
+
+.gf-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid #1e232c;
+}
+.gf-actions button { flex: 1; font-size: 11px; padding: 5px 8px; }
+
+/* 事实记忆的保留度条：一眼看出这条还能记多久 */
+.fact-keep {
+  font-size: 11px;
+  color: #6f7a8a;
+  white-space: nowrap;
+  min-width: 46px;
+  text-align: right;
+}
+.fact-keep.low { color: #d08b5a; }
+.fact-keep.gone { color: var(--danger); }
+
+/* 卡片底部的手动清理按钮。放在条目列表下面而不是标题里：
+   标题已经挤了（QQ、群、条数、档位、上限），再塞按钮会换行。 */
+.fact-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 10px;
+  padding-top: 8px;
+  border-top: 1px solid #1e232c;
+}
+.fact-actions button { font-size: 11px; }
+.fact-actions button:disabled { opacity: 0.4; cursor: default; }
+
+/* 「接近上限」：只在真的快满时才出现，平时不占地方 */
+.fact-full {
+  margin-left: auto;
+  padding: 2px 7px;
+  border-radius: 20px;
+  border: 1px solid #6b4a2a;
+  background: #2a1f14;
+  color: #d8a26a;
+  font-size: 10px;
+  white-space: nowrap;
+}
+
+/* 排序 / 筛选下拉：和搜索框同一套皮肤，但别跟着 flex:1 一起被拉长 */
+.bond-toolbar select {
+  flex: 0 0 auto;
+  padding: 7px 9px;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  background: #0d1016;
+  color: var(--text);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+.bond-toolbar select:focus { outline: none; border-color: var(--accent); }
+
+/* 手动调亲密度：一行放得下输入框和按钮，不额外占一行按钮区的高度 */
+.bond-adjust {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 8px 0 0;
+  font-size: 12px;
+  color: var(--muted);
+}
+.bond-adjust input {
+  width: 92px;
+  padding: 4px 8px;
+  border-radius: 7px;
+  border: 1px solid var(--line);
+  background: #0d1016;
+  color: var(--text);
+  font: inherit;
+  font-size: 12px;
+}
+.bond-adjust input:focus { outline: none; border-color: var(--accent); }
+.bond-adjust .hint { margin: 0; }
+/* 称呼输入框比数字框长：要放下「镇海之瞄,瞄瞄」这种多个叫法 */
+.bond-adjust input.bond-nickname { width: 220px; }
+
+/* 人一多整页会被撑到没法看：限高滚动比无限拉长好读得多。
+   460px 大约是 6 条卡片的可视高度，够一眼扫完又不至于要滚半天。 */
+.bond-list {
+  max-height: 460px;
+  overflow-y: auto;
+  padding-right: 6px;
+  overscroll-behavior: contain;
+}
+.bond-list::-webkit-scrollbar { width: 8px; }
+.bond-list::-webkit-scrollbar-track { background: transparent; }
+.bond-list::-webkit-scrollbar-thumb { background: #2a2f3a; border-radius: 4px; }
+.bond-list::-webkit-scrollbar-thumb:hover { background: #3a4150; }
+
+/* summary 里塞了第三个元素（置顶按钮），让昵称那段吃掉剩余宽度，
+   否则长昵称会把按钮挤出可视区 */
+#bondList .session summary span { flex: 1 1 auto; min-width: 0; }
+#bondList .session summary b { flex: 0 0 auto; }
+
+.bond-pin {
+  flex: 0 0 auto;
+  align-self: center;
+  padding: 1px 9px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.7;
+  white-space: nowrap;
+}
+.bond-pin.owner { color: var(--accent); border-color: #2f4a75; background: #16202f; }
+.bond-pin-btn {
+  flex: 0 0 auto;
+  align-self: center;
+  padding: 2px 10px;
+  font-size: 12px;
+  white-space: nowrap;
 }

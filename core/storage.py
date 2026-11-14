@@ -170,6 +170,18 @@ class Storage:
         # 单独一个文件而不是塞进 overrides，因为置顶不影响学习/注入行为，
         # 混进去会让「恢复默认」把用户排好的顺序一起清掉。
         self.pins: dict[str, Any] = self._load("pins.json")
+        # 关系状态：{"umo|sender_id": {...}}，结构由 bond.py 定义，这里只存取。
+        # 单独一个文件而不是塞进 overrides：关系是每轮都会变的累计值，
+        # 和「这个群要不要学习/注入」这种开关不是一回事。
+        self.bonds: dict[str, dict] = self._load("bonds.json")
+        # 事实记忆：{"umo|sender_id": [{fact}, ...]}，结构由 facts.py 定义。
+        # 和关系分开两个文件：关系是一条记录（键→值），事实是一串列表（键→数组），
+        # 混在一起会让两边的读写都变成类型判断。
+        self.facts: dict[str, list] = self._load("facts.json")
+        # 个人画像：{"qq号": {"text": "...", "manual": "...", ...}}，结构由 profile.py 定义。
+        # 单独一个文件而不是塞进 facts.json：画像是一人一条的「概述」，
+        # 事实是一人一串的「明细」，写盘频率也不同（画像一天最多一次）
+        self.profiles: dict[str, dict] = self._load("profiles.json")
 
         self._lock = asyncio.Lock()
         self._version = 0
@@ -182,6 +194,9 @@ class Storage:
             "overrides": False,
             "active": False,
             "pins": False,
+            "bonds": False,
+            "facts": False,
+            "profiles": False,
         }
         self._save_task: asyncio.Task | None = None
         self._save_delay = 5.0
@@ -241,6 +256,15 @@ class Storage:
             if self._dirty["pins"]:
                 await self._write("pins.json", self.pins)
                 self._dirty["pins"] = False
+            if self._dirty["bonds"]:
+                await self._write("bonds.json", self.bonds)
+                self._dirty["bonds"] = False
+            if self._dirty["facts"]:
+                await self._write("facts.json", self.facts)
+                self._dirty["facts"] = False
+            if self._dirty["profiles"]:
+                await self._write("profiles.json", self.profiles)
+                self._dirty["profiles"] = False
 
     async def _write(self, filename: str, data: dict) -> None:
         try:
@@ -249,6 +273,46 @@ class Storage:
             )
         except OSError as e:
             logger.error(f"[群聊记忆] 保存 {filename} 失败: {e}")
+
+    # ── 关系状态（bonds.json）───────────────────────────────────────────
+    #
+    # 键是 ``umo|sender_id``，由 ``bond.bond_key()`` 生成。
+    # 数据语义（阶段、亲密度、称呼）由 bond.py 解释，这里只保证两件事：
+    # 读到的永远是 dict、写进去的一定是 dict。脏数据不往业务层漏。
+
+    def bond_of(self, key: str) -> dict:
+        value = self.bonds.get(str(key))
+        return value if isinstance(value, dict) else {}
+
+    def set_bond(self, key: str, record: dict) -> None:
+        if not isinstance(record, dict):
+            return
+        self.bonds[str(key)] = record
+        self._mark("bonds")
+
+    def delete_bond(self, key: str) -> bool:
+        """删掉一条关系记录。返回是否真的删掉了。"""
+        if str(key) not in self.bonds:
+            return False
+        self.bonds.pop(str(key), None)
+        self._mark("bonds")
+        return True
+
+    def clear_bonds(self, umo: str = "") -> int:
+        """清关系记录。给了 umo 只清这个会话，返回清掉的条数。"""
+        if not umo:
+            count = len(self.bonds)
+            self.bonds.clear()
+            if count:
+                self._mark("bonds")
+            return count
+        prefix = f"{umo}|"
+        keys = [k for k in self.bonds if str(k).startswith(prefix)]
+        for key in keys:
+            self.bonds.pop(key, None)
+        if keys:
+            self._mark("bonds")
+        return len(keys)
 
     # ── 面板置顶（pins.json）───────────────────────────────────────────
     #
@@ -283,13 +347,52 @@ class Storage:
         self._mark("pins")
         return True
 
+    # ── 事实面板的人物置顶（pins.json 的 facts 键）──────────────────────
+    #
+    # 和学习库的「置顶」是同一套心智：用户手动钉的人在列表里排最前。
+    # 单独存一份而不是塞进事实记录：事实可能被「清空这人」清掉，
+    # 但「这个人我想一直看着」是个展示偏好，不该跟着数据一起没。
+
+    def pinned_facts(self) -> list[str]:
+        raw = self.pins.get("facts")
+        if not isinstance(raw, list):
+            return []
+        return [str(x) for x in raw if str(x or "").strip()]
+
+    def is_fact_pinned(self, qq: str) -> bool:
+        return str(qq) in self.pinned_facts()
+
+    async def set_fact_pin(self, qq: str, pinned: bool) -> bool:
+        """加 / 取消某个 QQ 的置顶，返回状态是否真的变了。"""
+        qq = str(qq or "").strip()
+        if not qq:
+            return False
+        current = self.pinned_facts()
+        if pinned:
+            if qq in current:
+                return False
+            current.append(qq)
+        else:
+            if qq not in current:
+                return False
+            current = [x for x in current if x != qq]
+        self.pins["facts"] = current
+        self._mark("pins")
+        return True
+
     # ── 会话级开关 ──────────────────────────────────────────────────────
 
     def session_override(self, session_id: str) -> dict[str, bool | None]:
         """原始覆盖记录。缺键表示走默认值，不在这里补默认。"""
         return self.overrides.get(session_id, {})
 
+    def learn_override(self, session_id: str) -> bool | None:
+        """三态：None 表示没手动设过（走全局默认），True/False 是用户明确的选择。"""
+        value = self.session_override(session_id).get("learn")
+        return value if isinstance(value, bool) else None
+
     def learn_allowed(self, session_id: str) -> bool:
+        """本会话的原始开关（不看全局配置）。判定顺序在 hooks.learn_allowed。"""
         return self.session_override(session_id).get("learn", True)
 
     def inject_allowed(self, session_id: str) -> bool:
@@ -1020,6 +1123,15 @@ class Storage:
             if self.active.pop(session_id, None) is not None:
                 changed = True
             self._mark("active")
+        if scope == "all":
+            # 事实也算记忆：清「全部」却留着「他下周要交论文」，用户会以为没清干净
+            prefix = f"{session_id}|"
+            keys = [k for k in self.facts if str(k).startswith(prefix)]
+            for key in keys:
+                self.facts.pop(key, None)
+            if keys:
+                changed = True
+                self._mark("facts")
         return changed
 
     async def clear_all(self, scope: str = "all") -> dict[str, int]:
@@ -1047,6 +1159,12 @@ class Storage:
             result["active"] = len(self.active)
             self.active.clear()
             self._mark("active")
+        if scope == "all":
+            result["facts"] = sum(
+                len(v) for v in self.facts.values() if isinstance(v, list)
+            )
+            self.facts.clear()
+            self._mark("facts")
         return result
 
     # ── 聊天缓冲 ────────────────────────────────────────────────────────
@@ -1063,6 +1181,26 @@ class Storage:
 
     def history_counts(self) -> dict[str, int]:
         return {sid: len(msgs) for sid, msgs in self.chat_history.items() if msgs}
+
+    def inactive_sessions(self, days: int = 30) -> list[str]:
+        """多久没有新消息的会话。用来找「bot 可能已经不在这个群了」。
+
+        判据只能是**最后一条消息的时间**：插件拿不到平台的群列表
+        （各适配器接口不一致），但「这个群 30 天没人说话」已经是很强的信号——
+        真在用的群很少一个月零消息。宁可漏判（用户手动删），不误删。
+        """
+        cutoff = time.time() - max(1, int(days)) * 86400
+        out: list[str] = []
+        for sid, msgs in list(self.chat_history.items()):
+            if not msgs:
+                out.append(sid)
+                continue
+            last = 0.0
+            for msg in msgs:
+                last = max(last, float(msg.get("time") or 0))
+            if last and last < cutoff:
+                out.append(sid)
+        return out
 
     async def clear_history(self, session_id: str) -> None:
         self.chat_history.pop(session_id, None)

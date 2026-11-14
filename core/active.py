@@ -34,6 +34,40 @@ BEIJING_TZ = timezone(timedelta(hours=8))
 COLD_WINDOW_SECONDS = 600
 LULL_SECONDS = 300
 
+# ── 动态参与度（1.7.x）──────────────────────────────────────────────────
+#
+# 为什么不再用「固定概率 × 冷却窗口」：固定概率下，热闹的群和冷清的群
+# 插话频率一模一样——热闹时显得没眼力见，冷清时又像死了一样不吭声。
+# 参考同类陪伴插件的做法（两个「想说话的理由」取更强）：
+#
+#   p = 基准 × (1 − 0.7 × 热度) × (1 + 0.4 × (1 − 热度)) + 0.5 × 接话黏性
+#
+# - **群热度**：最近 120 秒的消息数。越热闹越压低概率，把插话让给人说话；
+#   越冷清反而略微抬高——安静的时候冒个泡是「捧场」，热闹的时候插话是噪音
+# - **接话黏性**：刚有人接它的话 / 刚有人抛问题，攒一个会衰减的分。
+#   bot 自己说完话先降一截（「我说完了，轮到你们」）
+#
+# 全程本地计算，不发请求、不花 token，和 rule 模式一样零成本。
+HEAT_WINDOW_SECONDS = 120
+# 窗口内这么多条就算「热闹到该避让」。群聊正常节奏大约 8~12 条/2 分钟
+HEAT_FULL_MESSAGES = 10
+# 热闹时最多把概率压掉多少（0.7 = 压到三成）
+HEAT_DAMP = 0.7
+# 冷清时的捧场加成：群里没什么人说话时，把概率抬这么多（0.4 = 抬四成）。
+# 这是「养鱼」那类插件的核心观感——安静的时候才该冒个泡，
+# 热闹的时候插进去只会被当成噪音
+QUIET_BOOST = 0.4
+# 接话黏性的权重：黏性满格时额外加 0.5 的概率
+ENGAGE_GAIN = 0.5
+# 黏性半衰期：5 分钟衰减一半
+ENGAGE_HALF_LIFE = 300
+# 「bot 刚说完话，别人接着讲」的判定窗口
+ENGAGE_FOLLOW_WINDOW = 180
+# 概率硬顶：再活跃也不允许超过这个值，否则等于关掉了所有判断
+MAX_CHANCE = 0.85
+# bot 自己说完话后多久内不再掷骰子。防的是用户把冷却调到 60 秒后的连发
+MIN_SELF_GAP = 25
+
 # 退避最多把冷却放大到 4 倍：再大就等于永久闭嘴，用户会以为功能失效。
 MAX_BACKOFF_FACTOR = 4
 RECENT_MAX = 20
@@ -149,11 +183,27 @@ class ActiveReply:
             "last_reason": "",
             "last_at": None,
             "recent": [],
+            "chance_now": None,
+            "heat": None,
+            "engage": None,
         }
         try:
             state = self._load_state(session_id)
             now = time.time()
             next_roll_at = float(state.get("next_roll_at") or 0.0)
+            # 现在这一轮如果掷骰子，概率会是多少。面板上直接显示，
+            # 用户就不用猜「为什么设了 15% 却一直不说话」——很可能正被热度压着
+            chance_now = heat = engage = None
+            if self._mode() == "probability":
+                base = self._clamp(
+                    float(self.settings.get("active_reply_chance") or 0.0), 0.0, 1.0
+                )
+                try:
+                    messages = self._messages(session_id)
+                except Exception:  # noqa: BLE001
+                    messages = []
+                chance_now, detail = self._participation(state, messages, now, base)
+                heat, engage = detail["heat"], detail["engage"]
             snapshot.update(
                 {
                     "enabled": self._session_enabled(session_id, state),
@@ -165,6 +215,9 @@ class ActiveReply:
                     "last_reason": str(state.get("last_reason") or ""),
                     "last_at": float(state.get("last_at") or 0.0) or None,
                     "recent": list(state.get("recent") or [])[-RECENT_MAX:],
+                    "chance_now": None if chance_now is None else round(chance_now, 3),
+                    "heat": heat,
+                    "engage": engage,
                 }
             )
         except Exception as e:  # noqa: BLE001 - 面板读状态出错不该 500
@@ -256,24 +309,40 @@ class ActiveReply:
 
         # 11. 冷却。next_roll_at 是「下一次允许评估的时刻」，命中与否都会推进，
         #     所以骰子是每个冷却窗口掷一次，而不是每条消息掷一次——
-        #     后者会让群越热闹越容易被打断，正好和「别烦人」的目标相反。
+        #     后者会让群越热闹越容易被插嘴，正好和「别烦人」的目标相反。
         next_roll_at = float(state.get("next_roll_at") or 0.0)
         if next_roll_at > now:
+            # 冷却期内不掷骰子，但**照样积累接话黏性**：
+            # 「有人在接它的话」这个信号只在这几分钟内有效，等冷却过了再记就晚了
+            if self._absorb_engage(state, text, now):
+                self._save(session_id, state)
             return None
 
-        # llm_judge 没攒够就不判，也不推进冷却，等下一条消息够了立刻判
+        # 11.5 自己刚说完话的短时间内不再掷骰子。
+        #      冷却一般远大于 25 秒，这条只在用户把冷却调到极短时兜底，
+        #      防的是「一句话拆成两条发」那种观感事故
+        last_at = float(state.get("last_at") or 0.0)
+        if last_at and now - last_at < MIN_SELF_GAP:
+            return None
+
         judge_stack = max(1, self._int_setting("active_reply_judge_stack"))
         if mode == "llm_judge" and int(state.get("judge_buffer") or 0) < judge_stack:
             return None
 
-        streak = self._update_streak(state, messages, now)
         # 12. 退避：连续几次开口没人接，就把冷却放大，最多 4 倍
+        streak = self._update_streak(state, messages, now)
         state["next_roll_at"] = round(now + self._effective_cooldown(streak), 1)
 
+        # 这一条消息本身可能就把黏性抬起来了（有人抛问题 / 在接它的话）
+        self._absorb_engage(state, text, now)
+
         if mode == "probability":
-            chance = self._clamp(float(self.settings.get("active_reply_chance") or 0.0), 0.0, 1.0)
+            base = self._clamp(float(self.settings.get("active_reply_chance") or 0.0), 0.0, 1.0)
+            chance, detail = self._participation(state, messages, now, base)
             hit = random.random() < chance
-            reason = "probability"
+            # 把实际概率写进 reason：面板和日志里能直接看到
+            # 「为什么这轮是 8% 而不是配置的 15%」（刚被热闹压低）
+            reason = f"probability {int(chance * 100)}%(基准{int(base * 100)} 热{int(detail['heat'] * 100)} 粘{int(detail['engage'] * 100)})"
         elif mode == "llm_judge":
             hit, reason = await self._judge(session_id, state, messages)
         else:
@@ -294,6 +363,10 @@ class ActiveReply:
         if hit:
             state["today_count"] = int(state.get("today_count") or 0) + 1
             state["last_at"] = round(now, 1)
+            # 我说完了：黏性降一截，把「接话」的机会让回给人。
+            # 真人也是这个节奏——自己说完一段，会先等别人接
+            state["engage"] = round(max(0.0, self._engage_of(state, now) * 0.35), 3)
+            state["engage_at"] = round(now, 1)
         self._save(session_id, state)
 
         if not hit:
@@ -327,6 +400,75 @@ class ActiveReply:
             return None
 
     # ── rule 模式 ───────────────────────────────────────────────────────
+
+    # ── 动态参与度 ──────────────────────────────────────────────────────
+
+    def _engage_of(self, state: dict, now: float) -> float:
+        """当前接话黏性（0~1），按半衰期衰减到 now 这个时刻。
+
+        存在 state 里的是「上一次的值 + 那个值的时刻」，读的时候才衰减——
+        和好感、事实的惰性结算是一个思路：不挂定时器，插件停机那几天
+        黏性不会一直挂着，重启后读一次就归位了。
+        """
+        raw = float(state.get("engage") or 0.0)
+        at = float(state.get("engage_at") or 0.0)
+        if raw <= 0 or at <= 0:
+            return 0.0
+        dt = max(0.0, now - at)
+        return max(0.0, min(1.0, raw * (0.5 ** (dt / ENGAGE_HALF_LIFE))))
+
+    def _bump_engage(self, state: dict, value: float, now: float) -> bool:
+        """把黏性抬到至少 ``value``。返回是否真的变了（变了才值得写盘）。"""
+        current = self._engage_of(state, now)
+        if value <= current + 0.02:
+            return False
+        state["engage"] = round(min(1.0, value), 3)
+        state["engage_at"] = round(now, 1)
+        return True
+
+    def _absorb_engage(self, state: dict, text: str, now: float) -> bool:
+        """把这条消息里「有人在跟它说话」的信号折进黏性。返回是否变化。
+
+        两个信号，都是本地字符串/时间判断，零成本：
+
+        - **bot 刚说完话，别人接着讲**：大概率是在回应它。这是「免艾特续聊」
+          的核心——真人也是这样，你答了一句，对方接着说，你自然会继续参与
+        - **有人抛了个问题**：「有没有人知道」「求推荐」这种，群里在等答案，
+          这时候接一句最不突兀
+        """
+        bumped = False
+        last_at = float(state.get("last_at") or 0.0)
+        if last_at and now - last_at <= ENGAGE_FOLLOW_WINDOW:
+            bumped |= self._bump_engage(state, 0.65, now)
+        if any(hint in text for hint in QUESTION_HINTS):
+            bumped |= self._bump_engage(state, 0.4, now)
+        return bumped
+
+    def _heat(self, messages: list[dict], now: float) -> float:
+        """群热度 0~1：最近两分钟有多少人在说话。"""
+        recent = self._count_since(messages, now - HEAT_WINDOW_SECONDS)
+        return min(1.0, recent / float(HEAT_FULL_MESSAGES))
+
+    def _participation(
+        self, state: dict, messages: list[dict], now: float, base: float
+    ) -> tuple[float, dict[str, float]]:
+        """算出这一轮的实际插话概率，以及拆解（面板/日志要看得出为什么）。
+
+        ``base`` 是面板上那个「每个窗口的参与概率」。它现在的作用是**基准**，
+        实际概率 = 基准被热度压低、被接话黏性抬高。
+        """
+        heat = self._heat(messages, now)
+        engage = self._engage_of(state, now)
+        # 冷清抬一点、热闹压很多：两个方向不是对称的。
+        # 群里安静时多冒一个泡没人反感，热闹时插一句就打断了一屋子人
+        p = base * (1.0 - HEAT_DAMP * heat) * (1.0 + QUIET_BOOST * (1.0 - heat))
+        p += ENGAGE_GAIN * engage
+        p = max(0.0, min(MAX_CHANCE, p))
+        return p, {
+            "heat": round(heat, 2),
+            "engage": round(engage, 2),
+            "chance": round(p, 3),
+        }
 
     def _rule_hit(self, text: str, messages: list[dict], now: float) -> tuple[bool, str]:
         """纯本地规则，零成本。命中任一即算，但仍受冷却与日限约束。"""

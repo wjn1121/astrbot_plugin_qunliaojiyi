@@ -15,20 +15,21 @@
       </div>
 
       <nav class="nav" id="nav">
-        <button type="button" class="nav-item on" data-tab="overview">📊 <span>概览</span></button>
-        <button type="button" class="nav-item" data-tab="library">📚 <span>学习库</span><b class="nav-badge" id="navPending" hidden>0</b></button>
-        <button type="button" class="nav-item" data-tab="persona">🧬 <span>人格档案</span></button>
-        <button type="button" class="nav-item" data-tab="usage">💸 <span>Token 消费</span></button>
-        <button type="button" class="nav-item" data-tab="settings">⚙️ <span>参数</span></button>
-        <button type="button" class="nav-item" data-tab="preview">🔍 <span>注入预览</span></button>
-        <button type="button" class="nav-item" data-tab="sessions">💬 <span>会话与特征</span></button>
+        <button type="button" class="nav-item on" data-tab="overview" title="运行状态、主人是谁、累计花了多少">📊 <span>概览</span></button>
+        <button type="button" class="nav-item" data-tab="library" title="按群 / 私聊看学到了什么，可批准、否决、钉住、删除">📚 <span>学习库</span><b class="nav-badge" id="navPending" hidden>0</b></button>
+        <button type="button" class="nav-item" data-tab="bond" title="好感档位、事实记忆与画像、输出层调试">🎭 <span>关系与输出</span></button>
+        <button type="button" class="nav-item" data-tab="persona" title="每个群一份 markdown：自动段随学习更新，人工段永远归你">🧬 <span>人格档案</span></button>
+        <button type="button" class="nav-item" data-tab="preview" title="输入一句话，看这一轮实际会往 prompt 里塞什么（不改任何数据）">🔍 <span>注入预览</span></button>
+        <button type="button" class="nav-item" data-tab="sessions" title="每个会话的原始特征明细，可逐条编辑、删除、单独开关">💬 <span>会话与特征</span></button>
+        <button type="button" class="nav-item" data-tab="usage" title="今天花了多少、花在哪、近 7 天趋势">💸 <span>Token 消费</span></button>
+        <button type="button" class="nav-item" data-tab="settings" title="所有可热调的开关，改完下一轮就生效，不用重启">⚙️ <span>参数</span></button>
       </nav>
 
       <div class="side-actions">
-        <button id="newSessionBtn" class="ghost">➕ 新建会话记忆</button>
-        <button id="refresh" class="ghost">🔄 刷新</button>
-        <button id="importBtn" class="ghost">📥 导入备份</button>
-        <button id="exportBtn" class="ghost">📤 导出数据</button>
+        <button id="newSessionBtn" class="ghost" title="给还没在本插件出现过的群 / QQ 手动建一条记忆（要先选对平台实例）">➕ 新建会话记忆</button>
+        <button id="refresh" class="ghost" title="重新拉一遍数据（不重启插件、不清任何东西）">🔄 刷新</button>
+        <button id="importBtn" class="ghost" title="从导出的 JSON 恢复数据。会覆盖同名会话的现有内容">📥 导入备份</button>
+        <button id="exportBtn" class="ghost" title="把全部数据下成一个 JSON（含记忆与特征，不含聊天原文以外的敏感项）">📤 导出数据</button>
       </div>
     </aside>
 
@@ -38,6 +39,14 @@
           <h2>运行状态</h2>
           <div id="stats" class="grid"></div>
           <p class="hint" id="schedule"></p>
+        </section>
+
+        <section class="card">
+          <h2 class="card-title">
+            <span>👑 主人与学习</span>
+            <small>主人 QQ 一处生效，关系 / 事实 / 学习 / 清理四个模块共用</small>
+          </h2>
+          <div id="ownerCard" class="owner-card"></div>
         </section>
 
         <section class="card">
@@ -51,21 +60,35 @@
           <h2 class="card-title">
             <span>📚 学习库 <small>按群聊 / 私聊分开存，权重越高越容易进注入</small></span>
             <span class="trait-tools">
-              <input id="traitSearch" type="search" placeholder="搜群号或内容" />
-              <select id="traitStatus">
-                <option value="">全部状态</option>
-                <option value="pending">待审</option>
-                <option value="active">已生效</option>
-                <option value="archived">已归档</option>
-                <option value="rejected">已否决</option>
-              </select>
-              <button id="approveAllBtn" class="ghost">全部批准</button>
+              <button id="approveAllBtn" class="ghost" title="把当前筛选结果里的待审条目一次性批准。只对筛出来的生效，会再确认一次">全部批准</button>
             </span>
           </h2>
           <div id="traitStats" class="grid"></div>
-          <p class="hint" id="traitSearchNote" hidden></p>
+          <div class="seg" id="traitScope">
+            <button type="button" data-scope="group" class="on" title="群聊的学习开关是全局的，默认全部开启">群聊学习库</button>
+            <button type="button" data-scope="private" title="私聊默认不学，只有主人私聊自动开；其余要在这里逐个开">私聊学习库</button>
+          </div>
+          <p class="hint" id="traitScopeNote"></p>
+          <div class="gf-bar" id="traitFilterBar">
+            <button class="gf-head" data-col="who" type="button">
+              对象<span class="gf-caret"></span>
+            </button>
+            <button class="gf-head" data-col="status" type="button">
+              状态<span class="gf-caret"></span>
+            </button>
+            <button class="gf-head" data-col="score" type="button">
+              权重<span class="gf-caret"></span>
+            </button>
+            <button class="ghost tiny" id="traitPurge" type="button"
+                    title="清理 30 天没有新消息的会话（bot 可能已经不在的群 / 私聊）。置顶的会跳过">
+              清理不活跃
+            </button>
+            <button class="ghost tiny" data-gf-reset type="button" title="清空这一栏的所有筛选和排序，回到默认">重置</button>
+            <span class="hint" id="traitSearchNote"></span>
+            <div class="gf-pop" id="traitFilterPop" hidden></div>
+          </div>
           <p class="hint">点「证据」能看到这条是从哪句话学来的。权重是原始分，括号里是按时效打折后的有效分。分组标题右边的 📌 可以把该群置顶，置顶的排在列表最前。</p>
-          <div id="traits" class="traits"></div>
+          <div id="traits" class="traits scroll-box tall"></div>
         </section>
       </section>
 
@@ -73,7 +96,7 @@
         <section class="card">
           <h2 class="card-title">
             <span>🧬 人格档案 <small>每个群一份 markdown，自动段随学习更新，人工段永远归你</small></span>
-            <button id="rebuildAllPersona" class="ghost">全部重新生成</button>
+            <button id="rebuildAllPersona" class="ghost" title="按现在学习库里的特征，重写每个群的自动段。人工段不受影响，纯本地不花 token">全部重新生成</button>
           </h2>
           <div class="persona-layout">
             <aside class="persona-side">
@@ -87,7 +110,7 @@
                 <div class="block-head">
                   <b>🤖 自动生成</b>
                   <small>来自学习库中已生效的特征，学习或审核后自动重写</small>
-                  <button id="rebuildPersona" class="ghost">重新生成</button>
+                  <button id="rebuildPersona" class="ghost" title="只重写当前这个群的自动段。人工段不受影响">重新生成</button>
                 </div>
                 <pre id="personaAuto" class="persona-auto">选一个群查看</pre>
               </div>
@@ -96,15 +119,15 @@
                 <div class="block-head">
                   <b>✍️ 人工补充</b>
                   <small>只属于你，插件永远不改这一段</small>
-                  <button id="savePersona">保存</button>
+                  <button id="savePersona" title="保存人工补充段。插件永远不改这一段，学习也不会覆盖">保存</button>
                 </div>
                 <textarea id="personaManual" rows="8" placeholder="例如：群友管句尾的「呢」叫阴阳怪气，别用；有人认真问技术问题才正经回答。"></textarea>
               </div>
 
               <div class="persona-foot">
                 <span id="personaPath" class="hint"></span>
-                <button id="copyPersona" class="ghost">复制全文</button>
-                <button id="downloadPersona" class="ghost">下载 .md</button>
+                <button id="copyPersona" class="ghost" title="把自动段 + 人工段一起复制走">复制全文</button>
+                <button id="downloadPersona" class="ghost" title="下载成 markdown 文件，方便备份或放进别的地方用">下载 .md</button>
               </div>
             </div>
           </div>
@@ -126,8 +149,8 @@
           <h2 class="card-title">
             <span>今日调用分布 <small>按小时，悬停看这一小时的明细</small></span>
             <span class="seg" id="hourMetric">
-              <button type="button" data-metric="cost" class="on">金额</button>
-              <button type="button" data-metric="calls">次数</button>
+              <button type="button" data-metric="cost" class="on" title="按 DeepSeek 牌价估算的金额">金额</button>
+              <button type="button" data-metric="calls" title="调用次数（不看钱、只看频次时用这个）">次数</button>
             </span>
           </h2>
           <div id="hourChart" class="hour-chart"></div>
@@ -148,11 +171,110 @@
         <section class="card">
           <h2 class="card-title">
             <span>⚙️ 运行参数 <small>（改动即时生效，不写回配置文件）</small></span>
-            <button id="resetRuntime" class="ghost">恢复配置值</button>
+            <button id="resetRuntime" class="ghost" title="清掉所有面板上改过的值，回到配置文件里的设置">恢复配置值</button>
           </h2>
+          <div class="toolbar">
+            <input id="settingSearch" type="search" placeholder="搜参数名 / key / 说明" />
+            <span class="hint" id="settingFilterNote"></span>
+          </div>
           <div id="settings" class="settings"></div>
           <p class="hint err" id="settingsMsg"></p>
         </section>
+      </section>
+
+      <section class="pane" data-pane="bond">
+        <section class="card">
+          <h2 class="card-title">
+            <span>🧠 事实记忆</span>
+            <span class="title-actions">
+              <button id="factsRefresh" class="ghost" title="重新拉一遍事实与画像数据">刷新</button>
+            </span>
+          </h2>
+          <p class="hint" id="factsNote"></p>
+          <div id="factStats" class="grid"></div>
+          <div class="gf-bar" id="factFilterBar">
+            <button class="gf-head" data-col="who" type="button">
+              对象<span class="gf-caret"></span>
+            </button>
+            <button class="gf-head" data-col="stage" type="button">
+              档位<span class="gf-caret"></span>
+            </button>
+            <button class="gf-head" data-col="status" type="button">
+              状态<span class="gf-caret"></span>
+            </button>
+            <button class="gf-head" data-col="total" type="button">
+              条数<span class="gf-caret"></span>
+            </button>
+            <button class="gf-head" data-col="keep" type="button">
+              保留度<span class="gf-caret"></span>
+            </button>
+            <button class="ghost tiny" id="factMerge" type="button"
+                    title="把「同一件事的不同说法」并成一条。本地 2-gram 比对，不发请求、不花 token">
+              整理合并
+            </button>
+            <button class="ghost tiny" id="factPruneAll" type="button" title="按每个档位各自的保留条数瘦身，主人不受影响">
+              一键清理
+            </button>
+            <button class="ghost tiny" id="factPruneOwner" type="button" hidden
+                    title="只清主人。和一键清理分开，一键清理永远跳过主人">
+              清理主人
+            </button>
+            <button class="ghost tiny" data-gf-reset type="button" title="清空这一栏的所有筛选和排序，回到默认">重置</button>
+            <span class="hint" id="factFilterNote"></span>
+            <div class="gf-pop" id="factFilterPop" hidden></div>
+          </div>
+          <div id="factsList" class="scroll-box"></div>
+        </section>
+        <section class="card">
+          <h2 class="card-title">
+            <span>🎭 关系状态</span>
+            <span class="title-actions">
+              <button id="bondRefresh" class="ghost" title="重新拉一遍好感与关系数据">刷新</button>
+            </span>
+          </h2>
+          <p class="hint" id="bondNote"></p>
+          <div id="bondStats" class="grid"></div>
+          <div class="gf-bar" id="bondFilterBar">
+            <button class="gf-head" data-col="who" type="button">
+              对象<span class="gf-caret"></span>
+            </button>
+            <button class="gf-head" data-col="stage" type="button">
+              阶段<span class="gf-caret"></span>
+            </button>
+            <button class="gf-head" data-col="intimacy" type="button">
+              好感<span class="gf-caret"></span>
+            </button>
+            <button class="gf-head" data-col="turns" type="button">
+              轮次<span class="gf-caret"></span>
+            </button>
+            <button class="gf-head" data-col="idle" type="button">
+              最近聊天<span class="gf-caret"></span>
+            </button>
+            <button class="ghost tiny" data-gf-reset type="button" title="清空这一栏的所有筛选和排序，回到默认">重置</button>
+            <span class="hint" id="bondFilterNote"></span>
+            <div class="gf-pop" id="bondFilterPop" hidden></div>
+          </div>
+          <div id="bondList" class="bond-list"></div>
+        </section>
+
+        <section class="card">
+          <h2 class="card-title">
+            <span>✨ 输出层调试</span>
+            <small>粘一段 bot 的回复，看清理和拆条的实际结果。只算不写，不动配置</small>
+          </h2>
+          <div class="tone-bar">
+            <label class="tone-check"><input type="checkbox" id="toneClean" /> 去模型腔</label>
+            <label class="tone-check"><input type="checkbox" id="toneSqueeze" /> 压标点</label>
+            <label class="tone-check"><input type="checkbox" id="toneMarkdown" /> 去 markdown</label>
+            <label class="tone-check"><input type="checkbox" id="toneSegment" /> 拆条</label>
+            <label class="tone-num">每条 <input type="number" id="toneChars" min="10" max="300" step="5" value="60" /> 字</label>
+            <label class="tone-num">最多 <input type="number" id="toneParts" min="1" max="9" step="1" value="4" /> 条</label>
+            <button id="toneBtn" title="按上面勾的选项跑一遍清理和拆条，只算不写">解析</button>
+          </div>
+          <textarea id="toneInput" rows="5" placeholder="粘贴一段 bot 可能说出来的话，例如：&#10;作为一个 AI，我建议这样改——先把端口换掉，再重建容器。希望这对你有帮助！"></textarea>
+          <div id="toneOut" class="tone-out"></div>
+        </section>
+
       </section>
 
       <section class="pane" data-pane="preview">
@@ -163,8 +285,8 @@
           </h2>
           <div class="preview-bar">
             <div class="seg" id="previewMode">
-              <button type="button" data-active="0" class="on">被动</button>
-              <button type="button" data-active="1">主动</button>
+              <button type="button" data-active="0" class="on" title="别人跟你说话时的那一轮">被动</button>
+              <button type="button" data-active="1" title="bot 自己找时机插话时的那一轮，强度比被动低">主动</button>
             </div>
             <div class="picker" id="previewPicker">
               <input id="previewSessionInput" type="text" placeholder="输入群号 / QQ 号搜索会话" autocomplete="off" />
@@ -172,7 +294,7 @@
               <div class="picker-menu" id="previewMenu" hidden></div>
             </div>
             <input id="previewMessage" type="text" placeholder="输入一条群友可能说的话，例如：笑死我了 666" />
-            <button id="previewBtn">预览</button>
+            <button id="previewBtn" title="按当前参数算一遍，看实际会注入什么">预览</button>
           </div>
           <p class="hint" id="previewNote"></p>
           <pre id="previewOut" class="preview-out empty">尚未预览</pre>
@@ -184,9 +306,9 @@
           <h2 class="card-title">
             <span>💬 会话与特征</span>
             <span class="title-actions">
-              <button id="clearLearned" class="ghost danger">清空学习产出</button>
-              <button id="clearManual" class="ghost danger">清空手动记忆</button>
-              <button id="clearAll" class="ghost danger">清空全部</button>
+              <button id="clearLearned" class="ghost danger" title="清掉所有会话学到的特征和待审条目，手动记忆保留。不可恢复">清空学习产出</button>
+              <button id="clearManual" class="ghost danger" title="清掉所有人工添加的记忆。学习产出不受影响，不可恢复">清空手动记忆</button>
+              <button id="clearAll" class="ghost danger" title="清掉所有会话的学习产出 + 手动记忆 + 待学习消息。不可恢复">清空全部</button>
             </span>
           </h2>
           <div class="toolbar">
@@ -197,10 +319,10 @@
               <option value="name">按名称</option>
             </select>
             <span id="pagerInfo" class="hint"></span>
-            <button id="prevPage" class="ghost">上一页</button>
-            <button id="nextPage" class="ghost">下一页</button>
+            <button id="prevPage" class="ghost" title="上一页（排序和筛选条件保持不变）">上一页</button>
+            <button id="nextPage" class="ghost" title="下一页（排序和筛选条件保持不变）">下一页</button>
           </div>
-          <div id="sessions"></div>
+          <div id="sessions" class="scroll-box tall"></div>
         </section>
       </section>
     </main>
@@ -239,7 +361,7 @@
       </label>
       <p class="hint" id="editHint"></p>
       <div class="modal-actions">
-        <button id="editBatch" class="ghost">批量粘贴</button>
+        <button id="editBatch" class="ghost" title="切到批量：一行一条，格式「内容|场景|触发词」，一次加很多条">批量粘贴</button>
         <button id="editCancel" class="ghost">取消</button>
         <button id="editSave">保存</button>
       </div>
@@ -286,7 +408,7 @@
       <p class="hint" id="newPreview">拼出的会话 ID：—</p>
       <div class="modal-actions">
         <button id="newCancel" class="ghost">取消</button>
-        <button id="newNext">下一步：填内容</button>
+        <button id="newNext" title="先确认平台实例和会话号，再填记忆内容">下一步：填内容</button>
       </div>
     </div>
   </div>

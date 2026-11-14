@@ -11,3 +11,8 @@ Thumbs.db
 .idea/
 .vscode/
 *.log
+
+# 本地调试产物：预览页、截图、改动前的临时备份
+dev/preview*.html
+dev/shot_*.png
+*.bak-*

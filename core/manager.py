@@ -14,6 +14,7 @@ from typing import Any
 from astrbot.api import logger
 
 from .injector import Injector
+from .learn_gate import learn_enabled
 from .learner import Learner
 from .settings import Settings
 from .storage import Storage
@@ -129,7 +130,9 @@ class Manager:
                 continue
             # 1.3.0 这里漏了会话级开关，导致「面板关掉学习」在定时任务里不生效，
             # 1.4.0 补上：关掉的会话连替换式学习也不做。
-            if not self.storage.learn_allowed(sid):
+            # 1.7.x 起改走统一判定——群聊默认学、私聊默认不学（主人例外），
+            # 调度和回复链路必须用同一份逻辑，否则两边会打架
+            if not learn_enabled(self.settings, self.storage, sid):
                 continue
             out.append(sid)
         return out
@@ -145,7 +148,7 @@ class Manager:
             count = len(msgs)
             if count < min_history:
                 continue
-            if not self.storage.learn_allowed(sid):
+            if not learn_enabled(self.settings, self.storage, sid):
                 continue
             last = float((self.storage.learn_state.get(sid) or {}).get("last_learn_at", 0) or 0)
             idle = now - last if last > 0 else fallback
