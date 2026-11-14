@@ -1288,6 +1288,15 @@ p = 基准 × (1 − 0.7 × 群热度) × (1 + 0.4 × (1 − 群热度)) + 0.5 �
 面板里的 43 项参数，每条都标了「默认 X」和 token 影响箭头（`↑↑↑` / `↑↑` / `↑` / `↓` / `token 0`），
 扫一眼就知道哪项在烧钱。改完下一轮生效、不用重启，随时能改回去。
 
+### 记住一个人，一天两分钱
+
+按主人档把上限拉满算：关系段 300 字 + 事实 500 字 + 画像 520 字 ≈ 1300 字，折合约 900 token。
+注入走缓存命中价（0.05 元/百万），一轮 **0.00005 元**；按活跃群一天 500 轮算，**两分钱**——
+高峰时段（工作日 9-12、14-18 点）价格翻倍，也才四分。一个月不到一块。
+
+这不是形容词，是按面板里那张计价表算出来的。所以「贵不贵」不用问我——画像上限调小、
+遗忘天数缩短，账立刻跟着变；反过来把它全关掉，这笔钱直接归零。
+
 ---
 
 ## 📁 目录结构
@@ -1716,7 +1725,7 @@ A: 先算额度：默认 20 次/群/天 × 10 群 × 30 天 = 6000 次/月，Tav
 | AstrBot 主仓库 | 运行时 | https://github.com/AstrBotDevs/AstrBot |
 | AstrBot 插件市场 | 发布 | https://cloud.astrbot.app/market |
 | MaiBot（表达学习，设计参考） | 参考，仍在用 | https://github.com/Mai-with-u/MaiBot |
-| astrbot_plugin_oven_multi（风格学习已下线） | 历史来源，无代码关联 | https://github.com/huntersxy/astrbot_plugin_oven_multi |
+| astrbot_plugin_oven_multi（风格学习已下线） | 历史参考来源，已无代码关联 | https://github.com/huntersxy/astrbot_plugin_oven_multi |
 
 ---
 
