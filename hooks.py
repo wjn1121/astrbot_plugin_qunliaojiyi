@@ -72,6 +72,37 @@ def is_active_turn(event: AstrMessageEvent) -> bool:
         return False
 
 
+def is_direct_to_bot(event: AstrMessageEvent) -> bool:
+    """这条消息是不是**冲着 bot** 来的。
+
+    判据两条：
+
+    - 消息链里有 ``At``，且被 @ 的是 bot 自己
+    - 消息链里有 ``Reply``（引用回复），且被引用那条的发送者是 bot
+
+    判不出来一律返回 False——宁可当成「群聊旁听」少涨一点，
+    也不要把群里的背景闲聊抬到直接对话的价码。私聊不在这里判，
+    调用方用 ``is_group`` 兜住（私聊天然是直接对话）。
+    """
+    try:
+        self_id = str(event.get_self_id() or "")
+        if not self_id:
+            return False
+        for comp in event.get_messages() or []:
+            name = type(comp).__name__
+            if name == "At":
+                if str(getattr(comp, "qq", "") or "") == self_id:
+                    return True
+            elif name == "Reply":
+                # aiocqhttp 会带上被引用消息的发送者；取不到就当没回复 bot
+                sender = str(getattr(comp, "sender_id", "") or "")
+                if sender and sender == self_id:
+                    return True
+    except Exception:  # noqa: BLE001 - 读消息链失败按「不是直接对话」处理
+        return False
+    return False
+
+
 # 求助 / 说正事的信号词。刻意不用「怎么」这种到处都有的词——
 # 「你怎么这么可爱」不该被判成求助。宁可漏判（继续按关系语气说话），
 # 也不要误判（把闲聊全变成客服腔）。
@@ -318,11 +349,15 @@ async def touch_relation(plugin, event: AstrMessageEvent) -> None:
             if negative:
                 logger.debug(f"[群聊记忆] 负面反馈 · {sender_id} · {content[:20]}")
 
-        # 这一轮是主动插话还是被动回复？主动插话不走「被动只给四分之一」的系数
+        # 这一轮是「冲着 bot 说的」还是「群里顺带接了一句」？
+        #
+        # 私聊天然是直接对话；群里要看有没有 @ bot 或引用回复 bot 的消息。
+        # 主动插话那一轮对方并没有指向 bot，所以也算群聊旁听——
+        # 这是它该拿的价码，不是惩罚。
         try:
-            active_round = is_active_turn(event)
+            direct = (not is_group) or is_direct_to_bot(event)
         except Exception:  # noqa: BLE001
-            active_round = False
+            direct = False
 
         plugin.bond.touch(
             session_id,
@@ -330,7 +365,7 @@ async def touch_relation(plugin, event: AstrMessageEvent) -> None:
             sender_name=event.get_sender_name() or "",
             is_group=is_group,
             negative=negative,
-            passive=not active_round,
+            direct=direct,
         )
         # 标记放在 touch 之后：中途抛异常时下一段还能补记一次
         try:

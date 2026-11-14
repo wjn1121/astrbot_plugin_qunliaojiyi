@@ -648,7 +648,7 @@ class BondStore:
         sender_name: str = "",
         is_group: bool = False,
         negative: bool = False,
-        passive: bool = True,
+        direct: bool = False,
         now: float | None = None,
     ) -> dict[str, Any]:
         """记一轮真实对话，返回更新后的记录。
@@ -658,6 +658,9 @@ class BondStore:
 
         ``negative`` 为真时这一轮只扣分不涨分——被骂了一句还涨好感，
         这个数值就彻底没意义了。
+
+        ``direct`` 表示这条消息是不是**冲着 bot** 来的（@ 了它、回复了它的消息，
+        或者本来就是私聊）。它决定用哪个基准增量，见下面的注释。
         """
         at = float(now if now is not None else time.time())
         key = bond_key(sender_id)
@@ -699,21 +702,24 @@ class BondStore:
                 record["last_negative"] = at
                 changed = True
         elif can_raise:
-            growth = _as_float(cfg.get("growth_per_turn"), 10.0)
+            # 增量按**场景**直接取两个明确的数，不再做「基准 × 群聊减半 × 被动四分之一」
+            # 那种三层乘法。
+            #
+            # 三层乘法的问题是系数太抽象：用户看到面板上一次涨 1.25，根本算不出
+            # 这是怎么来的，也没法判断「我到底希望它涨多快」。改成两个数之后，
+            # 改一个数就是改一个数，解释成本归零。
+            #
+            # - **直接对话**（@ 了 bot、回复了 bot 的消息、私聊）：0.25 点
+            # - **群聊旁听**（对方没指向 bot，bot 顺带接了一句）：0.1 点
+            #
+            # 群聊里绝大多数交互是第二种。按第一种的价码算，几百轮就能把一个
+            # 从没跟 bot 说过话的人养成「老友」——那不是关系，是刷出来的。
+            if direct:
+                growth = _as_float(cfg.get("growth_per_turn"), 0.25)
+            else:
+                growth = _as_float(cfg.get("group_passive_gain"), 0.1)
             if growth < 0:
                 growth = 0.0
-            if is_group:
-                # 群聊的互动天然更轻，增量减半；私聊才按全额涨
-                growth = growth / 2
-            if passive:
-                # 被动轮（别人来找 bot、bot 回复）只给四分之一。
-                #
-                # 为什么要砍这么狠：被动回复是这个插件里最常见的交互——
-                # 群里随便搭一句话就算一轮，按原值 10 点算，40 轮就「熟悉」了，
-                # 那不是养出来的关系，是刷出来的。主动插话那一轮不走这个系数，
-                # 因为那是 bot 自己凑上去的，不该按「别人来找你」的价码算。
-                factor = _as_float(cfg.get("passive_growth_factor"), 0.25)
-                growth *= max(0.0, min(1.0, factor))
             # 指数曲线：越高越难涨。
             #
             # 线性增长的问题是「越往后越快」的错觉——从 800 到 1000 和从 0 到 200
