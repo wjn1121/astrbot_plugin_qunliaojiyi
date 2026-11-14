@@ -715,10 +715,18 @@ class BondStore:
             # 群聊里绝大多数交互是第二种。按第一种的价码算，几百轮就能把一个
             # 从没跟 bot 说过话的人养成「老友」——那不是关系，是刷出来的。
             if direct:
-                growth = _as_float(cfg.get("growth_per_turn"), 0.25)
+                growth = _as_float(cfg.get("growth_per_turn"), 3.1)
             else:
-                growth = _as_float(cfg.get("group_passive_gain"), 0.1)
+                growth = _as_float(cfg.get("group_passive_gain"), 1.25)
             if growth < 0:
+                growth = 0.0
+            # 群聊硬顶：到了这个分数，群里再怎么聊都不再涨（只封涨，不封跌）。
+            #
+            # 默认 200 = 「熟悉」门槛。这样「群聊能把关系推到哪」是可预期的：
+            # 不管群多热闹、聊多久，所有人都停在熟悉，想往上只能私聊。
+            # 调成 0 就不封顶，回到「群里也能涨到老友」的旧行为。
+            group_cap = _as_float(cfg.get("group_gain_cap"), 200.0)
+            if is_group and group_cap > 0 and base >= group_cap:
                 growth = 0.0
             # 指数曲线：越高越难涨。
             #
