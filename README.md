@@ -11,7 +11,7 @@
 [![Version](https://img.shields.io/badge/version-1.5.0-orange)](metadata.yaml)
 [![Stars](https://img.shields.io/github/stars/wjn1121/astrbot_plugin_qunliaojiyi?label=stars&color=yellow)](https://github.com/wjn1121/astrbot_plugin_qunliaojiyi/stargazers)
 [![Downloads](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fcloud.astrbot.app%2Fapi%2Fv1%2Fmarket%2Fplugins.json&query=%24%5B%27wjn1121%2Fastrbot_plugin_qunliaojiyi%27%5D.download_count&label=downloads&color=green&suffix=%E6%AC%A1&cacheSeconds=3600)](https://cloud.astrbot.app/market)
-[![License](https://img.shields.io/badge/license-AGPL--3.0-9cf)](LICENSE)
+[![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![Author](https://img.shields.io/badge/author-wjn1121-lightgrey)](https://github.com/wjn1121)
 
 ---
