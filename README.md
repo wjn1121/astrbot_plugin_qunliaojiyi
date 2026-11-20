@@ -724,7 +724,7 @@ bot 一个字没接，一分都不涨——以前是收到消息就算，等于�
 
 ## 🍚 喂食
 
-好感除了聊天，还可以从「吃什么」插件喂出来。
+好感除了聊天，还可以从 [「吃什么」](https://github.com/wjn1121/astrbot_plugin_chishenme) 插件喂出来。
 
 群友发「吃什么」随机拿到一道菜，或者发「点菜 红烧肉」点中一道，都算一次投喂。「吃什么」在消息事件上挂一个字段，「群聊记忆」在回复发出去之前读到它，加好感，再把结果写进同一条回复：
 
@@ -1795,6 +1795,7 @@ A: 先算额度：默认 20 次/群/天 × 10 群 × 30 天 = 6000 次/月，Tav
 | 消息事件监听 | 文档 | https://docs.astrbot.app/dev/star/guides/listen-message-event.html |
 | AstrBot 主仓库 | 运行时 | https://github.com/AstrBotDevs/AstrBot |
 | AstrBot 插件市场 | 发布 | https://cloud.astrbot.app/market |
+| 吃什么（喂食联动的那个） | 配套，可选装 | https://github.com/wjn1121/astrbot_plugin_chishenme |
 | MaiBot（表达学习，设计参考） | 参考，仍在用 | https://github.com/Mai-with-u/MaiBot |
 | astrbot_plugin_oven_multi（风格学习已下线） | 历史参考来源，已无代码关联 | https://github.com/huntersxy/astrbot_plugin_oven_multi |
 
