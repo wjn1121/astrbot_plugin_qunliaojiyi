@@ -39,8 +39,14 @@ BEIJING_TZ = timezone(timedelta(hours=8))
 PEAK_RANGES = ((9, 12), (14, 18))
 
 # 会产生 token 的来源；search 只计次数不计 token（搜索本身由服务商计费）
-TOKEN_SOURCES = ("learn", "judge", "bot")
-ALL_SOURCES = ("learn", "judge", "bot", "search")
+#
+# 1.7.0 起把「群里的对话」拆细了，因为它们的触发条件完全不同：
+# - reply：有人 @bot、回复 bot、或者私聊，属于「点名要你说」
+# - active：插件自己插话，凭空产生，是唯一可以整块关掉的
+# - bot：其余回调（例如群里配置成全量回复），历史上也落在这里
+# - learn / profile / judge：插件自己的后台请求，和聊天无关
+TOKEN_SOURCES = ("learn", "profile", "judge", "bot", "reply", "active")
+ALL_SOURCES = TOKEN_SOURCES + ("search",)
 
 DAY_FILE_FORMAT = "%Y-%m-%d"
 SAVE_DELAY = 30.0
@@ -528,9 +534,10 @@ class UsageTracker:
     def record(self, source: str, usage, session_id: str = "") -> None:
         """记一次 LLM 调用的 token。
 
-        ``source`` 取 ``learn`` / ``judge`` / ``bot``；认不出来的来源一律并入 bot，
-        免得面板上冒出乱七八糟的键。``usage`` 允许是 None 或缺字段 —— 这种情况下
-        仍然计一次调用数，只是 token 记 0。
+        ``source`` 取 ``learn`` / ``profile`` / ``judge`` / ``reply`` / ``active`` /
+        ``bot``；认不出来的来源一律并入 bot，免得面板上冒出乱七八糟的键。
+        ``usage`` 允许是 None 或缺字段 —— 这种情况下仍然计一次调用数，只是 token
+        记 0。
         """
         try:
             input_other, input_cached, output = extract_tokens(usage)
@@ -743,6 +750,34 @@ class UsageTracker:
             sid: _as_int(counts.get("search_calls"))
             for sid, counts in (doc.get("by_session") or {}).items()
         }
+        # 按来源拆一份，面板上「今日被叫回复」和「主动插话」各自花了多少就靠它。
+        # 日文件里每个来源只存 token 不存金额（金额是全天累加的一个数），所以
+        # 这里按此刻牌价折算——同一天内不会有偏差，跨到高峰边界会有几厘误差。
+        multiplier = self.peak_multiplier()
+        by_source: dict[str, dict] = {}
+        for name, counts in (doc.get("by_source") or {}).items():
+            calls = _as_int(counts.get("calls"))
+            if name == "search":
+                by_source[name] = {"calls": calls, "cost": 0.0, "tokens": _empty_tokens()}
+                continue
+            tokens = {
+                "input_other": _as_int(counts.get("input_other")),
+                "input_cached": _as_int(counts.get("input_cached")),
+                "output": _as_int(counts.get("output")),
+            }
+            by_source[name] = {
+                "calls": calls,
+                "cost": round(
+                    self._tokens_cost(
+                        tokens["input_other"],
+                        tokens["input_cached"],
+                        tokens["output"],
+                        multiplier,
+                    ),
+                    6,
+                ),
+                "tokens": tokens,
+            }
         return {
             "today": {
                 "cost": round(_as_float(doc.get("cost")), 4),
@@ -750,6 +785,7 @@ class UsageTracker:
                 "search_calls": _as_int(doc.get("search_calls")),
                 "calls": _as_int(doc.get("calls")),
             },
+            "by_source": by_source,
             "days": self.snapshot(),
             "hours": self.hours(),
             "current_hour": now_beijing().hour,

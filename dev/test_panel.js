@@ -68,7 +68,12 @@ const f = new Function(
   "location",
   "localStorage",
   src +
-    "\nreturn {groupCard, sessionCard, factBucketCard, settingRow, tokenTag, fmtDefault, TIER_TEXT, profileMatches};",
+    "\nreturn {groupCard, sessionCard, factBucketCard, settingRow, tokenTag, fmtDefault, TIER_TEXT, profileMatches," +
+    " renderFeedBoard, renderUsageSource, SETTING_GROUPS, profileBar, renderActiveList, renderActiveStats, ACTIVE_GF," +
+    " sortFacts," +
+    " setFeedBoard: (v) => { feedBoard = v; }," +
+    " setActiveGroups: (v, on, perUser) => { activeGroups = v; activeGlobalOn = on; activePerUserLimit = perUser || 0; }," +
+    " setStatus: (v) => { lastStatus = v; }};",
 );
 
 let api;
@@ -174,6 +179,27 @@ chk("画像有重新生成按钮", card.includes("data-prof-rewrite="));
 chk("人物标题栏有置顶按钮", card.includes("data-fact-pin-user=") && card.includes(">置顶<"));
 chk("条目级不再有钉住按钮", !card.includes('data-fact-pin="'));
 
+// ── 事实卡标题：昵称在前、QQ 在后 ──
+const namedCard = api.factBucketCard({ ...row, sender_name: "小明", nickname: "明明" });
+chk("标题是「昵称（QQ）」", namedCard.includes("小明（123）"));
+chk("标出你手动设的称呼", namedCard.includes("你叫他「明明」"));
+chk(
+  "没昵称时退回只显示 QQ",
+  api.factBucketCard({ ...row, sender_name: "", nickname: "" }).includes("<b>123</b>"),
+);
+
+// ── 事实列表排序：主人 → 置顶 → 其余 ──
+const factSorted = api.sortFacts([
+  { key: "a", total: 5, is_owner: false, pinned: false },
+  { key: "b", total: 3, is_owner: true, pinned: false },
+  { key: "c", total: 9, is_owner: false, pinned: true },
+]);
+chk(
+  "主人第一、置顶第二、其余按条数",
+  factSorted.map((r) => r.key).join(",") === "b,c,a",
+  factSorted.map((r) => r.key).join(","),
+);
+
 // ── 主动回复预设：整组匹配才算命中 ──
 const preset = {
   id: "balanced",
@@ -203,6 +229,168 @@ const rowHtml = api.settingRow(
 chk("参数行带默认值徽标", rowHtml.includes("set-def") && rowHtml.includes("默认 5"));
 chk("参数行带 token 标签", rowHtml.includes("set-tok") && rowHtml.includes("↑↑"));
 chk("参数行说明是 hint", rowHtml.includes('class="set-hint"'));
+
+// ── 参数页：喂食那组不能出现在这里（它有自己的页）──
+const settingsGroups = api.SETTING_GROUPS.filter((g) => !g.pane);
+chk("参数页不含喂食组", settingsGroups.every((g) => g.id !== "feed"));
+chk(
+  "喂食组挂在自己的 pane 上",
+  api.SETTING_GROUPS.some((g) => g.id === "feed" && g.pane === "feed"),
+);
+
+// ── 参数分组顺序：靠 order 排，不靠定义顺序 ──
+const ordered = settingsGroups.slice().sort((a, b) => (a.order ?? 99) - (b.order ?? 99));
+chk("第一组是全局", ordered[0].id === "global");
+chk("主动回复排在运行与学习之前", ordered.findIndex((g) => g.id === "active") < ordered.findIndex((g) => g.id === "base"));
+chk("计价永远在最后", ordered[ordered.length - 1].id === "price");
+chk("每组都有 order", settingsGroups.every((g) => typeof g.order === "number"));
+chk("order 不重复", new Set(settingsGroups.map((g) => g.order)).size === settingsGroups.length);
+
+// ── 三组新预设：和后端 GROUP_PROFILES 的键对上 ──
+// 用全量分组：主动回复有自己的页，不在参数页里，但预设照样要挂
+const profileGroups = api.SETTING_GROUPS.filter((g) => g.profileGroup);
+chk("四个组挂了预设", profileGroups.length === 4);
+chk(
+  "预设键名符合后端",
+  profileGroups.every((g) => ["active", "learn", "style", "facts"].includes(g.profileGroup)),
+);
+
+// ── 预设条：按钮带组名，命中时高亮 ──
+api.setStatus({
+  profiles: {
+    learn: [
+      { id: "lean", label: "🐢 极省", desc: "一天最多学一次", values: { analysis_interval_seconds: 86400 } },
+      { id: "balanced", label: "⚖️ 平衡", desc: "6 小时学一次", values: { analysis_interval_seconds: 21600 } },
+    ],
+  },
+});
+const bar = api.profileBar("learn", { analysis_interval_seconds: 21600 });
+chk("预设条渲染出按钮", bar.includes("🐢 极省") && bar.includes("⚖️ 平衡"));
+chk("按钮带组名", bar.includes('data-profile-group="learn"'));
+chk("命中当前档位时高亮", /data-profile="balanced"[^>]*class="on"/.test(bar));
+chk("标签跟着组走", bar.includes("学习强度"));
+chk("没命中时提示已微调", api.profileBar("learn", { analysis_interval_seconds: 3600 }).includes("微调"));
+chk("未知组不渲染", api.profileBar("nope", {}) === "");
+
+// ── 主动回复页：列表 / 筛选 / 排序 ──
+const activeNodes = {};
+const origActiveGet = global.document.getElementById;
+global.document.getElementById = (id) => {
+  if (!activeNodes[id]) activeNodes[id] = escEl();
+  return activeNodes[id];
+};
+api.setActiveGroups(
+  [
+    { session_id: "bot1:GroupMessage:111", name: "群 111", enabled: true, today: 3, limit: 8, full: false, last_at: 1762000000, next_roll_in: 600, streak: 0 },
+    { session_id: "bot1:GroupMessage:222", name: "群 222", enabled: false, today: 0, limit: 8, full: false, last_at: null, next_roll_in: null, streak: 0 },
+    { session_id: "bot1:GroupMessage:333", name: "群 333", enabled: true, today: 8, limit: 8, full: true, last_at: 1762100000, next_roll_in: null, streak: 4 },
+  ],
+  true,
+  6,
+);
+api.renderActiveList();
+api.renderActiveStats();
+const activeHtml = activeNodes.activeList.innerHTML;
+const activeStatsHtml = activeNodes.activeStats.innerHTML;
+
+chk("每个群一行", (activeHtml.match(/data-active-group=/g) || []).length === 3);
+chk("群名与今日次数都在", activeHtml.includes("群 111") && activeHtml.includes("今日 3/8"));
+chk("关掉的群有 off 标记", /class="arow off"[\s\S]{0,240}GroupMessage:222/.test(activeHtml));
+chk("今日已满单独标出来", activeHtml.includes("arow-tag full") && activeHtml.includes("今日已满"));
+chk("开着的群标「开着」", activeHtml.includes("arow-tag on"));
+chk("默认按今日降序", activeHtml.indexOf("群 333") < activeHtml.indexOf("群 111"));
+chk("统计里有总开关和群数", activeStatsHtml.includes("总开关") && activeStatsHtml.includes("2 / 3"));
+chk("统计里有每人每日上限", activeStatsHtml.includes("6 次"));
+
+// 搜索过滤：走的是列头同一份 state
+api.ACTIVE_GF.state.text.who = "111";
+api.renderActiveList();
+chk("搜群号能过滤", !activeNodes.activeList.innerHTML.includes("群 333"));
+api.ACTIVE_GF.state.text.who = "";
+
+// 状态筛选：只看关掉的
+api.ACTIVE_GF.state.sets.states = ["off"];
+api.renderActiveList();
+chk("只看关掉的群", activeNodes.activeList.innerHTML.includes("群 222")
+  && !activeNodes.activeList.innerHTML.includes("群 111"));
+api.ACTIVE_GF.state.sets.states = [];
+
+// 排序切成升序按最近说话
+api.ACTIVE_GF.state.sort = "idle";
+api.ACTIVE_GF.state.dir = "asc";
+api.renderActiveList();
+chk("按最近升序时没说过话的在前", activeNodes.activeList.innerHTML.indexOf("群 222") < activeNodes.activeList.innerHTML.indexOf("群 111"));
+api.ACTIVE_GF.reset();
+global.document.getElementById = origActiveGet;
+
+
+// ── 喂食页：投喂榜按次数排、今日次数独立显示 ──
+// 这一页是直接写 DOM 的，临时换掉 getElementById 让它在 stub 里跑一遍
+const feedNodes = {};
+const origGetById = global.document.getElementById;
+global.document.getElementById = (id) => {
+  if (!feedNodes[id]) feedNodes[id] = escEl();
+  return feedNodes[id];
+};
+api.setFeedBoard({
+  enabled: true,
+  limit: 1,
+  gain_random: 2,
+  gain_order: 5,
+  stats: { people: 2, total: 9, today: 1, today_people: 1, last_at: 1762000000 },
+  items: [
+    { qq: "111", name: "小明", total: 6, today: 1, last_dish: "牛肉面", last_mode: "order", last_at: 1762000000 },
+    { qq: "222", name: "小红", total: 3, today: 0, last_dish: "饺子", last_mode: "random", last_at: 1761000000 },
+  ],
+});
+api.renderFeedBoard();
+global.document.getElementById = origGetById;
+const feedListHtml = (feedNodes.feedList || {}).innerHTML || "";
+chk("投喂榜渲染出人", feedListHtml.includes("小明") && feedListHtml.includes("111"));
+// stub 的 innerHTML getter 会做一次 HTML 转义，所以这里按转义后的文本断言
+chk("投喂榜显示累计次数", feedListHtml.includes("6&lt;/b&gt; 次"));
+chk("投喂榜区分点菜与随机", feedListHtml.includes("（点菜）") && feedListHtml.includes("（随机）"));
+chk("今日次数带上限", feedListHtml.includes("今天 1/1"));
+chk("投喂榜第一名有奖牌", feedListHtml.includes("🥇"));
+chk(
+  "今日汇总进统计格",
+  ((feedNodes.feedStats || {}).innerHTML || "").includes("9 次"),
+);
+chk(
+  "说明里点明占日限额度",
+  ((feedNodes.feedNote || {}).textContent || "").includes("单日单人上限"),
+);
+
+// ── 用量页：回复与后台各成一块，块内再拆来源 ──
+const usageNodes = {};
+global.document.getElementById = (id) => {
+  if (!usageNodes[id]) usageNodes[id] = escEl();
+  return usageNodes[id];
+};
+api.renderUsageSource({
+  by_source: {
+    reply: { calls: 12, cost: 0.216, tokens: { input_other: 4000, output: 900 } },
+    active: { calls: 3, cost: 0.045, tokens: {} },
+    learn: { calls: 2, cost: 0.008, tokens: {} },
+  },
+});
+const srcHtml = (usageNodes.usageSource || {}).innerHTML || "";
+chk("被叫回复单独一行", srcHtml.includes("被叫回复"));
+chk("被叫回复次数与金额", srcHtml.includes("12 次") && srcHtml.includes("¥0.22"));
+chk("给出平均每次单价", srcHtml.includes("平均 ¥0.02/次"));
+chk("没有记录的来源不渲染", !srcHtml.includes("插话判定"));
+chk("回复块汇总是 reply+active", srcHtml.includes("15 次") && srcHtml.includes("¥0.26"));
+// 0.008 元小于一分钱，fmtMoney 会用四位小数，别显示成 ¥0.00
+chk("后台块单独汇总", srcHtml.includes("🧠 后台") && srcHtml.includes("¥0.0080"));
+chk("有占比条与两块颜色", srcHtml.includes("ub-bar") && srcHtml.includes('class="chat"'));
+chk("每块标出占今日比例", /占今日 \d+%/.test(srcHtml));
+
+// 后台有、回复没有时，不该留一个 ¥0.00 的回复块
+api.renderUsageSource({ by_source: { learn: { calls: 1, cost: 0.004 } } });
+const backOnly = (usageNodes.usageSource || {}).innerHTML || "";
+chk("回复没数据就不渲染回复块", !backOnly.includes("💬 回复"));
+chk("后台仍有数据时正常渲染", backOnly.includes("📚 学习风格"));
+global.document.getElementById = origGetById;
 
 console.log("\n" + (ok ? "全部通过" : "有失败项"));
 process.exit(ok ? 0 : 1);

@@ -597,6 +597,75 @@ h3 small { font-weight: 400; font-size: 11px; color: #6c7484; margin-left: 6px; 
 .usage-hero b { font-size: 30px; font-weight: 600; line-height: 1.2; }
 .usage-note { margin-top: 10px; line-height: 1.6; }
 
+/* 今日消耗构成：上面两块总额（回复 / 后台），下面一根占比条 + 逐项明细。
+   回复那块打高亮，因为它是每天都在发生、也是唯一由群友决定的那笔。 */
+.usage-breakdown {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-bottom: 14px;
+}
+.ub-sum {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.ub-block {
+  flex: 1 1 190px;
+  padding: 10px 14px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: #12151c;
+}
+.ub-block.hot { border-color: #2f4a75; background: #16202f; }
+.ub-name { display: block; color: var(--muted); font-size: 12px; }
+.ub-block b { font-size: 22px; font-weight: 600; line-height: 1.4; }
+.ub-block.hot b { color: var(--accent); }
+.ub-block small { display: block; color: var(--muted); font-size: 11px; }
+.ub-block .ub-share { margin-top: 2px; }
+.ub-block.hot .ub-share { color: var(--accent); }
+
+/* 占比条：两段拼起来，宽度就是金额占比。矮一点，是辅助信息不是主角 */
+.ub-bar {
+  display: flex;
+  height: 6px;
+  border-radius: 3px;
+  overflow: hidden;
+  background: #1b202a;
+}
+.ub-bar i { display: block; height: 100%; transition: width 0.3s ease; }
+.ub-bar i.chat { background: var(--accent); }
+.ub-bar i.back { background: #8a79e0; }
+
+.ub-list { display: flex; flex-direction: column; gap: 10px; }
+.ub-group-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin: 0 0 4px;
+  font-size: 12px;
+  color: var(--text);
+}
+.ub-group-head small { color: var(--muted); font-size: 11px; flex: 1 1 auto; min-width: 0; }
+.ub-group-head em { color: var(--muted); font-style: normal; font-size: 11px; }
+
+/* 一行一个来源：名字 / 次数 / 金额 / 平均单价与 token */
+.ub-row {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 6px 12px;
+  border-radius: 8px;
+  background: #12151c;
+  font-size: 12px;
+  color: var(--muted);
+}
+.ub-row + .ub-row { margin-top: 3px; }
+.ub-row-name { color: var(--text); flex: 0 0 96px; }
+.ub-row b { color: var(--text); font-size: 13px; }
+.ub-row-cost { color: var(--text); min-width: 62px; }
+.ub-row small { font-size: 11px; }
+
 /* 近 7 天柱状图：纯 div，柱高按最大值归一化 */
 .bars {
   display: flex;
@@ -680,7 +749,7 @@ h3 small { font-weight: 400; font-size: 11px; color: #6c7484; margin-left: 6px; 
 .seg button + button { border-left: 1px solid var(--line); }
 .seg button.on { background: #232838; color: var(--accent); }
 
-/* 主动回复的「强度预设」条：三个档位 + 一句当前说明。
+/* 整组预设条：几个档位 + 一句当前说明。
    放在参数组最上方，因为它改的是一整组参数，不是一个字段 */
 .profile-bar {
   display: flex;
@@ -704,6 +773,45 @@ h3 small { font-weight: 400; font-size: 11px; color: #6c7484; margin-left: 6px; 
   flex: 1 1 220px;
   min-width: 0;
 }
+
+/* 主动回复页的群列表：一行一个群，左开关、中群名、右状态。
+   不用折叠卡——这一行没有更多内容可展开，摊平更好扫 */
+.arow {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: #141820;
+  margin-bottom: 6px;
+  font-size: 12px;
+}
+.arow input { flex: none; accent-color: var(--accent); }
+.arow-name { font-weight: 600; flex: 0 0 auto; }
+.arow-meta {
+  flex: 1 1 auto;
+  min-width: 0;
+  color: var(--muted);
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.arow-tag {
+  flex: none;
+  padding: 1px 9px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  font-size: 11px;
+  font-style: normal;
+  white-space: nowrap;
+}
+/* 三种状态各自一个颜色：绿=在说，黄=今天说满了，灰=关着 */
+.arow-tag.on { color: var(--ok); border-color: #2c4a38; background: #14201a; }
+.arow-tag.full { color: #d8a45a; border-color: #4a3c24; background: #211a12; }
+.arow-tag.off { color: var(--muted); }
+.arow.off .arow-name { color: var(--muted); }
 /* 子库按钮上的数量：切换前就知道每条各有多少个会话 */
 .seg-count {
   display: inline-block;
@@ -1402,6 +1510,32 @@ h3 small { font-weight: 400; font-size: 11px; color: #6c7484; margin-left: 6px; 
   resize: vertical;
 }
 
+/* 列表上方的常驻搜索框。列头弹窗里也有同一个输入框，
+   但那个要点开才看得见——搜索是最常用的动作，不该藏在二级面板里。
+   两处共用 gf 的 state.text.who，改哪边都同步 */
+.list-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.list-head > .hint { flex: 1 1 220px; margin: 0; min-width: 0; }
+.list-search {
+  width: 200px;
+  flex: none;
+  background: #0d1016;
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 4px 8px;
+  font: inherit;
+  font-size: 12px;
+}
+.list-search:focus { outline: none; border-color: var(--accent); }
+/* 投喂记录那一行：和别的 hint 区分开，一眼能认出来 */
+.fed-note { color: #d8a45a; }
+.list-search::-webkit-search-cancel-button { cursor: pointer; }
+
 .fact-list { list-style: none; margin: 6px 0 0; padding: 0; }
 .fact-row {
   display: flex;
@@ -1677,7 +1811,101 @@ h3 small { font-weight: 400; font-size: 11px; color: #6c7484; margin-left: 6px; 
 /* summary 里塞了第三个元素（置顶按钮），让昵称那段吃掉剩余宽度，
    否则长昵称会把按钮挤出可视区 */
 #bondList .session summary span { flex: 1 1 auto; min-width: 0; }
+
+/* 事实卡的标题现在是「昵称（QQ）」+ 一长串状态，名字和右边的置顶按钮
+   都得钉住不压缩，只让中间那段自己缩，否则长昵称会把按钮挤出可视区 */
+#factsList .session summary b { flex: 0 0 auto; }
+#factsList .session summary > span:not(.fact-full) { flex: 1 1 auto; min-width: 0; }
+
+/* 「关系与输出」页里，事实记忆原来排在最前，可这一页叫「关系」。
+   用 order 把关系状态提到第一屏，DOM 顺序不动——搬 HTML 容易碰坏
+   事件绑定，收益不值那个风险 */
+[data-pane="bond"].on {
+  display: flex;
+  flex-direction: column;
+}
+[data-pane="bond"] > .card:nth-child(1) { order: 2; }
+[data-pane="bond"] > .card:nth-child(2) { order: 1; }
+[data-pane="bond"] > .card:nth-child(3) { order: 3; }
 #bondList .session summary b { flex: 0 0 auto; }
+
+/* ── 喂食页：给「吃什么」的引流卡 ──────────────────────────────────── */
+
+/* 三格说明：去哪装 / 装了没数据怎么查 / 加成为什么这么定。
+   放在统计下面、参数上面，既不挡主信息，又能在「这一页怎么空的」时候被看到 */
+.promo { border-color: #2f4a75; }
+.promo-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 10px;
+  margin-top: 10px;
+}
+.promo-item {
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: #12151c;
+}
+.promo-item b { display: block; font-size: 12px; margin-bottom: 4px; }
+.promo-item p { margin: 0; font-size: 12px; color: var(--muted); line-height: 1.65; }
+.promo-item a { color: var(--accent); text-decoration: none; }
+.promo-item a:hover { text-decoration: underline; }
+
+/* ── 喂食页：投喂榜 ────────────────────────────────────────────────── */
+
+/* 一行一个人，不用折叠卡：这里没有可操作的东西，只比次数，
+   摊平比一堆 details 更好扫。 */
+.feed-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 9px 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: #141820;
+  margin-bottom: 6px;
+}
+.feed-rank {
+  flex: 0 0 34px;
+  text-align: center;
+  color: var(--muted);
+  font-size: 13px;
+}
+.feed-row:nth-child(1) .feed-rank,
+.feed-row:nth-child(2) .feed-rank,
+.feed-row:nth-child(3) .feed-rank { font-size: 16px; }
+.feed-who {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.feed-who small { color: var(--muted); font-weight: 400; font-size: 12px; }
+.feed-dish {
+  flex: 0 1 auto;
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--muted);
+  font-size: 12px;
+}
+.feed-count {
+  flex: 0 0 auto;
+  text-align: right;
+  font-size: 12px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+.feed-count b { color: var(--text); font-size: 15px; }
+.feed-count small { display: block; font-size: 11px; }
+
+#feedList { max-height: 460px; }
 
 .bond-pin {
   flex: 0 0 auto;

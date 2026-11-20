@@ -16,6 +16,7 @@ from astrbot.api import logger
 
 from .constants import PLUGIN_VERSION
 from .core.learn_gate import is_private_session, learn_enabled as learn_gate_enabled
+from .core.feed import snapshot as feed_snapshot, today_str as feed_today
 from .core.facts import (
     KIND_LABEL,
     PRUNE_KEEP,
@@ -25,7 +26,7 @@ from .core.facts import (
     TIER_ORDER,
     tier_of as TIER_OF,
 )
-from .core.settings import ACTIVE_PROFILES
+from .core.settings import ACTIVE_PROFILES, GROUP_PROFILES
 from .core.storage import MANUAL_MAX_PER_SESSION, trait_score
 from .core.tone import clean_text, split_segments
 from .utils import display_name
@@ -45,6 +46,8 @@ def register(plugin) -> None:
         (f"/{plugin.plugin_name}/bond", api_bond, ["GET", "POST"], "关系状态"),
         (f"/{plugin.plugin_name}/tone", api_tone, ["POST"], "输出层预览"),
         (f"/{plugin.plugin_name}/facts", api_facts, ["GET", "POST"], "事实记忆"),
+        (f"/{plugin.plugin_name}/feed", api_feed, ["GET"], "喂食与投喂榜"),
+        (f"/{plugin.plugin_name}/active", api_active_groups, ["GET"], "主动回复按群开关"),
     )
     for route, func, methods, desc in routes:
         try:
@@ -224,8 +227,10 @@ async def api_status(plugin):
                 "manual_max": MANUAL_MAX_PER_SESSION,
                 "usage": _safe_usage(plugin),
                 "active_enabled": bool(plugin.settings.get("active_reply_enabled")),
-                # 主动回复的三档预设。前端拿它渲染「一键切换」那排按钮，
-                # 只有服务端这一份定义，避免两边写死两套数值对不上
+                # 各组的一键预设。前端拿它渲染那排按钮，只有服务端这一份定义，
+                # 避免两边写死两套数值对不上。active_profiles 保留是为了兼容
+                # 还缓存着旧 app.js 的浏览器
+                "profiles": GROUP_PROFILES,
                 "active_profiles": ACTIVE_PROFILES,
                 # 概览页要显示「主人是谁 / 学不学私聊」——这两件事影响四个模块，
                 # 却藏在配置里，用户回到面板第一眼就该看见
@@ -836,15 +841,23 @@ async def api_manage(plugin):
             key = str(body.get("key") or "")
             value = await plugin.settings.set_runtime(key, body.get("value"))
             return jsonify({"success": True, "data": {key: value}})
-        if action == "apply_active_profile":
-            # 一键切「安静 / 平衡 / 活跃」。这几个参数是互相咬合的，
-            # 单独改哪个都看不出效果，所以整档一起写
+        if action in ("apply_profile", "apply_active_profile"):
+            # 一键切「安静 / 平衡 / 学得勤」这类整组预设。这几个参数互相咬合，
+            # 单独改哪个都看不出效果，所以整档一起写。老 action 名保留，
+            # 免得缓存了旧页面的浏览器点了没反应
+            group_id = str(body.get("group") or "active")
+            profiles = GROUP_PROFILES.get(group_id) or []
             profile_id = str(body.get("profile") or "")
             preset = next(
-                (p for p in ACTIVE_PROFILES if p["id"] == profile_id), None
+                (p for p in profiles if p["id"] == profile_id), None
             )
             if preset is None:
-                return jsonify({"success": False, "message": f"不认识的预设: {profile_id}"})
+                return jsonify(
+                    {
+                        "success": False,
+                        "message": f"不认识的预设: {group_id}/{profile_id}",
+                    }
+                )
             applied: dict[str, Any] = {}
             for key, value in preset["values"].items():
                 applied[key] = await plugin.settings.set_runtime(key, value)
@@ -1017,6 +1030,8 @@ def _bond_rows(plugin) -> list[dict]:
                 "is_group": is_group,
                 "last_talk_text": store.format_since(info.get("last_talk", 0)),
                 "inject_text": inject_text,
+                # 投喂次数：面板在关系卡片上显示「喂过几次」
+                "fed": feed_snapshot(plugin, sender_id),
                 **info,
             }
         )
@@ -1170,6 +1185,173 @@ async def api_bond(plugin):
         return jsonify({"success": False, "message": str(e)})
 
 
+# ── GET /active ─────────────────────────────────────────────────────────
+
+
+def _active_group_rows(plugin) -> list[dict]:
+    """所有群聊的主动回复开关，给参数页那块「按群控制」用。
+
+    只列群聊：私聊没有「自己插话」这回事，放进来只是噪音。
+
+    会话来源取四个集合的并集——学过东西的、有手动记忆的、有聊天缓冲的、
+    以及**开过主动回复的**。最后这个不能漏：某个群关掉之后别的数据可能
+    被清掉，只留一条 active 状态，不并进来用户就再也找不到它、开不回去。
+    """
+    known = (
+        set(plugin.storage.universal)
+        | set(plugin.storage.manual)
+        | set(plugin.storage.chat_history)
+        | set(plugin.storage.active)
+    )
+    limit = int(plugin.settings.get("active_reply_daily_limit") or 0)
+    # 「今天说了几次」要自己比一下日期：ActiveStore 的按天重置只在读状态时
+    # 内存里做，不写回存储，所以这里直接读原值会拿到前几天的计数
+    today = feed_today()
+    now = time.time()
+    rows: list[dict] = []
+    for sid in known:
+        if ":GroupMessage:" not in sid:
+            continue
+        try:
+            state = plugin.storage.active_of(sid) or {}
+        except Exception:  # noqa: BLE001 - 一条读坏了不该拖垮整块
+            state = {}
+        # 和 ActiveStore._session_enabled 同一套判定：写过就以写的为准，
+        # 没写过回落到 overrides 的 active 键（默认开）
+        if "enabled" in state:
+            enabled = bool(state.get("enabled"))
+        else:
+            try:
+                enabled = bool(plugin.storage.session_override(sid).get("active", True))
+            except Exception:  # noqa: BLE001
+                enabled = True
+        count = int(state.get("today_count") or 0) if state.get("day") == today else 0
+        next_roll_at = float(state.get("next_roll_at") or 0.0)
+        per_user = state.get("per_user")
+        rows.append(
+            {
+                "session_id": sid,
+                "name": display_name(sid),
+                "enabled": enabled,
+                "today": count,
+                "limit": limit,
+                "full": limit > 0 and count >= limit,
+                "last_at": float(state.get("last_at") or 0.0) or None,
+                # 距离下次评估还有多久；没排过队就给 None（面板写「待评估」）
+                "next_roll_in": (
+                    max(0, int(next_roll_at - now)) if next_roll_at > now else None
+                ),
+                # 今天已经被主动搭过话的人数，用来对照「单人日限」
+                "per_user": len(per_user) if isinstance(per_user, dict) else 0,
+                "streak": int(state.get("no_reply_streak") or 0),
+            }
+        )
+    # 开着的排前面，再按今天说了几次。用户想关的通常是那个话最多的群
+    rows.sort(key=lambda r: (0 if r["enabled"] else 1, -r["today"], r["name"]))
+    return rows
+
+
+async def api_active_groups(plugin):
+    """主动回复的按群开关。改开关走 /manage 的 set_active。"""
+    # 读失败就让这一块空着，不要 500——参数页还有几十个别的参数要用
+    try:
+        items = _active_group_rows(plugin)
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"[群聊记忆] 读取主动回复开关失败: {e}")
+        items = []
+    return jsonify(
+        {
+            "success": True,
+            "data": {
+                "enabled": bool(plugin.settings.get("active_reply_enabled")),
+                "per_user_limit": int(
+                    plugin.settings.get("active_reply_per_user_limit") or 0
+                ),
+                "daily_limit": int(plugin.settings.get("active_reply_daily_limit") or 0),
+                "items": items,
+            },
+        }
+    )
+
+
+# ── GET /feed ───────────────────────────────────────────────────────────
+
+
+def _feed_board(plugin) -> dict:
+    """投喂榜：谁喂过、喂了几次、最近一道菜。
+
+    数据直接从 ``bonds.json`` 每条记录的 ``fed`` 字段读——投喂本来就不是独立
+    事件流，没有单独的日志文件，所以这里只能给出「累计 + 最近一次」，
+    给不出历史时间线。要时间线就得单独开个流水，为一个加成功能不值得。
+
+    排序是「次数多的在前，同次数看谁最近喂的」。
+    """
+    today = feed_today()
+    rows: list[dict] = []
+    for key, raw in list(plugin.storage.bonds.items()):
+        if not isinstance(raw, dict):
+            continue
+        sender_id = str(key).strip()
+        if not sender_id or "|" in sender_id:
+            continue
+        fed = raw.get("fed")
+        if not isinstance(fed, dict):
+            continue
+        try:
+            total = int(fed.get("total") or 0)
+        except (TypeError, ValueError):
+            continue
+        if total <= 0:
+            continue
+        used = 0
+        if fed.get("day") == today:
+            try:
+                used = int(fed.get("today") or 0)
+            except (TypeError, ValueError):
+                used = 0
+        rows.append(
+            {
+                "qq": sender_id,
+                "name": str(raw.get("sender_name") or "") or sender_id,
+                "total": total,
+                "today": used,
+                "last_dish": str(fed.get("last_dish") or ""),
+                "last_mode": str(fed.get("last_mode") or ""),
+                "last_at": float(fed.get("last_at") or 0) or 0,
+            }
+        )
+    rows.sort(key=lambda r: (-r["total"], -r["last_at"]))
+    last_at = max((r["last_at"] for r in rows), default=0)
+    return {
+        "items": rows,
+        "stats": {
+            "people": len(rows),
+            "total": sum(r["total"] for r in rows),
+            "today": sum(r["today"] for r in rows),
+            "today_people": sum(1 for r in rows if r["today"] > 0),
+            "last_at": last_at or None,
+        },
+    }
+
+
+async def api_feed(plugin):
+    """喂食页：只读的投喂榜 + 当前配置。改参数走 /manage 的 set_setting。"""
+    board = _feed_board(plugin)
+    cfg = plugin.settings
+    return jsonify(
+        {
+            "success": True,
+            "data": {
+                "enabled": bool(cfg.get("feed_enabled")),
+                "limit": int(cfg.get("feed_daily_limit") or 0),
+                "gain_random": float(cfg.get("feed_gain_random") or 0),
+                "gain_order": float(cfg.get("feed_gain_order") or 0),
+                **board,
+            },
+        }
+    )
+
+
 # ── POST /tone ──────────────────────────────────────────────────────────
 
 
@@ -1298,8 +1480,9 @@ def _fact_buckets(plugin) -> list[dict]:
         # 关系面板那边是「当前场合的亲疏」（群聊封顶在熟悉），这里要的是
         # 「跟他整体多熟」——不然会出现「阶段显示陌生、上限却是老友档」的矛盾。
         stage = ""
+        record: dict = {}
         try:
-            record = plugin.bond.record(sender_id)
+            record = plugin.bond.record(sender_id) or {}
             umo = str(record.get("last_umo") or "")
             bond = plugin.bond.summary(sender_id, is_group=":GroupMessage:" in umo)
             stage = str(plugin.bond.stage_now(sender_id) or "")
@@ -1323,7 +1506,11 @@ def _fact_buckets(plugin) -> list[dict]:
                 "session": umo,
                 "session_label": display_name(umo) if umo else "—",
                 "sender_id": sender_id,
-                "sender_name": str(bond.get("nickname") or ""),
+                # 平台昵称放前面显示用：光看 QQ 号认不出是谁，
+                # 尤其是几十个人的群里翻记忆的时候
+                "sender_name": str(record.get("sender_name") or ""),
+                # 手动设的称呼，和昵称是两回事——昵称会变，称呼是你自己定的
+                "nickname": str(bond.get("nickname") or ""),
                 "is_owner": is_owner,
                 # 人级别的置顶（面板展示顺序用，不进注入）
                 "pinned": plugin.storage.is_fact_pinned(sender_id),

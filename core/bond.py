@@ -579,6 +579,65 @@ class BondStore:
         rec["_keep_ratio"] = round(ratio, 4)
         return rec
 
+    def add_bonus(
+        self, sender_id: str, points: float, *, now: float | None = None
+    ) -> float:
+        """额外加一笔好感（投喂这类主动示好）。返回实际加了多少。
+
+        和 ``touch`` 有三处不同，都是刻意的：
+
+        - **不走 15 分钟冷却**。投喂有自己的每日次数限制（``feed_daily_limit``），
+          再叠一层冷却就变成「一天只能喂一次」，和参数重复了
+        - **不乘指数曲线**。曲线管的是「聊天越熟越难涨」，投喂是一次性的示好，
+          按固定值给更符合直觉
+        - **仍然受每日净增上限约束**。不占这个额度的话，投喂就成了绕过
+          ``daily_gain_cap`` 的后门——一天喂满额度，聊天还能再涨 80 点
+
+        衰减照常结算：先 settle 拿到当前基准，加完再把计时起点挪到现在。
+        """
+        cfg = self._cfg()
+        at = float(now if now is not None else time.time())
+        points = max(0.0, float(points or 0.0))
+        if points <= 0:
+            return 0.0
+
+        key = bond_key(sender_id)
+        raw = self.storage.bond_of(key)
+        record = self.settle(dict(raw) if isinstance(raw, dict) else new_record(at), at)
+        base = _as_float(record.get("decay_base"), 0.0)
+
+        today = _today(at)
+        if _as_int(record.get("gain_today")) and record.get("gain_day") != today:
+            record["gain_today"] = 0
+
+        give = points
+        cap = _as_int(cfg.get("daily_gain_cap"), 0)
+        if cap > 0:
+            used = _as_float(record.get("gain_today"))
+            give = max(0.0, min(give, cap - used))
+        if give <= 0:
+            return 0.0
+
+        base = _clamp(base + give)
+        record["decay_base"] = round(base, 4)
+        record["decay_base_at"] = at
+        record["intimacy"] = round(base, 2)
+        record["last_change"] = at
+        record["gain_day"] = today
+        record["gain_today"] = _as_float(record.get("gain_today")) + give
+        record["stage"] = stage_of(
+            base,
+            parse_thresholds(cfg.get("level_thresholds")),
+            is_group=False,
+            cap_group=False,
+            is_owner=self.is_owner(sender_id),
+        )
+        # settle 会塞两个下划线开头的临时字段（给面板算保留率用的），别落盘
+        record.pop("_decay_days", None)
+        record.pop("_keep_ratio", None)
+        self.storage.set_bond(key, record)
+        return give
+
     # ── 读取 ────────────────────────────────────────────────────────────
 
     def is_owner(self, sender_id: str) -> bool:
@@ -741,10 +800,21 @@ class BondStore:
             scale = _as_float(cfg.get("growth_curve_scale"), 300.0)
             if scale > 0 and base > 0:
                 growth *= 0.5 ** (base / scale)
+            today = _today(at)
+            # 次数闸门：一天最多计几次有效互动。
+            #
+            # 和下面的点数闸门是两件事：点数管「涨多少」，次数管「算几次」。
+            # 默认 60 次 × 旁听 1.25 = 75 点，刚好落在 80 点下面一点，
+            # 所以两个闸门几乎同时到达——想收紧就调次数（用户看得懂），
+            # 想放宽就调点数。
+            hits_cap = _as_int(cfg.get("daily_gain_hits"), 0)
+            if _as_int(record.get("hits_today")) and record.get("hits_day") != today:
+                record["hits_today"] = 0
+            if hits_cap > 0 and _as_int(record.get("hits_today")) >= hits_cap:
+                growth = 0.0
             # 每日净增锁：可选，默认关。10 分钟冷却之后它基本用不上了，
             # 留着是给「把冷却调到 0」的用户当第二道闸
             cap = _as_int(cfg.get("daily_gain_cap"), 0)
-            today = _today(at)
             if _as_int(record.get("gain_today")) and record.get("gain_day") != today:
                 record["gain_today"] = 0
             if cap > 0 and growth > 0:
@@ -755,6 +825,8 @@ class BondStore:
                 record["last_change"] = at
                 record["gain_day"] = today
                 record["gain_today"] = _as_float(record.get("gain_today")) + growth
+                record["hits_day"] = today
+                record["hits_today"] = _as_int(record.get("hits_today")) + 1
                 changed = True
 
         # 只有真的变了才记一轮。「轮」现在的含义是「一次有效交互」，

@@ -307,6 +307,20 @@ class ActiveReply:
         if daily_limit > 0 and int(state.get("today_count") or 0) >= daily_limit:
             return None
 
+        # 10.5 单人日限：别把整个群今天的额度都用在一个人身上。
+        #
+        # 群日限管的是「这个群今天还能不能说话」，它不知道说话对象是谁——
+        # 一个人从早聊到晚，bot 的主动插话可能全落在他身上，别人一次没被搭过。
+        # 这一层是「同一个人一天最多被主动搭话几次」，默认 6 次。
+        #
+        # 取的是这条消息的发送者：主动插话总是由某条消息触发的，
+        # 谁触发就算谁的账。抢不到额度就跳过这次，不消耗群日限。
+        per_limit = self._int_setting("active_reply_per_user_limit")
+        user_id = str(getattr(event, "sender_id", "") or "")
+        if per_limit > 0 and user_id:
+            if int((state.get("per_user") or {}).get(user_id) or 0) >= per_limit:
+                return None
+
         # 11. 冷却。next_roll_at 是「下一次允许评估的时刻」，命中与否都会推进，
         #     所以骰子是每个冷却窗口掷一次，而不是每条消息掷一次——
         #     后者会让群越热闹越容易被插嘴，正好和「别烦人」的目标相反。
@@ -363,6 +377,10 @@ class ActiveReply:
         if hit:
             state["today_count"] = int(state.get("today_count") or 0) + 1
             state["last_at"] = round(now, 1)
+            if user_id:
+                bucket = dict(state.get("per_user") or {})
+                bucket[user_id] = int(bucket.get(user_id) or 0) + 1
+                state["per_user"] = bucket
             # 我说完了：黏性降一截，把「接话」的机会让回给人。
             # 真人也是这个节奏——自己说完一段，会先等别人接
             state["engage"] = round(max(0.0, self._engage_of(state, now) * 0.35), 3)
@@ -604,11 +622,16 @@ class ActiveReply:
             state["day"] = today
             state["today_count"] = 0
             state["judge_buffer"] = 0
+            # 单人计数跟着自然日一起清。存成 {qq: 次数}，
+            # 因为「今天群聊了 20 次」和「今天跟同一个人聊了 20 次」是两件事
+            state["per_user"] = {}
         state["today_count"] = int(state.get("today_count") or 0)
         state["no_reply_streak"] = int(state.get("no_reply_streak") or 0)
         state["judge_buffer"] = int(state.get("judge_buffer") or 0)
         if not isinstance(state.get("recent"), list):
             state["recent"] = []
+        if not isinstance(state.get("per_user"), dict):
+            state["per_user"] = {}
         return state
 
     def _save(self, session_id: str, state: dict) -> None:

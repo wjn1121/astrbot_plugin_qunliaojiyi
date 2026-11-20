@@ -341,6 +341,88 @@ def admin_summary(plugin, session_id: str) -> str:
         return f"Error: 读取本群状态失败（{e}）"
 
 
+def _money(value: float) -> str:
+    """小额别显示成 0.00——一分钱以下的调用在群里是最常见的情况。"""
+    if 0 < value < 0.01:
+        return f"{value:.4f}"
+    return f"{value:.2f}"
+
+
+# 群里查消耗时用的简称，比面板上的全名短，一行能塞下
+_COST_LABELS = {
+    "reply": "被叫",
+    "active": "主动",
+    "bot": "其他",
+    "learn": "学习",
+    "profile": "画像",
+    "judge": "判定",
+}
+
+
+def cost_summary(plugin, session_id: str = "") -> str:
+    """群里的「今日消耗」，一条消息说完。
+
+    和面板同一套口径：先给总数，再按「回复 / 后台」两块拆开。
+    群消息不像网页能滚，所以只列今天真有数据的来源，没发生的不占行。
+    """
+    usage = getattr(plugin, "usage", None)
+    if usage is None:
+        return "消耗统计还没准备好。"
+    try:
+        today = usage.today() or {}
+    except Exception as e:  # noqa: BLE001 - 查不到就说查不到，别抛
+        logger.debug(f"[群聊记忆] 读取消耗失败: {e}")
+        return "读取消耗失败，具体原因看日志。"
+
+    total = float(today.get("cost") or 0.0)
+    calls = int(today.get("calls") or 0)
+    searches = int(today.get("search_calls") or 0)
+    try:
+        by_source = (usage.summary() or {}).get("by_source") or {}
+    except Exception as e:  # noqa: BLE001 - 分来源取不到就只给总数
+        logger.debug(f"[群聊记忆] 读取来源明细失败: {e}")
+        by_source = {}
+
+    head = f"今日消耗 ¥{_money(total)} · {calls} 次调用"
+    if searches:
+        head += f" · {searches} 次搜索"
+    lines = [head]
+
+    for title, keys in (
+        ("💬 回复", ("reply", "active", "bot")),
+        ("🧠 后台", ("learn", "profile", "judge")),
+    ):
+        rows: list[tuple[int, float, str]] = []
+        for key in keys:
+            bucket = by_source.get(key) or {}
+            count = int(bucket.get("calls") or 0)
+            if count <= 0:
+                continue
+            rows.append((count, float(bucket.get("cost") or 0.0), _COST_LABELS[key]))
+        if not rows:
+            continue
+        block_cost = sum(r[1] for r in rows)
+        block_calls = sum(r[0] for r in rows)
+        lines.append(f"{title} {block_calls} 次 · ¥{_money(block_cost)}")
+        for count, cost, label in rows:
+            avg = f" · 平均 ¥{_money(cost / count)}/次" if count > 1 else ""
+            lines.append(f"　{label} {count} 次 · ¥{_money(cost)}{avg}")
+
+    # 本群金额按 token 反算，和 /风格状态 里那一行同口径
+    if session_id:
+        try:
+            session = (today.get("by_session") or {}).get(session_id) or {}
+            own = float(usage.cost_of({"tokens": session}) or 0.0) if session else 0.0
+        except Exception:  # noqa: BLE001
+            own = 0.0
+        if own > 0:
+            lines.append(f"本群 ¥{_money(own)}")
+
+    if not by_source:
+        lines.append("（这份记录来自分来源统计上线之前，明细还没有）")
+    return "\n".join(lines)
+
+
 def _style_lines(plugin, session_id: str) -> list[str]:
     settings = plugin.settings
     injector = getattr(getattr(plugin, "manager", None), "injector", None)

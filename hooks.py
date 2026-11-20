@@ -18,6 +18,7 @@ from astrbot.api.event import AstrMessageEvent
 from astrbot.api.message_components import Plain
 
 from .core.admin import build_admin_tool
+from .core.feed import FEED_EXTRA_KEY, build_note, settle as settle_feed
 from .core.injector import Injector, override_roll
 from .core.learn_gate import learn_enabled
 from .core.search import BUILTIN_SEARCH_TOOL_NAMES, build_search_tool
@@ -256,6 +257,56 @@ def looks_like_correction(text: str) -> bool:
     return any(hint in body for hint in CORRECTION_HINTS)
 
 
+# ── 刷屏检测 ────────────────────────────────────────────────────────────
+
+# 每个 (会话, 发送者) 最近几条消息的时间戳。只在内存里，不落盘：
+# 重启后重新计数可接受——这个检测防的是「短时间内刷量」，
+# 而重启本身就会中断刷屏。
+_FLOOD_BUCKETS: dict[str, list[float]] = {}
+# 从没清理过的 key 会一直堆着，攒到这么多就顺手清一遍过期的
+_FLOOD_SWEEP_AT = 500
+
+FLOOD_EXTRA_KEY = "_qunliao_flooding"
+
+
+def is_flooding(plugin, event: AstrMessageEvent) -> bool:
+    """这条消息算不算刷屏。第一次调用时判定并记进 event，后面直接复用。
+
+    为什么用 event 存：采集（on_message）和关系推进（after_message_sent）
+    是两次不同的钩子，必须口径一致——采集时判了刷屏，涨好感时也得跳过，
+    否则「刷屏不进学习库、但还是把关系刷上去了」。
+    """
+    cached = event.get_extra(FLOOD_EXTRA_KEY)
+    if cached is not None:
+        return bool(cached)
+
+    session_id = str(getattr(event, "unified_msg_origin", "") or "")
+    sender_id = str(event.get_sender_id() or "")
+    window = int(plugin.settings.get("flood_window_seconds") or 0)
+    limit = int(plugin.settings.get("flood_max_messages") or 0)
+    result = False
+    if window > 0 and limit > 0 and session_id and sender_id:
+        key = f"{session_id}|{sender_id}"
+        now = time.time()
+        cutoff = now - window
+        bucket = [t for t in _FLOOD_BUCKETS.get(key, []) if t >= cutoff]
+        if len(bucket) >= limit:
+            result = True
+        else:
+            bucket.append(now)
+        _FLOOD_BUCKETS[key] = bucket
+        if len(_FLOOD_BUCKETS) > _FLOOD_SWEEP_AT:
+            for k in [k for k, v in _FLOOD_BUCKETS.items() if not v or v[-1] < cutoff]:
+                _FLOOD_BUCKETS.pop(k, None)
+        if result:
+            logger.info(
+                f"[群聊记忆] 刷屏检测 · {session_id} · {sender_id} "
+                f"{window}s 内超过 {limit} 条，这条不计入学习和关系"
+            )
+    event.set_extra(FLOOD_EXTRA_KEY, result)
+    return result
+
+
 # ── 消息收集 ────────────────────────────────────────────────────────────
 
 
@@ -272,6 +323,15 @@ async def collect_message(plugin, event: AstrMessageEvent) -> None:
 
     content = (event.get_message_str() or "").strip()
     if not content or content.startswith("/"):
+        return
+
+    # 刷屏检测：超出的消息不进待学习缓冲。
+    #
+    # 防的不是「说得多的正常人」（一分钟 15 条已经算话痨），
+    # 而是「靠刷量把学习提前触发」——一次提炼约 0.01 元，
+    # 刷 600 条能触发 20 次，等于一个正常群一周的开销。
+    # 这些消息仍留在 AstrBot 自己的对话上下文里，只是不进学习材料。
+    if is_flooding(plugin, event):
         return
 
     plugin.storage.add_message(
@@ -335,6 +395,12 @@ async def touch_relation(plugin, event: AstrMessageEvent) -> None:
         session_id = event.unified_msg_origin
         sender_id = event.get_sender_id()
         if not session_allowed(plugin, session_id, sender_id):
+            return
+
+        # 刷屏的人不涨好感。口径和采集那边一致（同一个 extra），
+        # 见 is_flooding 的注释：刷屏既不进学习库，也不推进关系，
+        # 否则「刷 600 条」仍然能把关系刷上去，只是慢一点
+        if is_flooding(plugin, event):
             return
 
         # 判不出私聊就按群聊算：群聊的增量更保守，判错时不会把关系推得太快
@@ -775,14 +841,84 @@ async def apply_tone(plugin, event: AstrMessageEvent) -> None:
 
 
 async def record_llm_usage(plugin, event: AstrMessageEvent, response) -> None:
-    """记一次全机消耗。多轮工具调用中间的请求会漏计，所以这是下限值。"""
+    """记一次全机消耗，并按「谁引起的」分来源。
+
+    分三种，因为这三笔钱的归属完全不同：
+
+    - ``active``：插件自己插话，可以整块关掉，是唯一「不关也有人花钱」的来源；
+    - ``reply``：被 @、被回复、私聊——有人点名要它说话；
+    - ``bot``：其余回调（例如把群聊配成全部回复），算不清就落在这里。
+
+    多轮工具调用中间的请求会漏计，所以每个来源都是下限值。
+    """
     try:
         usage = getattr(response, "usage", None)
         if usage is None:
             return
-        plugin.usage.record("bot", usage, event.unified_msg_origin)
+        if is_active_turn(event):
+            source = "active"
+        elif is_direct_to_bot(event) or not _is_group(event):
+            source = "reply"
+        else:
+            source = "bot"
+        plugin.usage.record(source, usage, event.unified_msg_origin)
     except Exception as e:  # noqa: BLE001 - 记账失败不能影响回复
         logger.debug(f"[群聊记忆] 记录全机消耗失败（可忽略）: {e}")
+
+
+async def apply_feed_note(plugin, event: AstrMessageEvent) -> None:
+    """把「好感 +N」拼进「吃什么」那条**还没发出去**的回复里。
+
+    为什么非得在这一步：``after_message_sent`` 触发时消息已经出去了，
+    再想改内容只能补发第二条——那就变成两条回复，用户明确说过要一条。
+    decorating 阶段拿到的还是链里的结果，往最后一个文本组件末尾拼一句，
+    看到的就是和菜名、图片同一条消息。
+
+    结算也在这里做（同一份逻辑，带 event 级去重标记），所以回复里写的
+    数字一定就是实际加进去的数字；``after_message_sent`` 那边再调会因为
+    标记直接跳过，不会记两遍。
+
+    加不上就什么都不做：比分错一次账，一条回复难看是更小的事。
+    """
+    # 先把「这条消息是不是投喂」问清楚：是投喂又没加成，才值得记一行日志。
+    # 不先问的话，所有消息都会走到 settle 里被静默拒绝，出问题时看不出卡在哪
+    try:
+        payload = event.get_extra(FEED_EXTRA_KEY)
+    except Exception:  # noqa: BLE001
+        payload = None
+    if not isinstance(payload, dict):
+        return
+    try:
+        result = event.get_result()
+        raw = getattr(result, "chain", None) if result is not None else None
+        if not raw:
+            logger.info("[群聊记忆] 投喂提示：这条消息没有结果链，跳过")
+            return
+        info = settle_feed(plugin, event)
+        if not info:
+            logger.info(
+                "[群聊记忆] 投喂提示：这次没加成分（已结算过 / 加成设成 0 / 没开喂食）"
+            )
+            return
+        note = build_note(info.get("gain"), info.get("reason") or "")
+        if not note:
+            return
+        # 重建一份再赋值，而不是原地改组件：result.chain 有可能是 getter
+        # 返回的浅拷贝，改了不写回去等于没改
+        chain = list(raw)
+        for index in range(len(chain) - 1, -1, -1):
+            body = getattr(chain[index], "text", None)
+            if isinstance(body, str) and body.strip():
+                chain[index] = Plain(body.rstrip() + note)
+                result.chain = chain
+                logger.info(f"[群聊记忆] 投喂提示已拼进回复 · {note}")
+                return
+        # 整条链里没有文字（纯图片），只能补一个组件
+        chain.append(Plain(note))
+        result.chain = chain
+        logger.info(f"[群聊记忆] 投喂提示单独成段 · {note}")
+    except Exception as e:  # noqa: BLE001 - 提示加不上不能影响这条回复
+        logger.warning(f"[群聊记忆] 追加好感提示失败: {e}")
 
 
 def _cut_at_sentence_end(text: str, keep: int) -> str:

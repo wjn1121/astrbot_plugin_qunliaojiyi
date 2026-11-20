@@ -108,7 +108,7 @@ DEFAULTS: dict[str, Any] = {
     "fact_deep_days": 30,
     "fact_core_days": 60,
     # ── 个人画像（按 QQ 号）─────────────────────────────────────────────
-    # 从事实里提炼「这个人是谁」，按好感档位给字数（陌生 60 → 老友 180，主人 260）。
+    # 从事实里提炼「这个人是谁」，按好感档位给字数（陌生 120 → 老友 420，主人 800）。
     # 默认开：不待见档直接不生成，陌生人只有 60 字，成本可控；
     # 关掉等于回到「只有事实、没有画像」。
     "profile_enabled": True,
@@ -119,6 +119,31 @@ DEFAULTS: dict[str, Any] = {
     # 每天最多重写几个人的画像。一次学习可能同时触发好几个人，
     # 这个上限把「一天最坏开销」钉死
     "profile_daily_cap": 6,
+    # ── 喂食（和「吃什么」插件联动）─────────────────────────────────────
+    # 群友用「吃什么」插件点菜/查菜时，那个插件会把菜名塞进 event 的 extra，
+    # 本插件在 after_message_sent 里读到就记一次投喂，给这个人加点好感。
+    #
+    # 需要「吃什么」插件配合（它 set_extra，这边 get_extra）。没装就完全空转，
+    # 不会有任何报错——extra 就是个没人读的字典项。
+    "feed_enabled": True,
+    # 随机推荐一道菜（「吃什么」）加多少。默认 2：一次直接对话是 3.1，
+    # 随手问一句不该比认真聊天更值钱
+    "feed_gain_random": 2.0,
+    # 明确点菜（「点菜KFC」「我要吃红烧肉」）加多少。默认 5：有明确意图，
+    # 比随机推荐重，但仍然低于"聊了三轮"的量
+    "feed_gain_order": 5.0,
+    # 每人每天最多计几次有效投喂。默认 1：这个功能是「日常小互动」，
+    # 一天记一次就够，多了会盖过正常聊天的权重
+    "feed_daily_limit": 2,
+    # ── 刷屏检测 ────────────────────────────────────────────────────────
+    # 同一个人在一个窗口里发太多条，超出的部分不计入「待学习」缓冲，
+    # 也不推进关系。防的是「靠刷量把学习提前触发」——一次提炼约 0.01 元，
+    # 刷 600 条能触发 20 次，等于一个正常群一周的开销。
+    #
+    # 正常聊天一分钟说十几句已经算话痨，所以 15 条对正常人完全无感。
+    # flood_window_seconds 设 0 关闭检测
+    "flood_window_seconds": 60,
+    "flood_max_messages": 15,
     # ── 风格强度与人格让位 ──────────────────────────────────────────────
     # 0 = 完全不注入风格（纯人格）；100 = 全力体现。分档见 injector.scale_quota
     "style_strength": 100,
@@ -142,6 +167,10 @@ DEFAULTS: dict[str, Any] = {
     "active_reply_chance": 0.15,
     "active_reply_cooldown_seconds": 1800,
     "active_reply_daily_limit": 8,
+    # 单人每日上限：同一个人一天最多被 bot 主动搭话几次。
+    # 群日限管「这个群今天还能说几次」，这个管「别在一个人身上用完」。
+    # 默认 6：一天被主动搭话 6 次已经算密切，再多就烦人
+    "active_reply_per_user_limit": 6,
     "active_reply_quiet_hours": "01:00-08:00",
     "active_reply_min_messages": 3,
     "active_reply_judge_stack": 8,
@@ -261,6 +290,10 @@ GROUP_DEFAULTS: dict[str, dict[str, Any]] = {
         # 防止有人连聊一整天把关系一次刷到老友。
         # 80 点 ≈ 一天最密集也只能从 0 到「熟悉」的四成
         "daily_gain_cap": 80,
+        # 每天最多计几次互动（次数闸门，和上面的点数闸门并存，谁先到算谁）。
+        # 默认 60：旁听 1.25 × 60 = 75 点，刚好卡在 80 点下面一点，
+        # 两个闸门几乎同时到达。设 0 = 不限次数（只受点数约束）
+        "daily_gain_hits": 60,
         # 按好感档位分配记忆量：越熟注入越多，陌生人只给一点点
         "tiered_memory": True,
     },
@@ -279,11 +312,11 @@ GROUP_DEFAULTS: dict[str, dict[str, Any]] = {
         "activate_count": 1,
         # 每人保留条数上限，超出按分数淘汰（标 rejected 留档，不删）。
         # 这是「陌生」档的基准，实际按好感档位缩放（主人 ×15 = 300）
-        "max_per_user": 20,
+        "max_per_user": 30,
         # 主人单独清理时保留几条。上限 300 → 清到 150，正好砍一半边角料，
         # 又不至于把聊了半年的记忆清空（一天记 1~2 条的话，150 条约等于 3~5 个月）。
         # 「一键清理」仍然完全跳过主人，这个值只给「单独清理主人」用
-        "owner_prune_keep": 150,
+        "owner_prune_keep": 225,
         # 每轮注入几条、总共多少字
         "max_inject": 3,
         "inject_max_chars": 200,
@@ -394,6 +427,160 @@ ACTIVE_PROFILES: list[dict[str, Any]] = [
     },
 ]
 
+# ── 另外三组的预设 ────────────────────────────────────────────────────
+#
+# 主动回复那五档调的是「bot 多话」，这三组各自只有一个维度：学得多勤、
+# 风格压不压人格、记多久。所以只给三到四档，再多就选不过来了。
+#
+# 一组预设只写它真正咬合的几个键。像 max_stable_traits（存储上限）这种
+# 「改大只是多留档案、不多花每轮的钱」的参数不塞进预设——放进去会让人
+# 以为换个档就能省钱。
+
+LEARN_PROFILES: list[dict[str, Any]] = [
+    {
+        "id": "lean",
+        "label": "🐢 极省",
+        "desc": "一天最多学一次，攒够 60 条才学。大群里只想有个大概印象时用",
+        "values": {
+            "analysis_interval_seconds": 86400,
+            "min_history_for_analysis": 60,
+            "max_messages_per_learn": 40,
+            "max_stable_inject": 2,
+            "max_manual_inject": 1,
+        },
+    },
+    {
+        "id": "balanced",
+        "label": "⚖️ 平衡",
+        "desc": "6 小时学一次，每轮注入 5 条风格 + 3 条手动。默认值",
+        "values": {
+            "analysis_interval_seconds": 21600,
+            "min_history_for_analysis": 30,
+            "max_messages_per_learn": 80,
+            "max_stable_inject": 5,
+            "max_manual_inject": 3,
+        },
+    },
+    {
+        "id": "diligent",
+        "label": "📚 学得勤",
+        "desc": "2 小时学一次，每轮注入 8 条风格。学得快，学习开销约是默认的三倍",
+        "values": {
+            "analysis_interval_seconds": 7200,
+            "min_history_for_analysis": 20,
+            "max_messages_per_learn": 120,
+            "max_stable_inject": 8,
+            "max_manual_inject": 5,
+        },
+    },
+]
+
+STYLE_PROFILES: list[dict[str, Any]] = [
+    {
+        "id": "persona_only",
+        "label": "🧊 只留人格",
+        "desc": "完全不注入学到的风格，每轮少几十到一百多字。最省钱，也不像群里的人",
+        "values": {
+            "style_strength": 0,
+            "active_style_strength": 0,
+            "style_override_threshold": 100,
+        },
+    },
+    {
+        "id": "persona_first",
+        "label": "🎭 人格优先",
+        "desc": "默认：风格只当参考，人格说了算",
+        "values": {
+            "style_strength": 100,
+            "active_style_strength": 60,
+            "style_override_threshold": 100,
+        },
+    },
+    {
+        "id": "style_first",
+        "label": "🌊 风格优先",
+        "desc": "约八成回复按群里的说话方式走，人格退到后面",
+        "values": {
+            "style_strength": 80,
+            "active_style_strength": 60,
+            "style_override_threshold": 60,
+        },
+    },
+    {
+        "id": "follow_group",
+        "label": "🔥 完全跟随",
+        "desc": "每轮都按群的说话方式，人格基本不起作用",
+        "values": {
+            "style_strength": 100,
+            "active_style_strength": 100,
+            "style_override_threshold": 0,
+        },
+    },
+]
+
+FACTS_PROFILES: list[dict[str, Any]] = [
+    {
+        "id": "light",
+        "label": "🍃 轻记",
+        "desc": "浅层 7 天就归档、核心 30 天降档。人多的大群，别记太厚",
+        "values": {
+            "fact_shallow_days": 7,
+            "fact_deep_days": 14,
+            "fact_core_days": 30,
+            "profile_enabled": True,
+            "profile_rewrite_hours": 48,
+            "profile_daily_cap": 3,
+        },
+    },
+    {
+        "id": "balanced",
+        "label": "⚖️ 平衡",
+        "desc": "默认：15 / 30 / 60 天，画像一天重写一次、最多 6 人",
+        "values": {
+            "fact_shallow_days": 15,
+            "fact_deep_days": 30,
+            "fact_core_days": 60,
+            "profile_enabled": True,
+            "profile_rewrite_hours": 24,
+            "profile_daily_cap": 6,
+        },
+    },
+    {
+        "id": "deep",
+        "label": "🐘 记得久",
+        "desc": "30 / 90 / 180 天。熟人小群用，核心记忆能压很久",
+        "values": {
+            "fact_shallow_days": 30,
+            "fact_deep_days": 90,
+            "fact_core_days": 180,
+            "profile_enabled": True,
+            "profile_rewrite_hours": 12,
+            "profile_daily_cap": 10,
+        },
+    },
+    {
+        "id": "no_profile",
+        "label": "🚫 只记不画像",
+        "desc": "事实照记，但不生成也不注入个人画像，每轮省几十到两百多字",
+        "values": {
+            "fact_shallow_days": 15,
+            "fact_deep_days": 30,
+            "fact_core_days": 60,
+            "profile_enabled": False,
+            "profile_rewrite_hours": 24,
+            "profile_daily_cap": 0,
+        },
+    },
+]
+
+# 组 id → 预设列表。前端只认这一份，不在 JS 里写死数值
+GROUP_PROFILES: dict[str, list[dict[str, Any]]] = {
+    "active": ACTIVE_PROFILES,
+    "learn": LEARN_PROFILES,
+    "style": STYLE_PROFILES,
+    "facts": FACTS_PROFILES,
+}
+
 # 允许在面板热调、且会写进 runtime.json 的字段。
 RUNTIME_KEYS = {
     "enabled",
@@ -407,6 +594,13 @@ RUNTIME_KEYS = {
     "profile_min_facts",
     "profile_rewrite_hours",
     "profile_daily_cap",
+    # 喂食与刷屏检测
+    "feed_enabled",
+    "feed_gain_random",
+    "feed_gain_order",
+    "feed_daily_limit",
+    "flood_window_seconds",
+    "flood_max_messages",
     # 全局主人 + 学习库分开关：面板改完即时生效，不用重启
     "owner_ids",
     "learn_group_enabled",
@@ -455,6 +649,7 @@ RUNTIME_KEYS = {
     "active_reply_chance",
     "active_reply_cooldown_seconds",
     "active_reply_daily_limit",
+    "active_reply_per_user_limit",
     "active_reply_quiet_hours",
     "active_reply_min_messages",
     "active_reply_judge_stack",

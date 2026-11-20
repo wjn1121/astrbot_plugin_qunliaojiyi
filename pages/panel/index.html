@@ -18,9 +18,11 @@
         <button type="button" class="nav-item on" data-tab="overview" title="运行状态、主人是谁、累计花了多少">📊 <span>概览</span></button>
         <button type="button" class="nav-item" data-tab="library" title="按群 / 私聊看学到了什么，可批准、否决、钉住、删除">📚 <span>学习库</span><b class="nav-badge" id="navPending" hidden>0</b></button>
         <button type="button" class="nav-item" data-tab="bond" title="好感档位、事实记忆与画像、输出层调试">🎭 <span>关系与输出</span></button>
+        <button type="button" class="nav-item" data-tab="feed" title="群友用「吃什么」点菜时自动加好感，这里看投喂榜和调加成">🍚 <span>喂食</span></button>
+        <button type="button" class="nav-item" data-tab="active" title="bot 自己找时机接话。按群开关、调多久说一次、看今天说了几次">🗣 <span>主动回复</span></button>
         <button type="button" class="nav-item" data-tab="persona" title="每个群一份 markdown：自动段随学习更新，人工段永远归你">🧬 <span>人格档案</span></button>
-        <button type="button" class="nav-item" data-tab="preview" title="输入一句话，看这一轮实际会往 prompt 里塞什么（不改任何数据）">🔍 <span>注入预览</span></button>
         <button type="button" class="nav-item" data-tab="sessions" title="每个会话的原始特征明细，可逐条编辑、删除、单独开关">💬 <span>会话与特征</span></button>
+        <button type="button" class="nav-item" data-tab="preview" title="输入一句话，看这一轮实际会往 prompt 里塞什么（不改任何数据）">🔍 <span>注入预览</span></button>
         <button type="button" class="nav-item" data-tab="usage" title="今天花了多少、花在哪、近 7 天趋势">💸 <span>Token 消费</span></button>
         <button type="button" class="nav-item" data-tab="settings" title="所有可热调的开关，改完下一轮就生效，不用重启">⚙️ <span>参数</span></button>
       </nav>
@@ -141,8 +143,9 @@
             <small>按北京时间自然日，只计本插件发起的请求</small>
           </h2>
           <div id="usageTop" class="usage-top"></div>
+          <div id="usageSource" class="usage-breakdown"></div>
           <div id="usageTokens" class="grid"></div>
-          <p class="hint usage-note">金额按 DeepSeek 牌价估算，节假日会略微高估；全机消耗是下限值（多轮工具调用中间请求会漏计）。</p>
+          <p class="hint usage-note">金额按 DeepSeek 牌价估算，节假日会略微高估；全机消耗是下限值（多轮工具调用中间请求会漏计）。「被叫回复」是从这一版起才分开记的，更早的消耗都算在「其他回复」里。</p>
         </section>
 
         <section class="card">
@@ -177,6 +180,7 @@
             <input id="settingSearch" type="search" placeholder="搜参数名 / key / 说明" />
             <span class="hint" id="settingFilterNote"></span>
           </div>
+          <p class="hint">喂食参数在左侧「🍚 喂食」页；主动回复的档位、按群开关和全部参数在「🗣 主动回复」页。</p>
           <div id="settings" class="settings"></div>
           <p class="hint err" id="settingsMsg"></p>
         </section>
@@ -190,7 +194,11 @@
               <button id="factsRefresh" class="ghost" title="重新拉一遍事实与画像数据">刷新</button>
             </span>
           </h2>
-          <p class="hint" id="factsNote"></p>
+          <div class="list-head">
+            <p class="hint" id="factsNote"></p>
+            <input id="factSearch" class="list-search" type="search" autocomplete="off"
+                   placeholder="搜 QQ 号 / 昵称 / 记忆内容" title="输入 QQ 号、昵称或记忆里的字，即时过滤；和「对象」列头共用同一个条件" />
+          </div>
           <div id="factStats" class="grid"></div>
           <div class="gf-bar" id="factFilterBar">
             <button class="gf-head" data-col="who" type="button">
@@ -232,7 +240,11 @@
               <button id="bondRefresh" class="ghost" title="重新拉一遍好感与关系数据">刷新</button>
             </span>
           </h2>
-          <p class="hint" id="bondNote"></p>
+          <div class="list-head">
+            <p class="hint" id="bondNote"></p>
+            <input id="bondSearch" class="list-search" type="search" autocomplete="off"
+                   placeholder="搜 QQ 号 / 昵称 / 群号" title="输入 QQ 号、昵称或群号，即时过滤；和「对象」列头共用同一个条件" />
+          </div>
           <div id="bondStats" class="grid"></div>
           <div class="gf-bar" id="bondFilterBar">
             <button class="gf-head" data-col="who" type="button">
@@ -275,6 +287,118 @@
           <div id="toneOut" class="tone-out"></div>
         </section>
 
+      </section>
+
+      <section class="pane" data-pane="feed">
+        <section class="card">
+          <h2 class="card-title">
+            <span>🍚 今日投喂 <small>群友用「吃什么」点菜时自动记一次，加多少好感在这里调</small></span>
+            <span class="title-actions">
+              <button id="feedRefresh" class="ghost" title="重新拉一遍投喂数据">刷新</button>
+            </span>
+          </h2>
+          <div id="feedStats" class="grid"></div>
+          <p class="hint" id="feedNote"></p>
+        </section>
+
+        <section class="card promo">
+          <h2 class="card-title">
+            <span>🍽️ 这一页靠「吃什么」供货</span>
+            <small>没装那个插件，这里会一直是空的</small>
+          </h2>
+          <p class="hint">
+            群友发「吃什么」，那个插件随机推荐一道菜；发「点菜 红烧肉」，它按名字出菜。
+            出菜的同时它会往这边递一条记录，这边才加好感、才上投喂榜——两个插件装在同一台机器人上就自动通了，不用配置。
+          </p>
+          <div class="promo-grid">
+            <div class="promo-item">
+              <b>📦 还没装</b>
+              <p>插件市场搜「吃什么」，或者
+                <a href="https://github.com/wjn1121/astrbot_plugin_chishenme" target="_blank" rel="noopener noreferrer">去 GitHub 看看</a>。</p>
+            </div>
+            <div class="promo-item">
+              <b>🤔 装了但这里是空的</b>
+              <p>确认那个插件的「点菜」开关是开的，两个插件用的是同一个机器人账号。第一次投喂要等它真的出一次菜。</p>
+            </div>
+            <div class="promo-item">
+              <b>💡 为什么点菜加得多</b>
+              <p>随机推荐是随手一问，点菜是明确说了要吃什么。加成高一点，群友才愿意多说那一句。</p>
+            </div>
+          </div>
+        </section>
+
+        <section class="card">
+          <h2 class="card-title">
+            <span>⚙️ 喂食参数</span>
+            <small>改动即时生效，下一顿就按新值算</small>
+          </h2>
+          <div id="feedSettings" class="settings"></div>
+          <p class="hint err" id="feedMsg"></p>
+        </section>
+
+        <section class="card">
+          <h2 class="card-title">
+            <span>🏅 投喂榜</span>
+            <small>累计次数最多的排前面</small>
+          </h2>
+          <div class="list-head">
+            <p class="hint" id="feedListNote"></p>
+            <input id="feedSearch" class="list-search" type="search" autocomplete="off"
+                   placeholder="搜 QQ 号 / 昵称" />
+          </div>
+          <div id="feedList" class="scroll-box"></div>
+        </section>
+      </section>
+
+      <section class="pane" data-pane="active">
+        <section class="card">
+          <h2 class="card-title">
+            <span>🗣 今日主动回复 <small>bot 自己找时机接的话，这是唯一会凭空产生请求的功能</small></span>
+            <span class="title-actions">
+              <button id="activeRefresh" class="ghost" title="重新拉一遍各群的开关和计数">刷新</button>
+            </span>
+          </h2>
+          <div id="activeStats" class="grid"></div>
+          <p class="hint" id="activeNote"></p>
+        </section>
+
+        <section class="card">
+          <h2 class="card-title">
+            <span>按群控制</span>
+            <small>关掉的群只在被 @ 或回复时说话，不会自己插话</small>
+          </h2>
+          <div class="list-head">
+            <p class="hint" id="activeListNote"></p>
+            <input id="activeSearch" class="list-search" type="search" autocomplete="off"
+                   placeholder="搜群号 / 群名" title="输入群号或群名即时过滤；和「群」列头共用同一个条件" />
+          </div>
+          <div class="gf-bar" id="activeFilterBar">
+            <button class="gf-head" data-col="who" type="button">
+              群<span class="gf-caret"></span>
+            </button>
+            <button class="gf-head" data-col="state" type="button">
+              状态<span class="gf-caret"></span>
+            </button>
+            <button class="gf-head" data-col="today" type="button">
+              今日<span class="gf-caret"></span>
+            </button>
+            <button class="gf-head" data-col="idle" type="button">
+              最近<span class="gf-caret"></span>
+            </button>
+            <button class="ghost tiny" data-gf-reset type="button" title="清空这一栏的所有筛选和排序，回到默认">重置</button>
+            <span class="hint" id="activeFilterNote"></span>
+            <div class="gf-pop" id="activeFilterPop" hidden></div>
+          </div>
+          <div id="activeList" class="scroll-box"></div>
+        </section>
+
+        <section class="card">
+          <h2 class="card-title">
+            <span>⚙️ 参数 <small>先选一档，再按需微调；改完下一轮就生效</small></span>
+          </h2>
+          <div id="activeSettings" class="settings"></div>
+          <p class="hint err" id="activeMsg"></p>
+        </section>
       </section>
 
       <section class="pane" data-pane="preview">

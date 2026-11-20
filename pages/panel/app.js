@@ -169,8 +169,16 @@ const TAB_TEXT = {
   settings: "参数",
   preview: "注入预览",
   bond: "关系与输出",
+  feed: "喂食",
+  active: "主动回复",
   sessions: "会话与特征",
 };
+
+// 当前停在哪一页。只在「刷新后要不要补拉这一页的数据」时用
+function currentPane() {
+  const el = document.querySelector(".pane.on");
+  return el ? el.dataset.pane : "";
+}
 
 function switchTab(tab) {
   if (!TAB_TEXT[tab]) tab = "overview";
@@ -188,6 +196,10 @@ function switchTab(tab) {
     syncToneSwitches();
     loadFacts();
   }
+  // 投喂榜每次切过来都重拉：群里可能刚有人点过菜
+  if (tab === "feed") loadFeed();
+  // 主动回复的计数一直在变，切过来就重拉一次
+  if (tab === "active") loadActive();
   try {
     // 在 iframe 里，sessionStorage 可能被宿主的沙箱限制，失败就当没记住
     localStorage.setItem(TAB_KEY, tab);
@@ -240,6 +252,9 @@ async function load() {
     renderOwnerCard(data);
     renderUsage(data);
     renderSettings(data.settings || {});
+    // 喂食和主动回复各自一页，参数区也要跟着这份配置重画
+    renderFeedSettings(data.settings || {});
+    renderPaneSettings("active", "activeSettings", data.settings || {});
     renderSessions(data.sessions || []);
     fillPreviewSessions(data);
     renderPager(data);
@@ -249,6 +264,9 @@ async function load() {
     // 输出层调试的开关要用当前配置当初始值；直接停在关系页时
     // switchTab 早于这里执行，那一次拿不到配置，靠这次补上
     syncToneSwitches();
+    // 停在喂食 / 主动回复页时，保存参数引发的重载要顺带把上面的统计也刷新
+    if (currentPane() === "feed") await loadFeed();
+    if (currentPane() === "active") await loadActive();
   } catch (err) {
     console.error("加载状态失败:", err);
     showToast("加载失败，请查看日志");
@@ -497,7 +515,17 @@ function renderTraits(groups) {
         g.traits.length > 0 ||
         // 搜群号命中的组即使条目被状态筛空也要留着，否则用户会以为这个群没数据
         (g.bySession && !statuses.length && !flags.length),
-    );
+    )
+    // 群之间也要有顺序。后端给的是「第一次学习的先后」，新群永远沉在最后，
+    // 打开面板根本注意不到。改成：置顶 → 有待审的 → 条目多的。
+    // 这三档正好对应「我要找它」「我要处理它」「它内容最多」三种动机
+    .sort((a, b) => {
+      if (!!a.pinned !== !!b.pinned) return a.pinned ? -1 : 1;
+      const pendingA = Number((a.counts || {}).pending || 0);
+      const pendingB = Number((b.counts || {}).pending || 0);
+      if (pendingA !== pendingB) return pendingB - pendingA;
+      return Number(b.total || 0) - Number(a.total || 0);
+    });
 
   // 「全部批准」只在真有待审条目时出现。注意要看**过滤后**的：
   // 筛了「已生效」还挂着「全部批准」，点了会批准一批看不见的东西
@@ -788,18 +816,25 @@ function renderOwnerCard(data) {
 
 function renderStats(stats, manager) {
   const metrics = stats.metrics || {};
+  // 第三个元素是悬停提示（面板里那种白底小字）。数字为什么是这个值，
+  // 光看标签猜不出来，所以每个都写一句
   const items = [
-    ["会话数", stats.sessions ?? 0],
-    ["风格特征", stats.traits ?? 0],
-    ["学习 / 手动", `${stats.learned_traits ?? 0} / ${stats.manual_traits ?? 0}`],
-    ["稳定 / 场景", `${stats.stable ?? 0} / ${stats.situational ?? 0}`],
-    ["待学习消息", stats.pending_messages ?? 0],
-    ["学习间隔", fmtDuration(manager.interval)],
-    ["下次学习", manager.running ? fmtDuration(manager.next_run_in) : "已停止"],
-    ["状态", manager.running ? "运行中" : "已停止"],
+    ["会话数", stats.sessions ?? 0, "本插件见过的群和私聊总数，去「会话与特征」看明细"],
+    ["风格特征", stats.traits ?? 0, "学习库里的条目总数，含待审和已否决的"],
+    ["学习 / 手动", `${stats.learned_traits ?? 0} / ${stats.manual_traits ?? 0}`, "自动学到的条数 / 你自己手动加的条数"],
+    ["稳定 / 场景", `${stats.stable ?? 0} / ${stats.situational ?? 0}`, "稳定风格跨场景都用，场景化表达只在语境匹配时注入"],
+    ["待学习消息", stats.pending_messages ?? 0, "已经收下、还没送去提炼的消息数。攒够门槛才学"],
+    ["学习间隔", fmtDuration(manager.interval), "两次自动学习之间至少隔这么久，这是成本的主要控制点"],
+    ["下次学习", manager.running ? fmtDuration(manager.next_run_in) : "已停止", "距离下一次自动学习还有多久"],
+    ["状态", manager.running ? "运行中" : "已停止", "调度器是否在跑。停用插件或关掉总开关都会变成已停止"],
   ];
   $("stats").innerHTML = items
-    .map(([k, v]) => `<div class="stat"><span>${esc(k)}</span><b>${esc(v)}</b></div>`)
+    .map(
+      ([k, v, tip]) =>
+        `<div class="stat"${tip ? ` title="${escAttr(tip)}"` : ""}><span>${esc(k)}</span><b>${esc(
+          v,
+        )}</b></div>`,
+    )
     .join("");
 
   // 累计成本：让「这套机制到底花了多少」可见
@@ -808,13 +843,18 @@ function renderStats(stats, manager) {
   const fail = metrics.learn_fail ?? 0;
   const chars = metrics.chars_analyzed ?? 0;
   $("cost").innerHTML = [
-    ["累计学习次数", calls],
-    ["成功 / 失败", `${ok} / ${fail}`],
-    ["累计分析消息", metrics.messages_analyzed ?? 0],
-    ["累计分析字数", chars >= 10000 ? `${(chars / 10000).toFixed(1)} 万` : chars],
-    ["累计耗时", fmtDuration(Math.round(metrics.elapsed_total ?? 0))],
+    ["累计学习次数", calls, "从装上到现在一共发起了多少次学习请求"],
+    ["成功 / 失败", `${ok} / ${fail}`, "失败通常是模型报错或超时，不计费"],
+    ["累计分析消息", metrics.messages_analyzed ?? 0, "这些请求一共读了多少条群消息"],
+    ["累计分析字数", chars >= 10000 ? `${(chars / 10000).toFixed(1)} 万` : chars, "读进来的纯文字量，token 基本按这个算"],
+    ["累计耗时", fmtDuration(Math.round(metrics.elapsed_total ?? 0)), "所有学习请求加起来花了多少时间"],
   ]
-    .map(([k, v]) => `<div class="stat"><span>${esc(k)}</span><b>${esc(v)}</b></div>`)
+    .map(
+      ([k, v, tip]) =>
+        `<div class="stat"${tip ? ` title="${escAttr(tip)}"` : ""}><span>${esc(k)}</span><b>${esc(
+          v,
+        )}</b></div>`,
+    )
     .join("");
 
   const last = manager.last_run_result || {};
@@ -834,20 +874,164 @@ function renderUsage(data) {
   const cost = Number(today.cost) || 0;
 
   $("usageTop").innerHTML = `
-    <div class="usage-hero"><span>今日金额</span><b>¥${esc(fmtMoney(cost))}</b></div>
-    <div class="stat"><span>今日调用</span><b>${esc(today.calls ?? 0)}</b></div>
-    <div class="stat"><span>今日搜索</span><b>${esc(today.search_calls ?? 0)}</b></div>`;
+    <div class="usage-hero" title="按 DeepSeek 牌价估算，高峰时段翻倍。本插件自己发起的请求才算，不含你和别人正常聊天">
+      <span>今日金额</span><b>¥${esc(fmtMoney(cost))}</b></div>
+    <div class="stat" title="今天一共发起了几次模型请求。搜索单独计数，不占这里">
+      <span>今日调用</span><b>${esc(today.calls ?? 0)}</b></div>
+    <div class="stat" title="联网搜索的次数。按次单独计费，不占 token">
+      <span>今日搜索</span><b>${esc(today.search_calls ?? 0)}</b></div>`;
 
   $("usageTokens").innerHTML = [
-    ["缓存命中输入", fmtCount(tokens.input_cached)],
-    ["未命中输入", fmtCount(tokens.input_other)],
-    ["输出", fmtCount(tokens.output)],
+    ["缓存命中输入", fmtCount(tokens.input_cached), "命中了前缀缓存的部分，价格只有未命中的三十分之一"],
+    ["未命中输入", fmtCount(tokens.input_other), "没命中缓存、按原价算的输入。改 system prompt 会让这个数暴涨"],
+    ["输出", fmtCount(tokens.output), "模型吐出来的字。输出价是缓存命中输入价的九十倍"],
   ]
-    .map(([k, v]) => `<div class="stat"><span>${esc(k)} token</span><b>${esc(v)}</b></div>`)
+    .map(
+      ([k, v, tip]) =>
+        `<div class="stat"${tip ? ` title="${escAttr(tip)}"` : ""}><span>${esc(k)} token</span><b>${esc(
+          v,
+        )}</b></div>`,
+    )
     .join("");
 
+  renderUsageSource(usage);
   renderHours(usage);
   renderBars(usage.days || []);
+}
+
+// ── 今日消耗构成 ─────────────────────────────────────────────────────
+//
+// 分成两块钱：**回复**（bot 说出去的每句话）和**后台**（插件自己发的请求）。
+// 这么分是因为它们的开关是分开的——回复由群友决定，后台由配置决定，
+// 混在一起看，用户没法判断「关掉哪个能省钱」。
+//
+// 每块钱先给总额（次数 / 金额 / token），再往下列各自的下级项目。
+// 只列今天真的有数据的项目，没发生的来源不占位置。
+
+const USAGE_SOURCE_META = {
+  reply: ["👤 被叫回复", "有人 @bot、回复 bot 的消息，或者私聊"],
+  active: ["🗣 主动插话", "插件自己找时机接的话，可以整块关掉"],
+  bot: ["💬 其他回复", "群里没点名但触发了回复，或认不出来的来源"],
+  learn: ["📚 学习风格", "定时提炼群聊风格的后台请求"],
+  profile: ["🪞 人物画像", "给某个人重写「他是谁」的那次请求"],
+  judge: ["🔎 插话判定", "让模型判断这轮该不该插话"],
+};
+
+const USAGE_BLOCKS = [
+  {
+    key: "chat",
+    title: "💬 回复",
+    hint: "bot 说出去的每句话，一轮就是一次完整请求",
+    sources: ["reply", "active", "bot"],
+  },
+  {
+    key: "back",
+    title: "🧠 后台",
+    hint: "插件自己发起的请求，跟聊天无关，可以整块关掉",
+    sources: ["learn", "profile", "judge"],
+  },
+];
+
+function usageBucket(bySource, key) {
+  const raw = bySource[key] || {};
+  const tokens = raw.tokens || {};
+  return {
+    key,
+    calls: Number(raw.calls) || 0,
+    cost: Number(raw.cost) || 0,
+    tokens:
+      (Number(tokens.input_other) || 0) +
+      (Number(tokens.input_cached) || 0) +
+      (Number(tokens.output) || 0),
+  };
+}
+
+function renderUsageSource(usage) {
+  const box = $("usageSource");
+  if (!box) return;
+  const bySource = usage.by_source || {};
+
+  const blocks = USAGE_BLOCKS.map((block) => {
+    const rows = block.sources
+      .map((key) => usageBucket(bySource, key))
+      .filter((row) => row.calls > 0);
+    return {
+      ...block,
+      rows,
+      calls: rows.reduce((sum, r) => sum + r.calls, 0),
+      cost: rows.reduce((sum, r) => sum + r.cost, 0),
+      tokens: rows.reduce((sum, r) => sum + r.tokens, 0),
+    };
+  });
+  const live = blocks.filter((b) => b.calls > 0);
+
+  if (!live.length) {
+    box.innerHTML =
+      `<p class="hint">今天还没有按来源的记录。这一版起会把「回复 / 后台」分开记，` +
+      `更早的消耗都在「其他回复」里。</p>`;
+    return;
+  }
+
+  // 占比按金额算；万一每笔 token 都是 0（只有空 usage），退回按次数算
+  const totalCost = live.reduce((sum, b) => sum + b.cost, 0);
+  const totalCalls = live.reduce((sum, b) => sum + b.calls, 0);
+  const share = (b) =>
+    totalCost > 0 ? b.cost / totalCost : totalCalls > 0 ? b.calls / totalCalls : 0;
+  const pctOf = (b) => Math.max(1, Math.round(share(b) * 100));
+
+  const sumHtml = live
+    .map(
+      (b) => `<div class="ub-block${b.key === "chat" ? " hot" : ""}">
+        <span class="ub-name">${esc(b.title)}</span>
+        <b>¥${fmtMoney(b.cost)}</b>
+        <small>${b.calls} 次 · ${esc(fmtCount(b.tokens))} token</small>
+        <small class="ub-share">占今日 ${pctOf(b)}%</small>
+      </div>`,
+    )
+    .join("");
+
+  const barHtml = live
+    .map(
+      (b) =>
+        `<i class="${b.key}" style="width:${pctOf(b)}%" title="${esc(
+          `${b.title} 占 ${pctOf(b)}%`,
+        )}"></i>`,
+    )
+    .join("");
+
+  const listHtml = live
+    .map((b) => {
+      const rows = b.rows
+        .map((row) => {
+          const [label, hint] = USAGE_SOURCE_META[row.key] || [row.key, ""];
+          const avg = row.calls > 0 ? row.cost / row.calls : 0;
+          // 只有一笔时不写「平均」——一次的价格就是它本身
+          const detail =
+            row.calls > 1
+              ? `平均 ¥${fmtMoney(avg)}/次 · ${fmtCount(row.tokens)} token`
+              : `${fmtCount(row.tokens)} token`;
+          return `<div class="ub-row" title="${esc(hint)}">
+            <span class="ub-row-name">${label}</span>
+            <b>${row.calls} 次</b>
+            <span class="ub-row-cost">¥${fmtMoney(row.cost)}</span>
+            <small>${esc(detail)}</small>
+          </div>`;
+        })
+        .join("");
+      const shareText = `${pctOf(b)}%`;
+      return `<div class="ub-group">
+        <p class="ub-group-head">${esc(b.title)}<small>${esc(b.hint)}</small>
+          <em>占今日 ${shareText}</em>
+        </p>
+        ${rows}
+      </div>`;
+    })
+    .join("");
+
+  box.innerHTML = `
+    <div class="ub-sum">${sumHtml}</div>
+    <div class="ub-bar">${barHtml}</div>
+    <div class="ub-list">${listHtml}</div>`;
 }
 
 // ── 今日 24 小时分布 ─────────────────────────────────────────────────
@@ -971,9 +1155,13 @@ function renderUsageSearch(data) {
 // ── 设置（热调）────────────────────────────────────────────────────
 
 // 六组新参数 + 一组原有的运行参数。hint 一律写清成本影响。
+// 参数页的顺序不用定义顺序决定，看 order 字段——
+// 想调整分组位置只改数字，不用搬几十行代码。
+// 排法：先「这是谁、怎么说话」，再「怎么学、记什么」，最后是外部能力和运维。
 const SETTING_GROUPS = [
   {
     id: "global",
+    order: 10,
     title: "👑 全局",
     sub: "主人 QQ 与学习库总开关。改一次，关系 / 事实 / 学习 / 清理一起生效",
     items: [
@@ -1012,13 +1200,15 @@ const SETTING_GROUPS = [
   },
   {
     id: "base",
+    order: 50,
+    profileGroup: "learn",
     title: "⚙️ 运行与学习",
     sub: "原有参数，改动同样即时生效",
     items: [
       { key: "enabled", label: "启用群聊记忆", type: "bool", default: true, hint: "总开关。关掉后不收集、不学习、不注入，完全静默。影响：token 0。" },
       { key: "inject_enabled", label: "启用风格注入", type: "bool", default: true, hint: "关闭后不再注入风格，字数上限也一起失效（两者在同一个钩子里）。学习照常、仍有消耗。影响：token ↓↓（关掉后每条回复少几十到一百多字，这是最大的单项开销）。" },
       { key: "analysis_interval_seconds", label: "学习间隔（秒）", type: "int", min: 60, max: 604800, step: 60, default: 21600, hint: "默认 21600（6 小时）≈ 一天最多 4 次，这是「几乎零消耗」的核心。影响：token ↑↑（调小等于按倍数变贵）。" },
-      { key: "min_history_for_analysis", label: "触发学习的最少消息数", type: "int", min: 1, max: 1000, step: 1, default: 10, hint: "攒够这么多条新消息才送去提炼，不够直接跳过不发请求。默认 30：10 条太容易学到「嗯」「哈」这类噪音。影响：token ↓（调大）。" },
+      { key: "min_history_for_analysis", label: "触发学习的最少消息数", type: "int", min: 1, max: 1000, step: 1, default: 30, hint: "攒够这么多条新消息才送去提炼，不够直接跳过不发请求。默认 30：10 条太容易学到「嗯」「哈」这类噪音。影响：token ↓（调大）。" },
       { key: "max_messages_per_learn", label: "单次提炼最多消息数", type: "int", min: 1, max: 500, step: 10, default: 80, hint: "单次最多带多少条消息进 prompt。影响：token ↑↑（学一次的钱几乎全在这里）。" },
       { key: "max_stable_inject", label: "最多注入学习风格", type: "int", min: 0, max: 20, step: 1, default: 5, hint: "每轮按熟练度取前 N 条学习风格注入。影响：token ↑↑（每加一条就多一段文本，且每轮都带）。" },
       { key: "max_manual_inject", label: "最多注入手动记忆", type: "int", min: 0, max: 20, step: 1, default: 3, hint: "手动记忆单独占名额，和学习名额各算各的。设 0 = 只存不注入。影响：token ↑（调大，每轮多带几条）。" },
@@ -1036,6 +1226,8 @@ const SETTING_GROUPS = [
   },
   {
     id: "style",
+    order: 30,
+    profileGroup: "style",
     title: "🎭 风格与人格",
     sub: "调低＝省钱＋更像人设，调高＝更像群里的人",
     items: [
@@ -1059,6 +1251,7 @@ const SETTING_GROUPS = [
   },
   {
     id: "length",
+    order: 40,
     title: "📏 回复长度",
     sub: "「上限」是倾向不是硬限制",
     items: [
@@ -1072,6 +1265,8 @@ const SETTING_GROUPS = [
   },
   {
     id: "facts",
+    order: 60,
+    profileGroup: "facts",
     title: "🧠 事实记忆与个人画像",
     sub: "上面三个是遗忘节奏（多久没提就忘），下面是画像（这个人是谁）",
     items: [
@@ -1089,7 +1284,7 @@ const SETTING_GROUPS = [
       },
       {
         key: "profile_enabled", label: "启用个人画像", type: "bool", default: true,
-        hint: "从事实里提炼一段「这个人是谁」，按好感给字数（陌生 60 → 老友 180，**主人 260**），每轮注入时单独一段。\n不待见档不生成也不注入；关掉等于回到「只有事实、没有画像」。影响：token ↑（每轮多几十到两百多字）。",
+        hint: "从事实里提炼一段「这个人是谁」，按好感给字数（陌生 120 → 老友 420，**主人 800**），每轮注入时单独一段。\n不待见档不生成也不注入；关掉等于回到「只有事实、没有画像」。影响：token ↑（每轮多几十到四百多字）。",
       },
       {
         key: "profile_min_facts", label: "画像最少几条事实", type: "int", min: 1, max: 50, step: 1, default: 3,
@@ -1106,7 +1301,37 @@ const SETTING_GROUPS = [
     ],
   },
   {
+    id: "feed",
+    order: 999,
+    // 单独一页渲染：投喂榜、加成、每日次数是同一个话题，拆在参数里要翻两处
+    pane: "feed",
+    title: "🍚 喂食",
+    sub: "群友用「吃什么」插件点菜时自动加好感；没装那个插件就是空转，不报错",
+    items: [
+      {
+        key: "feed_enabled", label: "启用喂食", type: "bool", default: true,
+        hint: "开了之后，「吃什么」出菜时会往消息上挂一条标记，本插件读到就记一次投喂。需要那个插件也更新到带标记的版本，否则两边各跑各的、不会加好感。影响：token 0（不加请求）。",
+      },
+      {
+        key: "feed_gain_random", label: "随机推荐加多少", type: "slider", min: 0, max: 20, step: 0.5, default: 2,
+        hint: "群友发「吃什么」、bot 随机报一道菜时加多少。默认 2：一次直接对话是 3.1，随手问一句不该比认真聊天更值钱。影响：token 0。",
+      },
+      {
+        key: "feed_gain_order", label: "点菜加多少", type: "slider", min: 0, max: 30, step: 0.5, default: 5,
+        hint: "群友明确点菜（「点菜KFC」「我要吃红烧肉」）时加多少。默认 5：有明确意图，比随机推荐重，但仍低于聊三轮。影响：token 0。",
+      },
+      {
+        key: "feed_daily_limit", label: "每人每天计几次", type: "int", min: 0, max: 50, step: 1, default: 2,
+        hint: "同一个人一天最多算几次有效投喂，超出不涨分也不报错。默认 2：随机推荐一次 + 点菜一次，两种都能加分；再往上会盖过认真聊天的权重。0 = 不限次数（不建议）。影响：token 0。",
+      },
+    ],
+  },
+  {
     id: "active",
+    order: 20,
+    // 单独一页：预设、按群开关、13 个参数挤在参数页里太长了
+    pane: "active",
+    profileGroup: "active",
     title: "🗣 主动回复",
     sub: "唯一会凭空产生请求的功能。顶部五档一键切换，改完还能单独微调",
     items: [
@@ -1117,6 +1342,7 @@ const SETTING_GROUPS = [
       },
       { key: "active_reply_cooldown_seconds", label: "冷却时间（秒）", type: "int", min: 60, max: 86400, step: 60, default: 1800, hint: "两次评估至少隔多久，默认 1800 ≈ 一天 48 个窗口。影响：token ↓（调大）。" },
       { key: "active_reply_daily_limit", label: "每日上限（每群）", type: "int", min: 0, max: 100, step: 1, default: 8, hint: "每群每天最多主动说几次，自然日重置，**这是最硬的一道闸门**——概率写得再高也超不过它。每次约 1500 token：8 次 ≈ 1.2 万、40 次 ≈ 6 万、70 次 ≈ 10 万 token/天。30 以上要留意平台风控和被嫌吵。影响：token ↑↑（每多一次就是一次完整请求）。" },
+      { key: "active_reply_per_user_limit", label: "单人每日上限", type: "int", min: 0, max: 100, step: 1, default: 6, hint: "同一个人一天最多被主动搭话几次。群日限管「这个群今天还能说几次」，这个管「别把额度全花在一个人身上」。默认 6 次；0 = 不限。影响：token ↓（跳过的那次不发请求）。" },
       { key: "active_reply_quiet_hours", label: "静默时段", type: "text", default: "01:00-08:00", hint: "格式 01:00-08:00，支持跨天（如 22:00-06:00）。这段时间零消耗。留空 = 不静默。影响：token ↓（静默时段完全不发请求）。" },
       { key: "active_reply_min_messages", label: "冷清阈值", type: "int", min: 0, max: 100, step: 1, default: 3, hint: "最近 10 分钟少于这么多条就不插话，避免对着空气说话。0 = 关闭检测。影响：token ↓。" },
       {
@@ -1137,6 +1363,7 @@ const SETTING_GROUPS = [
   },
   {
     id: "search",
+    order: 70,
     title: "🌐 联网搜索",
     sub: "每次搜索约多 1200 token",
     items: [
@@ -1165,6 +1392,7 @@ const SETTING_GROUPS = [
   },
   {
     id: "admin",
+    order: 80,
     title: "🛡 管理员",
     sub: "让管理员在群里直接改参数",
     items: [
@@ -1174,6 +1402,7 @@ const SETTING_GROUPS = [
   },
   {
     id: "price",
+    order: 90,
     title: "💰 计价",
     sub: "只影响面板估的金额，不影响真实扣费",
     items: [
@@ -1214,28 +1443,287 @@ function profileMatches(profile, settings) {
   });
 }
 
-// 「强度预设」那一排。点一下把 5 个参数整组写进去，改完还能继续单独微调——
-// 微调到不匹配任何预设时，右边那句提示会说「已单独改过」
-function activeProfileBar(settings) {
-  const profiles = (lastStatus && lastStatus.active_profiles) || [];
+// 一组预设 =「几个互相咬合的参数一起改」。点一下整组写进去，之后还能单独
+// 微调；微调到不匹配任何预设时，右边那句提示会说「已单独改过」。
+//
+// 标签跟着组走：主动回复叫「强度预设」，别处叫档位——在「事实记忆」里看到
+// 「强度」两个字，用户不知道在说强度的什么。
+const PROFILE_LABELS = {
+  active: "强度预设",
+  learn: "学习强度",
+  style: "风格档位",
+  facts: "记忆档位",
+};
+
+function profileBar(groupKey, settings) {
+  const all = (lastStatus && lastStatus.profiles) || {};
+  // 老浏览器缓存了旧 app.js 时只有 active_profiles，这里兜一下
+  const profiles =
+    all[groupKey] ||
+    (groupKey === "active" && lastStatus && lastStatus.active_profiles) ||
+    [];
   if (!profiles.length) return "";
   const current = profiles.find((p) => profileMatches(p, settings));
   const buttons = profiles
     .map(
       (p) =>
-        `<button type="button" data-profile="${escAttr(p.id)}"${
-          current && current.id === p.id ? ' class="on"' : ""
-        } title="${escAttr(p.desc)}">${esc(p.label)}</button>`,
+        `<button type="button" data-profile="${escAttr(p.id)}" data-profile-group="${escAttr(
+          groupKey,
+        )}"${current && current.id === p.id ? ' class="on"' : ""} title="${escAttr(
+          p.desc,
+        )}">${esc(p.label)}</button>`,
     )
     .join("");
   const note = current
     ? esc(current.desc)
-    : "下面这几个参数被单独改过，已经不属于任何预设";
+    : "这里被单独微调过，已经不属于任何一个档位";
+  const label = PROFILE_LABELS[groupKey] || "预设";
   return `<div class="profile-bar">
-    <span class="profile-label">强度预设</span>
-    <div class="seg" id="activeProfileSeg">${buttons}</div>
+    <span class="profile-label" title="点一下会同时改这组里互相咬合的几个参数。改完还能继续单独调，调过之后就不再属于任何档位">${esc(
+      label,
+    )}</span>
+    <div class="seg">${buttons}</div>
     <span class="hint">${note}</span>
   </div>`;
+}
+
+// ── 主动回复页 ───────────────────────────────────────────────────────
+//
+// 从参数页搬出来单独成页：十几个参数 + 预设 + 按群开关挤在同一组里，
+// 想找「哪个群在说话」得滚半天。
+//
+// 筛选/排序复用学习库那套 gf 组件，和事实、关系两页同一套手感。
+
+let activeGroups = [];
+let activeGlobalOn = false;
+let activePerUserLimit = 0;
+
+const activeFilter = { text: {}, sets: {}, sort: "today", dir: "desc" };
+
+const ACTIVE_FLAGS = {
+  full: "今日已满",
+  spoke: "今天说过话",
+  quiet: "今天还没说话",
+  streak: "连续没被接",
+};
+
+function matchActiveFlag(item, flag) {
+  if (flag === "full") return !!item.full;
+  if (flag === "spoke") return (item.today || 0) > 0;
+  if (flag === "quiet") return (item.today || 0) === 0;
+  if (flag === "streak") return (item.streak || 0) >= 3;
+  return false;
+}
+
+const ACTIVE_GF = {
+  bar: "activeFilterBar",
+  pop: "activeFilterPop",
+  search: "activeSearch",
+  state: activeFilter,
+  items: () => activeGroups,
+  render: renderActiveList,
+  reset: () => {
+    activeFilter.text = {};
+    activeFilter.sets = {};
+    activeFilter.sort = "today";
+    activeFilter.dir = "desc";
+  },
+  columns: [
+    {
+      col: "who",
+      label: "群",
+      type: "text",
+      title: "按群筛选",
+      placeholder: "群号 / 群名",
+      groups: [
+        {
+          key: "flags",
+          title: "附加条件",
+          options: Object.keys(ACTIVE_FLAGS).map((key) => ({ key, label: ACTIVE_FLAGS[key] })),
+          count: (items, key) => items.filter((i) => matchActiveFlag(i, key)).length,
+        },
+      ],
+    },
+    {
+      col: "state",
+      label: "状态",
+      groups: [
+        {
+          key: "states",
+          title: "按开关状态",
+          options: [
+            { key: "on", label: "开着" },
+            { key: "off", label: "关掉" },
+          ],
+          count: (items, key) =>
+            items.filter((i) => (key === "on" ? !!i.enabled : !i.enabled)).length,
+        },
+      ],
+    },
+    {
+      col: "today",
+      label: "今日",
+      type: "sort",
+      descLabel: "降序（说得多的在前）",
+      ascLabel: "升序（说得少的在前）",
+    },
+    {
+      col: "idle",
+      label: "最近",
+      type: "sort",
+      descLabel: "降序（刚说过的在前）",
+      ascLabel: "升序（最久没说的在前）",
+    },
+  ],
+};
+
+function matchActive(item) {
+  const st = gfState(ACTIVE_GF);
+  const kw = String(st.text.who || "").trim().toLowerCase();
+  if (kw && !`${item.session_id} ${item.name}`.toLowerCase().includes(kw)) return false;
+  const flags = st.sets.flags || [];
+  if (flags.length && !flags.some((f) => matchActiveFlag(item, f))) return false;
+  const states = st.sets.states || [];
+  if (states.length && states.includes("on") !== !!item.enabled) return false;
+  return true;
+}
+
+function sortActive(items) {
+  const st = gfState(ACTIVE_GF);
+  const mul = st.dir === "asc" ? 1 : -1;
+  const key = st.sort || "today";
+  const pick = key === "idle" ? (i) => i.last_at || 0 : (i) => i.today || 0;
+  return items.sort((a, b) => {
+    const diff = (pick(a) - pick(b)) * mul;
+    // 排不出先后时让开着的排前面，否则同一档的群每次刷新顺序都在跳
+    return diff !== 0 ? diff : (b.enabled ? 1 : 0) - (a.enabled ? 1 : 0);
+  });
+}
+
+function activeRow(g) {
+  const stage = !g.enabled ? "off" : g.full ? "full" : "on";
+  const label = { on: "开着", off: "关掉", full: "今日已满" }[stage];
+  const today = g.limit > 0 ? `今日 ${g.today}/${g.limit}` : `今日 ${g.today} 次`;
+  const roll = g.next_roll_in ? `下次评估 ${fmtDuration(g.next_roll_in)}后` : "待评估";
+  const last = g.last_at ? `上次插话 ${fmtTime(g.last_at)}` : "还没插过话";
+  // 中途把上限调小时，已经用掉的次数不会跟着清零——今天就是会超过上限。
+  // 不解释一句，用户会以为计数坏了
+  const tip =
+    g.full && g.today > g.limit
+      ? "今天已经用超了：把上限调小不会清掉已经用掉的次数，明天零点自动重置"
+      : g.enabled
+        ? "这个群会自己找时机接话。取消勾选就安静下来，其它群不受影响"
+        : "这个群不会主动插话，只在被 @ 或回复时说话。勾上恢复";
+  return `<div class="arow${g.enabled ? "" : " off"}" title="${escAttr(tip)}">
+    <input type="checkbox" data-active-group="${escAttr(g.session_id)}" ${
+      g.enabled ? "checked" : ""
+    } />
+    <b class="arow-name">${esc(g.name)}</b>
+    <span class="arow-meta">${esc(today)} · ${esc(roll)} · ${esc(last)}</span>
+    <i class="arow-tag ${stage}">${esc(label)}</i>
+  </div>`;
+}
+
+function renderActiveList() {
+  const box = $("activeList");
+  if (!box) return;
+  const all = activeGroups || [];
+  const visible = sortActive(all.filter(matchActive).slice());
+  const note = $("activeListNote");
+  if (note) {
+    note.textContent =
+      visible.length === all.length ? `共 ${all.length} 个群` : `${visible.length} / ${all.length} 个群`;
+  }
+  const cond = $("activeFilterNote");
+  if (cond) cond.textContent = gfNoteText(ACTIVE_GF);
+  gfPaint(ACTIVE_GF);
+
+  if (!all.length) {
+    box.innerHTML =
+      `<p class="empty">还没有群聊会话。bot 在群里收到过消息之后，这里才会出现对应的群。</p>`;
+    return;
+  }
+  if (!visible.length) {
+    box.innerHTML = `<p class="empty">没有符合条件的群</p>`;
+    return;
+  }
+  box.innerHTML = visible.map(activeRow).join("");
+}
+
+function renderActiveStats() {
+  const items = activeGroups || [];
+  const on = items.filter((g) => g.enabled).length;
+  const total = items.reduce((sum, g) => sum + (g.today || 0), 0);
+  const spoke = items.filter((g) => (g.today || 0) > 0).length;
+  const limit = items.length ? items[0].limit : 0;
+  $("activeStats").innerHTML = [
+    ["总开关", activeGlobalOn ? "开着" : "关着", "总开关关掉后，下面每个群的开关都不再起作用"],
+    ["开着的群", `${on} / ${items.length}`, "允许自己找时机接话的群数"],
+    ["今日主动发言", `${total} 次`, "所有群加起来，今天 bot 自己插了几次话"],
+    ["今天说过话的群", `${spoke} 个`, "今天至少插过一次话的群数"],
+    ["每群每日上限", limit > 0 ? `${limit} 次` : "不限", "单个群每天最多主动说几次，自然日重置。这是最硬的一道闸门"],
+    [
+      "每人每日上限",
+      activePerUserLimit > 0 ? `${activePerUserLimit} 次` : "不限",
+      "同一个人一天最多被主动搭话几次，防止把额度全花在一个人身上",
+    ],
+  ]
+    .map(
+      ([k, v, tip]) =>
+        `<div class="stat"${tip ? ` title="${escAttr(tip)}"` : ""}><span>${esc(k)}</span><b>${esc(
+          v,
+        )}</b></div>`,
+    )
+    .join("");
+
+  const notes = [];
+  if (!activeGlobalOn) notes.push("总开关现在是关着的，下面群开了也不会插话——往上翻参数区打开它。");
+  if (limit > 0 && total >= limit * Math.max(1, on)) {
+    notes.push(`今天所有群都接近或达到上限（每群 ${limit} 次），想多说只能改「每群每日上限」。`);
+  }
+  notes.push("这里只管「自己找时机接话」。被 @ 或被回复时的正常回复不受任何开关影响。");
+  $("activeNote").textContent = notes.join(" ");
+}
+
+async function loadActive() {
+  try {
+    const data = unwrap(await Bridge.apiGet("active", {}));
+    activeGroups = data.items || [];
+    activeGlobalOn = !!data.enabled;
+    activePerUserLimit = Number(data.per_user_limit || 0);
+  } catch (err) {
+    console.error("加载主动回复数据失败:", err);
+    activeGroups = [];
+    showToast("主动回复数据加载失败，请查看日志");
+    return;
+  }
+  renderActiveStats();
+  renderActiveList();
+}
+
+// 关掉某个群的主动回复。只改本地那一行，不整页重渲染：
+// 重渲染会把滚动条弹回顶部，用户刚点的那个群反而找不到了
+async function toggleActiveGroup(sid, enabled) {
+  try {
+    const payload = unwrap(
+      await Bridge.apiPost("manage", { action: "set_active", session_id: sid, enabled }),
+    );
+    if (payload && payload.success === false) {
+      showToast(payload.message || "切换失败");
+      return;
+    }
+    const row = activeGroups.find((g) => g.session_id === sid);
+    if (row) {
+      row.enabled = enabled;
+      row.full = enabled ? row.full : false;
+    }
+    showToast(enabled ? "已开启这个群的主动回复" : "已关掉这个群的主动回复");
+    renderActiveStats();
+    renderActiveList();
+  } catch (err) {
+    console.error("切换单群主动回复失败:", err);
+    showToast("切换失败，请查看日志");
+  }
 }
 
 function renderSettings(settings) {
@@ -1244,7 +1732,11 @@ function renderSettings(settings) {
   const q = settingQuery.trim().toLowerCase();
   let hitCount = 0;
 
-  const blocks = SETTING_GROUPS.map((group) => {
+  // 带 pane 的组属于别的页（比如喂食），不在这里出现——一页一个话题。
+  // filter 已经返回新数组，可以直接排序，不会打乱原定义
+  const blocks = SETTING_GROUPS.filter((group) => !group.pane)
+    .sort((a, b) => (a.order ?? 99) - (b.order ?? 99))
+    .map((group) => {
     // 搜索时按「参数名 / key / 说明」过滤，一整组都没命中就整组不渲染——
     // 67 项参数一屏放不下，用户要的是「直接定位到那一条」
     const defs = q
@@ -1261,7 +1753,7 @@ function renderSettings(settings) {
     const footer = group.id === "style" ? '<p class="hint compute" id="styleNote"></p>' : "";
     // 主动回复组顶部是「三档一键切换」：这几个参数互相咬合，
     // 单独改一个看不出效果，所以给整体档位
-    const head = group.id === "active" ? activeProfileBar(settings) : "";
+    const head = group.profileGroup ? profileBar(group.profileGroup, settings) : "";
     return `<section class="set-group">
       <h3>${esc(group.title)}${sub}${note}</h3>
       ${head}
@@ -1280,6 +1772,119 @@ function renderSettings(settings) {
   clearSettingMsg();
   updateStyleNote();
   applySearchMode(settings.web_search_mode || "plugin");
+}
+
+// ── 喂食页 ───────────────────────────────────────────────────────────
+//
+// 这一页原来挤在参数页里，滚到一半才能看见；投喂榜又要跟加成对着看，
+// 所以整块搬出来：上面是今天喂了多少，中间是参数，下面是排行榜。
+
+let feedBoard = { items: [], stats: {} };
+const feedQuery = { text: "" };
+
+// 参数区复用参数页那套渲染，输入框的 data-key 一样，保存走同一个接口。
+// 主动回复和喂食各自成页，但参数行的长相和交互不该有两套
+function renderPaneSettings(paneId, containerId, settings) {
+  const box = $(containerId);
+  if (!box) return;
+  const group = SETTING_GROUPS.find((g) => g.pane === paneId);
+  if (!group) return;
+  const overrides = settings._runtime_overrides || {};
+  const head = group.profileGroup ? profileBar(group.profileGroup, settings) : "";
+  box.innerHTML =
+    head +
+    `<div class="set-grid">${group.items
+      .map((def) => settingRow(def, settings, overrides))
+      .join("")}</div>`;
+}
+
+function renderFeedSettings(settings) {
+  renderPaneSettings("feed", "feedSettings", settings);
+}
+
+async function loadFeed() {
+  try {
+    const data = unwrap(await Bridge.apiGet("feed", {}));
+    feedBoard = data || { items: [], stats: {} };
+  } catch (err) {
+    console.error("加载投喂数据失败:", err);
+    showToast("投喂数据加载失败，请查看日志");
+    return;
+  }
+  renderFeedBoard();
+}
+
+function renderFeedBoard() {
+  const stats = feedBoard.stats || {};
+  const items = feedBoard.items || [];
+  const limit = Number(feedBoard.limit || 0);
+  const gainRandom = Number(feedBoard.gain_random || 0);
+  const gainOrder = Number(feedBoard.gain_order || 0);
+
+  const enabled = !!feedBoard.enabled;
+  $("feedStats").innerHTML = [
+    ["今日投喂", `${stats.today ?? 0} 次`, "今天被记成有效投喂的次数，超出每人上限的不算"],
+    ["今日人数", `${stats.today_people ?? 0} 人`, "今天喂过的人有多少"],
+    ["累计投喂", `${stats.total ?? 0} 次`, "从装上到现在一共记了多少次"],
+    ["喂过的人", `${stats.people ?? 0} 人`, "至少喂过一次的人数"],
+    ["每人每天上限", limit > 0 ? `${limit} 次` : "不限", "同一个人一天最多算几次，超出不涨分也不报错"],
+    ["最近一次", stats.last_at ? fmtTime(stats.last_at) : "—", "最近一次投喂的时间"],
+  ]
+    .map(
+      ([k, v, tip]) =>
+        `<div class="stat"${tip ? ` title="${escAttr(tip)}"` : ""}><span>${esc(k)}</span><b>${esc(
+          v,
+        )}</b></div>`,
+    )
+    .join("");
+
+  const notes = [];
+  notes.push(
+    gainRandom > 0 || gainOrder > 0
+      ? `当前一次随机推荐 +${gainRandom} 点、一次点菜 +${gainOrder} 点好感。`
+      : "两个加成都是 0，现在投喂只记次数、不加好感。",
+  );
+  if (!enabled) notes.push("喂食总开关关着，投喂不会被记录。");
+  notes.push(
+    "投喂的加分同样占「单日单人上限」的额度，所以它不会变成绕开日限的捷径；" +
+      "打满之后就只记次数、不再涨分。",
+  );
+  $("feedNote").textContent = notes.join(" ");
+
+  const kw = feedQuery.text.trim().toLowerCase();
+  const visible = kw
+    ? items.filter((it) =>
+        `${it.qq} ${it.name} ${it.last_dish}`.toLowerCase().includes(kw),
+      )
+    : items;
+  $("feedListNote").textContent = `${visible.length} 人`;
+
+  if (!items.length) {
+    $("feedList").innerHTML =
+      `<p class="empty">还没有投喂记录。群友在群里发「吃什么」、或者点一道菜，` +
+      `这里就会出现第一条。没装「吃什么」插件的话，这一页会一直是空的。</p>`;
+    return;
+  }
+  if (!visible.length) {
+    $("feedList").innerHTML = `<p class="empty">没有匹配「${esc(feedQuery.text.trim())}」的人</p>`;
+    return;
+  }
+
+  $("feedList").innerHTML = visible
+    .map((it, i) => {
+      const rank = i === 0 ? "🥇" : i === 1 ? "🥈" : i === 2 ? "🥉" : `${i + 1}.`;
+      const dish = it.last_dish
+        ? `最近吃了${it.last_dish}${it.last_mode === "order" ? "（点菜）" : "（随机）"}`
+        : "还没记到菜名";
+      const todayText = limit > 0 ? `今天 ${it.today}/${limit}` : `今天 ${it.today} 次`;
+      return `<div class="feed-row">
+        <span class="feed-rank">${rank}</span>
+        <b class="feed-who">${esc(it.name)}<small>${esc(it.qq)}</small></b>
+        <span class="feed-dish">${esc(dish)}</span>
+        <span class="feed-count"><b>${it.total}</b> 次<small>${esc(todayText)}</small></span>
+      </div>`;
+    })
+    .join("");
 }
 
 // token 影响标签：从 hint 里那句「影响：token ↑」提取出来单独渲染。
@@ -1317,7 +1922,12 @@ function settingRow(def, settings, overrides) {
     : settings[def.key];
   const hot = def.key in overrides ? '<i class="hot">已热调</i>' : "";
   const defText = fmtDefault(def);
-  const defBadge = defText === "" ? "" : `<i class="set-def">默认 ${esc(defText)}</i>`;
+  const defBadge =
+    defText === ""
+      ? ""
+      : `<i class="set-def" title="配置文件里的默认值。控件里显示的才是当前生效的，改过的会在右边标「已热调」">默认 ${esc(
+          defText,
+        )}</i>`;
   const hint = def.hint
     ? `<p class="set-hint${def.warn ? " warn" : ""}">${esc(def.hint)}</p>`
     : "";
@@ -1446,8 +2056,13 @@ function applySearchMode(mode) {
 
 function setSettingMsg(message) {
   const el = $("settingsMsg");
-  if (!el) return;
-  el.textContent = message || "";
+  if (el) el.textContent = message || "";
+  // 喂食页和主动回复页的参数走同一个保存接口，报错也各写一份，
+  // 否则在那一页改错了值只会看到一条转瞬即逝的 toast
+  ["feedMsg", "activeMsg"].forEach((id) => {
+    const box = $(id);
+    if (box) box.textContent = message || "";
+  });
 }
 function clearSettingMsg() {
   setSettingMsg("");
@@ -2164,6 +2779,7 @@ function gfBind(cfg, col, pop) {
   if (text) {
     text.addEventListener("input", (e) => {
       st.text[col] = e.target.value || "";
+      syncSearchBox(cfg);
       cfg.render();
       again();
       // 重渲染会把面板重建，光标就丢了。打一个字跳一次焦点没法用。
@@ -2246,10 +2862,29 @@ function gfOpen(cfg, col, btn, { toggle = false } = {}) {
 }
 
 // 一个工具条只初始化一次：页面切来切去不会把监听器叠成一堆
+// 外部搜索框和列头弹窗里的输入框改的是同一份 state（text.who）。
+// 改完要把另一处的显示对齐，否则会出现「明明筛了，框里还是旧词」。
+function syncSearchBox(cfg) {
+  const box = document.getElementById(cfg.search || "");
+  if (!box) return;
+  const want = String(gfState(cfg).text.who || "");
+  if (box.value !== want) box.value = want;
+}
+
 function gfInitBar(cfg) {
   const bar = $(cfg.bar);
   if (!bar || bar.dataset.gfInit) return;
   bar.dataset.gfInit = "1";
+
+  // 常驻搜索框：输入即筛，走的是同一套 state，所以列头上的 ● 也会亮
+  const box = document.getElementById(cfg.search || "");
+  if (box) {
+    box.addEventListener("input", () => {
+      gfState(cfg).text.who = box.value;
+      gfPaint(cfg);
+      cfg.render();
+    });
+  }
   bar.addEventListener("click", (e) => {
     const head = e.target.closest(".gf-head");
     if (!head) return;
@@ -2264,6 +2899,7 @@ function gfInitBar(cfg) {
       e.stopPropagation();
       cfg.reset();
       gfClose(cfg);
+      syncSearchBox(cfg);
       cfg.render();
     });
   }
@@ -2297,6 +2933,8 @@ function matchFlag(item, flag) {
 const BOND_GF = {
   bar: "bondFilterBar",
   pop: "bondFilterPop",
+  // 列表上方那个常驻搜索框的 id。它和列头弹窗里的输入框共用 state.text.who
+  search: "bondSearch",
   state: bondFilter,
   items: () => bondData.items,
   render: renderBond,
@@ -2465,6 +3103,13 @@ function bondCard(item) {
     ? esc(item.inject_text)
     : "（这条现在不会注入：可能关系总开关关着，或字数超上限被整段丢弃）";
   const stageName = STAGE_TEXT[stage] || stage;
+  // 投喂记录：没喂过就整行不渲染，免得每张卡都挂一行「喂过 0 次」
+  const fed = item.fed || {};
+  const fedNote = Number(fed.total || 0)
+    ? `🍚 喂过 ${fed.total} 次${fed.last_dish ? `（最近：${fed.last_dish}）` : ""}${
+        fed.limit ? ` · 今天 ${fed.today ?? 0}/${fed.limit}` : ""
+      }`
+    : "";
   // 主人单独标出来：他的阶段不会停在「熟悉」，不标的话会被当成配置没生效
   const ownerTag = item.is_owner ? "👑 " : "";
   const ownerNote = item.is_owner ? " · 主人（群聊不封顶）" : "";
@@ -2506,6 +3151,7 @@ function bondCard(item) {
         item.last_talk_text || "—",
       )}${esc(idleNote)}${esc(cdNote)}</p>
       <p class="hint">${esc(tier)}</p>
+      ${fedNote ? `<p class="hint fed-note">${esc(fedNote)}</p>` : ""}
       <div class="bond-adjust">
         <span>亲密度</span>
         <input type="number" class="bond-value" data-key="${escAttr(item.key)}"
@@ -2691,6 +3337,7 @@ function matchFactFlag(row, flag) {
 const FACT_GF = {
   bar: "factFilterBar",
   pop: "factFilterPop",
+  search: "factSearch",
   state: factFilter,
   items: () => factData.items,
   render: renderFacts,
@@ -2802,18 +3449,23 @@ function matchFact(row) {
 
 function sortFacts(list) {
   const st = gfState(FACT_GF);
-  const copy = [...list];
   const mul = st.dir === "asc" ? 1 : -1;
-  if (st.sort === "total") {
-    copy.sort((a, b) => mul * (Number(a.total || 0) - Number(b.total || 0)));
-  } else if (st.sort === "keep") {
-    // 升序时「快忘光的」排前面：要清理记忆时先看到最该清的那几条
-    copy.sort((a, b) => mul * (factMinKeep(a) - factMinKeep(b)));
-  } else {
-    // 没选排序时按条数降序：和原来的默认一致，不改变习惯
-    copy.sort((a, b) => Number(b.total || 0) - Number(a.total || 0));
-  }
-  return copy;
+  // 没选排序时按条数降序：这是原来的默认，不改变习惯。
+  // 「快忘光的」只在显式选了保留度时才管排序，平时不该抢这个位置
+  const pick =
+    st.sort === "keep"
+      ? factMinKeep
+      : st.sort === "total" || !st.sort
+        ? (i) => Number(i.total || 0)
+        : null;
+  if (!pick) return [...list];
+  const cmp = (a, b) => mul * (pick(a) - pick(b));
+  // 三段式：主人 → 置顶 → 其余，和关系页同一套规矩。
+  // 以前置顶只写进了 storage，列表排序没认它，「置顶这个人」点了等于没反应
+  const owner = list.filter((i) => i.is_owner).sort(cmp);
+  const pinned = list.filter((i) => !i.is_owner && i.pinned).sort(cmp);
+  const rest = list.filter((i) => !i.is_owner && !i.pinned).sort(cmp);
+  return owner.concat(pinned, rest);
 }
 
 function renderFacts() {
@@ -2886,7 +3538,14 @@ function renderFactsBody() {
 }
 
 function factBucketCard(row) {
-  const who = row.is_owner ? `👑 ${row.sender_id}` : row.sender_id;
+  // 名字在前、QQ 在后，和关系页同一套写法：翻记忆时认名字比认号快，
+  // 号留在括号里是给「要核对是不是同一个人」的时候用的
+  const name = String(row.sender_name || "").trim();
+  const who = name
+    ? `${row.is_owner ? "👑 " : ""}${name}（${row.sender_id}）`
+    : `${row.is_owner ? "👑 " : ""}${row.sender_id}`;
+  // 手动称呼单独标：它和平台昵称不是一回事，别让人以为昵称被改过
+  const nickNote = row.nickname ? ` · 你叫他「${row.nickname}」` : "";
   // 「最近在哪个群」只是展示信息：事实按 QQ 号存，跨群共享，
   // 写在这里是为了让人知道这个人主要在哪儿出现过
   const where = row.session ? `最近在 ${esc(row.session_label)}` : "会话未知";
@@ -3011,7 +3670,7 @@ function factBucketCard(row) {
   return `<details class="session">
     <summary>
       <b>${row.pinned ? "📌 " : ""}${esc(who)}</b>
-      <span>${where}${stage}${coreNote} · ${alive}${cap} 条（生效 ${row.active} · 待观察 ${row.pending} · 疑似记错 ${row.suspect}${archived}${rejected}）${keepNote}</span>
+      <span>${where}${nickNote}${stage}${coreNote} · ${alive}${cap} 条（生效 ${row.active} · 待观察 ${row.pending} · 疑似记错 ${row.suspect}${archived}${rejected}）${keepNote}</span>
       ${fullTag}
       ${pinUserBtn}
     </summary>
@@ -3478,6 +4137,13 @@ async function submitNewSession() {
 
 Bridge.ready()
   .then(() => {
+  // 列头能点这件事没人猜得到。统一补一句悬停提示，省得每个按钮写一遍；
+  // 已经自己写了 title 的不覆盖
+  document.querySelectorAll(".gf-head").forEach((el) => {
+    if (el.title) return;
+    const name = (el.textContent || "").trim();
+    el.title = `${name}：点开按这一列筛选和排序，再点一次收起`;
+  });
   restoreTab();
   $("nav").addEventListener("click", (e) => {
     const btn = e.target.closest(".nav-item");
@@ -3497,6 +4163,7 @@ Bridge.ready()
   gfInitBar(BOND_GF);
   gfInitBar(FACT_GF);
   gfInitBar(TRAIT_GF);
+  gfInitBar(ACTIVE_GF);
   if ($("bondList")) {
     $("bondList").addEventListener("click", (e) => {
       const btn = e.target.closest("button[data-bond]");
@@ -3710,43 +4377,68 @@ Bridge.ready()
   $("resetRuntime").addEventListener("click", async () => {
     if (await manage({ action: "reset_runtime" })) { showToast("已恢复配置值"); await load(); }
   });
+  $("feedRefresh").addEventListener("click", async () => {
+    await loadFeed();
+    showToast("已刷新投喂数据");
+  });
+  $("activeRefresh").addEventListener("click", async () => {
+    await loadActive();
+    showToast("已刷新主动回复数据");
+  });
+  $("feedSearch").addEventListener("input", (e) => {
+    feedQuery.text = e.target.value || "";
+    renderFeedBoard();
+  });
   $("confirmOk").addEventListener("click", () => closeConfirm(true));
   $("confirmCancel").addEventListener("click", () => closeConfirm(false));
   $("confirmModal").addEventListener("click", (e) => {
     if (e.target === $("confirmModal")) closeConfirm(false);
   });
 
-  // 设置项：滑块拖动时实时更新显示与联动文案，松手（change）才落库
-  $("settings").addEventListener("input", (e) => {
+  // 设置项：滑块拖动时实时更新显示与联动文案，松手（change）才落库。
+  // 喂食页的参数也是同一套控件，共用这两个处理函数——所以那边不用再写一遍
+  const onSettingInput = (e) => {
     const el = e.target;
     if (!el.dataset || !el.dataset.key) return;
     if (el.type === "range") updateSlider(el);
     if (STYLE_KEYS.includes(el.dataset.key)) updateStyleNote();
-  });
+  };
+  $("settings").addEventListener("input", onSettingInput);
+  $("feedSettings").addEventListener("input", onSettingInput);
+  $("activeSettings").addEventListener("input", onSettingInput);
 
-  // 主动回复的「强度预设」：点一下整套参数一起写，不用逐个调
-  $("settings").addEventListener("click", async (e) => {
+  // 各组的一键预设：点一下整套参数一起写，不用逐个调。
+  // 参数页和主动回复页都有预设条，绑同一个处理函数
+  const onProfileClick = async (e) => {
     const btn = e.target.closest("button[data-profile]");
     if (!btn) return;
     e.preventDefault();
     const id = btn.dataset.profile;
+    const group = btn.dataset.profileGroup || "active";
     btn.disabled = true;
     try {
       const res = unpack(
-        await Bridge.apiPost("manage", { action: "apply_active_profile", profile: id }),
+        await Bridge.apiPost("manage", { action: "apply_profile", group, profile: id }),
       );
       showToast(res.message || (res.ok ? "已切换" : "切换失败"));
       if (res.ok) await load();
     } catch (err) {
-      console.error("切换主动回复预设失败:", err);
+      console.error("切换预设失败:", err);
       showToast("切换失败，请查看日志");
     } finally {
       btn.disabled = false;
     }
-  });
+  };
+  $("settings").addEventListener("click", onProfileClick);
+  $("activeSettings").addEventListener("click", onProfileClick);
 
-  $("settings").addEventListener("change", async (e) => {
+  const onSettingChange = async (e) => {
     const el = e.target;
+    // 按群开关不是配置项，是会话级状态，走另一个接口
+    if (el.dataset && el.dataset.activeGroup) {
+      await toggleActiveGroup(el.dataset.activeGroup, !!el.checked);
+      return;
+    }
     if (!el.dataset || !el.dataset.key) return;
     const key = el.dataset.key;
     const parsed = readSettingValue(el);
@@ -3762,7 +4454,10 @@ Bridge.ready()
     // 搜索模式先切联动，不必等 load() 回来
     if (key === "web_search_mode") applySearchMode(el.value);
     await saveSetting(key, parsed.value);
-  });
+  };
+  $("settings").addEventListener("change", onSettingChange);
+  $("feedSettings").addEventListener("change", onSettingChange);
+  $("activeSettings").addEventListener("change", onSettingChange);
 
   // 记住哪些会话是展开的，刷新后还原
   $("sessions").addEventListener("toggle", (e) => {

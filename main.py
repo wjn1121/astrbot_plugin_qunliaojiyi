@@ -34,13 +34,15 @@ from . import api
 from .constants import PLUGIN_AUTHOR, PLUGIN_DESC, PLUGIN_NAME, PLUGIN_VERSION
 from .core import Manager, Settings, Storage
 from .core.active import ActiveReply
-from .core.admin import admin_summary, is_admin
+from .core.admin import admin_summary, cost_summary, is_admin
 from .core.bond import BondStore
 from .core.facts import FactStore
+from .core.feed import record_feed
 from .core.profile import ProfileStore
 from .core.persona import PersonaStore
 from .core.usage import UsageTracker
 from .hooks import (
+    apply_feed_note,
     apply_tone,
     collect_message,
     detect_correction,
@@ -131,6 +133,9 @@ class QunliaoJiyi(Star):
         15 分钟冷却 + 每轮去重兜底，分段回复打多遍钩子也只记一次。
         """
         await touch_relation(self, event)
+        # 喂食要在关系之后：touch 可能因为冷却/刷屏提前放行，
+        # 而投喂有自己的一套限制（每日次数），不该被它挡掉
+        await record_feed(self, event)
 
     @filter.on_llm_request(priority=17)
     async def on_llm_request(self, event: AstrMessageEvent, req):
@@ -145,6 +150,8 @@ class QunliaoJiyi(Star):
         # 先清理再截断：清理只会让字变少，截断按清理后的长度算才准
         await apply_tone(self, event)
         await truncate_result(self, event)
+        # 投喂提示放在截断之后：它不算进回复字数，也就不会被截掉半句
+        await apply_feed_note(self, event)
 
     # ── 命令 ────────────────────────────────────────────────────────────
 
@@ -252,6 +259,22 @@ class QunliaoJiyi(Star):
             yield event.plain_result("这个命令只有管理员能用。")
             return
         yield event.plain_result(admin_summary(self, event.unified_msg_origin))
+
+    async def _cost_text(self, event: AstrMessageEvent) -> str:
+        """查消耗的共同入口，/消耗 和 /token 走同一份，省得两边口径跑偏。"""
+        if not is_admin(self, event):
+            return "这个命令只有管理员能用。"
+        return cost_summary(self, event.unified_msg_origin)
+
+    @filter.command("消耗")
+    async def cmd_cost(self, event: AstrMessageEvent):
+        """查今天的 token 消耗，按回复 / 后台分开算。"""
+        yield event.plain_result(await self._cost_text(event))
+
+    @filter.command("token")
+    async def cmd_token(self, event: AstrMessageEvent):
+        """同 /消耗，留个英文名方便记。"""
+        yield event.plain_result(await self._cost_text(event))
 
     @filter.command("学习风格")
     async def cmd_learn(self, event: AstrMessageEvent):
