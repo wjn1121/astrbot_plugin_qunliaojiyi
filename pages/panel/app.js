@@ -168,9 +168,11 @@ const TAB_TEXT = {
   usage: "Token 消费",
   settings: "参数",
   preview: "注入预览",
-  bond: "关系与输出",
+  bond: "人格与关系",
   feed: "喂食",
+  sticker: "表情包",
   active: "主动回复",
+  search: "联网搜索",
   sessions: "会话与特征",
 };
 
@@ -198,8 +200,12 @@ function switchTab(tab) {
   }
   // 投喂榜每次切过来都重拉：群里可能刚有人点过菜
   if (tab === "feed") loadFeed();
+  // 图库会被人从命令行 / 磁盘直接改，每次切过来重扫一次最省心
+  if (tab === "sticker") loadSticker();
   // 主动回复的计数一直在变，切过来就重拉一次
   if (tab === "active") loadActive();
+  // 搜索页的状态卡用的是 lastStatus 里那份配置，切过来重画一次就够
+  if (tab === "search") renderSearchPage();
   try {
     // 在 iframe 里，sessionStorage 可能被宿主的沙箱限制，失败就当没记住
     localStorage.setItem(TAB_KEY, tab);
@@ -248,13 +254,24 @@ async function load() {
     lastStatus = data;
     pinnedIds = data.pinned_ids || [];
     $("version").textContent = `v${data.version || "?"} · 从群聊里增量积累说话风格，按语境零网络注入`;
-    renderStats(data.stats || {}, data.manager || {});
+    renderStats(data.stats || {}, data.manager || {}, data.usage || {});
     renderOwnerCard(data);
     renderUsage(data);
     renderSettings(data.settings || {});
     // 喂食和主动回复各自一页，参数区也要跟着这份配置重画
     renderFeedSettings(data.settings || {});
     renderPaneSettings("active", "activeSettings", data.settings || {});
+    // 参数组已经按主题拆到各页：调风格时手边就是它影响的那批数据，
+    // 不用在「参数」页里翻 60 项
+    const cfg = data.settings || {};
+    renderSettingGroupInto("bondStyleSettings", "style", cfg);
+    renderSettingGroupInto("bondFactsSettings", "facts", cfg);
+    renderSettingGroupInto("stickerSettings", "sticker", cfg);
+    renderSettingGroupInto("budgetSettings", "budget", cfg);
+    renderSettingGroupInto("priceSettings", "price", cfg);
+    renderSettingGroupInto("searchSettings", "search", cfg);
+    renderFeatureSwitches(cfg);
+    renderTriggerHelp();
     renderSessions(data.sessions || []);
     fillPreviewSessions(data);
     renderPager(data);
@@ -267,6 +284,7 @@ async function load() {
     // 停在喂食 / 主动回复页时，保存参数引发的重载要顺带把上面的统计也刷新
     if (currentPane() === "feed") await loadFeed();
     if (currentPane() === "active") await loadActive();
+    renderSearchPage();
   } catch (err) {
     console.error("加载状态失败:", err);
     showToast("加载失败，请查看日志");
@@ -814,7 +832,7 @@ function renderOwnerCard(data) {
     .join("");
 }
 
-function renderStats(stats, manager) {
+function renderStats(stats, manager, usage) {
   const metrics = stats.metrics || {};
   // 第三个元素是悬停提示（面板里那种白底小字）。数字为什么是这个值，
   // 光看标签猜不出来，所以每个都写一句
@@ -837,17 +855,30 @@ function renderStats(stats, manager) {
     )
     .join("");
 
-  // 累计成本：让「这套机制到底花了多少」可见
+  // 累计成本：让「这套机制到底花了多少」可见。
+  // 钱、调用、搜索、图片、画像分开放——用户想知道的是「哪一块在烧钱」，
+  // 而不是只看到一个学习次数
   const calls = metrics.learn_calls ?? 0;
   const ok = metrics.learn_ok ?? 0;
   const fail = metrics.learn_fail ?? 0;
   const chars = metrics.chars_analyzed ?? 0;
+  const totals = (usage && usage.totals) || {};
+  const by = totals.by_source || {};
+  const src = (key) => Number(by[key] || 0);
+  const days = Number(totals.days || 0);
+  const span = days > 0 ? `统计了 ${days} 天的记录` : "还没有记录";
   $("cost").innerHTML = [
+    ["累计金额", `¥${fmtMoney(totals.cost || 0)}`, `本插件所有请求的估算总额，${span}。不含你和别人正常聊天`],
+    ["累计调用", totals.calls ?? 0, `所有请求次数，${span}`],
+    ["累计搜索", totals.searches ?? 0, "联网搜索次数，按次计费不占 token"],
+    ["图片判断", src("sticker"), "让模型判断「该不该发、发哪类」的次数"],
+    ["图片打标", src("sticker_tag"), "给表情包自动打标签的次数，每张图一次"],
+    ["画像训练", src("profile"), "重写个人画像的次数，一次一个人"],
     ["累计学习次数", calls, "从装上到现在一共发起了多少次学习请求"],
     ["成功 / 失败", `${ok} / ${fail}`, "失败通常是模型报错或超时，不计费"],
     ["累计分析消息", metrics.messages_analyzed ?? 0, "这些请求一共读了多少条群消息"],
     ["累计分析字数", chars >= 10000 ? `${(chars / 10000).toFixed(1)} 万` : chars, "读进来的纯文字量，token 基本按这个算"],
-    ["累计耗时", fmtDuration(Math.round(metrics.elapsed_total ?? 0)), "所有学习请求加起来花了多少时间"],
+    ["累计耗时", fmtDuration(Math.round(metrics.elapsed_total || 0)), "所有学习请求加起来花了多少时间"],
   ]
     .map(
       ([k, v, tip]) =>
@@ -865,26 +896,100 @@ function renderStats(stats, manager) {
       : "";
 }
 
-// ── 今日消耗 ────────────────────────────────────────────────────────
+// ── 消耗总览（可按今天 / 7 天 / 30 天 / 90 天 / 全部看）──────────────
+//
+// 数据一次给 90 天（usage.days），切换范围在本地聚合，不往返；
+// 「全部」走 usage.totals（跨天只累加，不重算 token）
+
+let usageRange = 7;
+
+// 把若干天加总。每天只有 cost / calls / search_calls / tokens，
+// 没有来源拆分和小时拆分——那两块只有「今天」有
+function sumUsageDays(list) {
+  const out = {
+    cost: 0,
+    calls: 0,
+    searches: 0,
+    tokens: { input_cached: 0, input_other: 0, output: 0 },
+    days: list.length,
+  };
+  list.forEach((d) => {
+    out.cost += Number(d.cost || 0);
+    out.calls += Number(d.calls || 0);
+    out.searches += Number(d.search_calls || 0);
+    const t = d.tokens || {};
+    out.tokens.input_cached += Number(t.input_cached || 0);
+    out.tokens.input_other += Number(t.input_other || 0);
+    out.tokens.output += Number(t.output || 0);
+  });
+  return out;
+}
+
+function usageSummaryOf(usage) {
+  const days = usage.days || [];
+  const totals = usage.totals || {};
+  if (usageRange === 1) {
+    const today = usage.today || {};
+    return {
+      cost: Number(today.cost) || 0,
+      calls: Number(today.calls) || 0,
+      searches: Number(today.search_calls) || 0,
+      tokens: today.tokens || { input_cached: 0, input_other: 0, output: 0 },
+      days: 1,
+      label: "今天",
+      span: String(today.date || ""),
+    };
+  }
+  if (usageRange === 0) {
+    return {
+      cost: Number(totals.cost) || 0,
+      calls: Number(totals.calls) || 0,
+      searches: Number(totals.searches) || 0,
+      tokens: null,
+      days: Number(totals.days) || 0,
+      label: "全部",
+      span: "",
+    };
+  }
+  const list = days.slice(-usageRange);
+  const sum = sumUsageDays(list);
+  const first = list.length ? list[0].date : "";
+  const last = list.length ? list[list.length - 1].date : "";
+  return {
+    ...sum,
+    label: `近 ${usageRange} 天`,
+    span: first && last ? `${first} ~ ${last}（实际有记录 ${list.length} 天）` : "",
+  };
+}
 
 function renderUsage(data) {
   const usage = data.usage || {};
   const today = usage.today || {};
-  const tokens = today.tokens || {};
+  const days = usage.days || [];
+
+  // 卡片上半部分固定讲「今天」。它回答的是「现在花了多少」，
+  // 跟着下面的趋势图一起变只会让人分不清哪个数字是哪一段的
   const cost = Number(today.cost) || 0;
-
+  const calls = Number(today.calls) || 0;
+  const searches = Number(today.search_calls) || 0;
   $("usageTop").innerHTML = `
-    <div class="usage-hero" title="按 DeepSeek 牌价估算，高峰时段翻倍。本插件自己发起的请求才算，不含你和别人正常聊天">
+    <div class="usage-hero" title="按牌价估算，高峰时段翻倍。本插件自己发起的请求才算，不含你和别人正常聊天">
       <span>今日金额</span><b>¥${esc(fmtMoney(cost))}</b></div>
-    <div class="stat" title="今天一共发起了几次模型请求。搜索单独计数，不占这里">
-      <span>今日调用</span><b>${esc(today.calls ?? 0)}</b></div>
-    <div class="stat" title="联网搜索的次数。按次单独计费，不占 token">
-      <span>今日搜索</span><b>${esc(today.search_calls ?? 0)}</b></div>`;
+    <div class="stat" title="今天发起了几次模型请求。搜索单独计数，不占这里">
+      <span>今日调用</span><b>${esc(fmtCount(calls))}</b></div>
+    <div class="stat" title="今天的联网搜索次数，按次单独计费，不占 token">
+      <span>今日搜索</span><b>${esc(fmtCount(searches))}</b></div>`;
 
+  const span = $("usageSpan");
+  if (span) {
+    span.textContent = today.date ? `${today.date} · 按北京时间自然日` : "";
+  }
+
+  const t = today.tokens || {};
   $("usageTokens").innerHTML = [
-    ["缓存命中输入", fmtCount(tokens.input_cached), "命中了前缀缓存的部分，价格只有未命中的三十分之一"],
-    ["未命中输入", fmtCount(tokens.input_other), "没命中缓存、按原价算的输入。改 system prompt 会让这个数暴涨"],
-    ["输出", fmtCount(tokens.output), "模型吐出来的字。输出价是缓存命中输入价的九十倍"],
+    ["缓存命中输入", fmtCount(t.input_cached || 0), "命中了前缀缓存的部分，价格只有未命中的三十分之一"],
+    ["未命中输入", fmtCount(t.input_other || 0), "没命中缓存、按原价算的输入。改 system prompt 会让这个数暴涨"],
+    ["输出", fmtCount(t.output || 0), "模型吐出来的字。输出价是缓存命中输入价的九十倍"],
   ]
     .map(
       ([k, v, tip]) =>
@@ -896,7 +1001,387 @@ function renderUsage(data) {
 
   renderUsageSource(usage);
   renderHours(usage);
-  renderBars(usage.days || []);
+
+  // 趋势图：7 天 / 30 天两档。柱子多了按「密集」处理，间距压到 1px，
+  // 否则 8px × 29 个间距就能把卡片撑破
+  const seg = $("usageRange");
+  if (seg) {
+    [...seg.querySelectorAll("button")].forEach((b) => {
+      b.classList.toggle("on", Number(b.dataset.range) === usageRange);
+    });
+  }
+
+  const shown = days.slice(-usageRange);
+  const first = shown[0] ? shown[0].date : "";
+  const last = shown[shown.length - 1] ? shown[shown.length - 1].date : "";
+  const note = $("usageBarsNote");
+  if (note) {
+    note.textContent = !shown.length
+      ? "还没有消耗记录"
+      : shown.length === 1
+        ? `${first} · 今天这一根`
+        : `${first} ~ ${last} · 共 ${shown.length} 天，悬停看当天金额与调用次数`;
+  }
+  renderBars(shown);
+
+  renderTotals(usage);
+  renderBudgetBar(usage);
+}
+
+// ── 累计消耗 ─────────────────────────────────────────────────────────
+//
+// 分成「总量」和「按来源」两块。用户真正想知道的是「哪一块在烧钱」，
+// 光看一个总额没有行动意义
+
+const TOTAL_SOURCE_LABEL = {
+  reply: "被叫回复",
+  active: "主动插话",
+  bot: "其他回复",
+  learn: "学习提炼",
+  profile: "画像生成",
+  judge: "插话判定",
+  sticker: "图片判断",
+  sticker_tag: "图片打标",
+  search: "联网搜索",
+};
+
+function renderTotals(usage) {
+  const box = $("usageTotal");
+  if (!box) return;
+  const t = (usage && usage.totals) || {};
+  const days = Number(t.days || 0);
+  const cost = Number(t.cost || 0);
+  const calls = Number(t.calls || 0);
+  const searches = Number(t.searches || 0);
+  const perDay = days > 0 ? cost / days : 0;
+
+  box.innerHTML = [
+    ["累计金额", `¥${fmtMoney(cost)}`, "从装上到现在，本插件所有请求的估算总额。不含你和别人正常聊天"],
+    ["累计调用", fmtCount(calls), "所有模型请求次数。搜索按次算，不在这项里"],
+    ["累计搜索", fmtCount(searches), "联网搜索次数，按次计费、不占 token"],
+    ["日均", `¥${fmtMoney(perDay)}`, days > 0 ? `按有记录的 ${days} 天摊平` : "还没有记录"],
+    ["记录天数", `${days} 天`, "受「计价 → 消耗记录保留天数」限制，默认留 400 天"],
+  ]
+    .map(
+      ([k, v, tip]) =>
+        `<div class="stat" title="${escAttr(tip)}"><span>${esc(k)}</span><b>${esc(v)}</b></div>`,
+    )
+    .join("");
+
+  const src = $("usageTotalSource");
+  if (!src) return;
+  const by = t.by_source || {};
+  const rows = Object.entries(by)
+    .filter(([, n]) => Number(n) > 0)
+    .sort((a, b) => Number(b[1]) - Number(a[1]));
+  if (!rows.length) {
+    src.innerHTML =
+      '<p class="hint">还没有按来源的记录。跑几轮学习或聊天就会有了。</p>';
+    return;
+  }
+  const top = Number(rows[0][1]) || 1;
+  src.innerHTML =
+    '<p class="ub-title">按来源（次数）</p>' +
+    rows
+      .map(([key, n]) => {
+        const label = TOTAL_SOURCE_LABEL[key] || key;
+        const width = Math.max(2, Math.round((Number(n) / top) * 100));
+        return `<div class="tot-row" title="${escAttr(label)}：${n} 次">
+          <span>${esc(label)}</span>
+          <i style="width:${width}%"></i>
+          <b>${esc(fmtCount(n))}</b>
+        </div>`;
+      })
+      .join("");
+}
+
+// 每日预算条：已花 / 上限 + 一条进度。超支要一眼能看出来是「已经收摊了」，
+// 而不是「数字到顶了但还在照常花钱」
+function renderBudgetBar(usage) {
+  const box = $("budgetBar");
+  if (!box) return;
+  const b = (usage && usage.budget) || {};
+  const limit = Number(b.limit || 0);
+  if (!b.enabled || limit <= 0) {
+    box.innerHTML =
+      '<p class="hint">上限没开。开着的话，花到金额就自动停掉学习、主动回复、画像生成、联网搜索，表情包退回关键词。</p>';
+    return;
+  }
+
+  const spent = Number(b.spent || 0);
+  const over = !!b.over_limit;
+  const bypass = !!b.bypassed;
+  const width = Math.min(100, Math.round((spent / limit) * 100));
+
+  // 三种状态各给一句话和一颗按钮：
+  // 没超 → 不用管；超了 → 可以「今天先放开」；已放开 → 可以「恢复限制」
+  let status;
+  let action = "";
+  if (bypass) {
+    status = `<span class="bypass">今天已放开${over ? "，超支也不再拦" : ""}，明早额度刷新后自动恢复</span>`;
+    action = '<button type="button" class="ghost tiny" data-budget="relock" title="立刻恢复按上限拦截">恢复限制</button>';
+  } else if (over) {
+    status = '<span class="over">已到上限，花钱的功能全部收摊，明天零点恢复</span>';
+    action = '<button type="button" class="ghost tiny" data-budget="release" title="只放开今天。不改任何配置，明早自动回到正常拦截">今天先放开</button>';
+  } else {
+    status = `<span>还能花 ¥${esc(fmtMoney(b.remain || 0))}</span>`;
+  }
+
+  box.innerHTML = `
+    <div class="budget-line">
+      <span>今日已花 <b>¥${esc(fmtMoney(spent))}</b> / ¥${esc(fmtMoney(limit))}</span>
+      <span class="budget-acts">${status}${action}</span>
+    </div>
+    <div class="budget-track"><i class="${over && !bypass ? "over" : ""}" style="width:${width}%"></i></div>
+    <p class="hint">跨零点自动归零；手动放开也只算今天，第二天照样按上限拦。金额是面板估算值，受下面「计价」影响，不等于账单。</p>`;
+}
+
+// ── 联网搜索页 ───────────────────────────────────────────────────────
+
+function renderSearchPage() {
+  const box = $("searchStatus");
+  const note = $("searchNote");
+  if (!box) return;
+  const st = (lastStatus && lastStatus.search) || {};
+  const cfg = (lastStatus && lastStatus.settings) || {};
+  const on = !!cfg.web_search_enabled;
+  const mode = String(st.mode || cfg.web_search_mode || "plugin");
+  const provider = String(st.provider || "").toLowerCase();
+  const names = { deepseek: "DeepSeek", tavily: "Tavily", bocha: "博查", brave: "Brave" };
+  const usable = on && mode !== "off" && (mode === "inherit" || st.key_configured);
+
+  box.innerHTML = [
+    ["总开关", on ? "已开" : "已关", "关着的时候连搜索工具都不挂，模型不知道有这回事"],
+    ["接管模式", mode === "inherit" ? "跟随 AstrBot" : mode === "off" ? "已关闭" : "插件接管", "插件接管才能按群限次和统计次数"],
+    ["服务商", names[provider] || provider || "未选", "决定单次价格和额度"],
+    ["key", st.key_configured ? "已配置" : "没配", "没配 key 的话，配了服务商也搜不了"],
+    ["按群每日上限", `${st.daily_limit ?? 0} 次`, "每群每天最多搜几次，只在插件接管模式下生效"],
+    ["单轮最多", `${st.max_per_turn ?? 0} 次`, "一轮回复里最多搜几次，防止模型连搜"],
+  ]
+    .map(
+      ([k, v, tip]) =>
+        `<div class="stat" title="${escAttr(tip)}"><span>${esc(k)}</span><b>${esc(v)}</b></div>`,
+    )
+    .join("");
+
+  if (!note) return;
+  note.className = "hint";
+  if (!on) {
+    note.textContent = "总开关关着，群里不会搜。要用就把上面的开关打开。";
+  } else if (mode === "off") {
+    note.textContent = "「接管模式」选的是「关闭搜索工具」，就算总开关开着也不会搜。";
+    note.classList.add("err");
+  } else if (mode === "inherit") {
+    note.textContent = "跟随 AstrBot 全局设置：插件看不到搜索次数，也没法按群限次。";
+  } else if (!st.key_configured) {
+    note.textContent = "服务商的 key 还没配，这个模式下搜不了。DeepSeek 的搜索 key 和模型 key 是同一个。";
+    note.classList.add("err");
+  } else {
+    note.textContent = `可以搜。${names[provider] || provider} 每次约 ¥0.005，按群每天最多 ${st.daily_limit ?? 0} 次。`;
+  }
+}
+
+// ── 功能总开关（主动回复 / 喂食 / 联网搜索）─────────────────────────
+//
+// 这三个开关单独放在各页顶部，不塞进参数网格：它们是「这个功能开不开」，
+// 不是「这个功能怎么调」——混在十几项里，用户会找不到
+
+function renderFeatureSwitches(settings) {
+  [
+    ["activeEnabled", "active_reply_enabled"],
+    ["feedEnabled", "feed_enabled"],
+    ["searchEnabled", "web_search_enabled"],
+    ["stickerEnabled", "sticker_enabled"],
+  ].forEach(([id, key]) => {
+    const el = $(id);
+    if (el) el.checked = !!settings[key];
+  });
+}
+
+function bindFeatureSwitch(id, key) {
+  const el = $(id);
+  if (!el) return;
+  el.addEventListener("change", async () => {
+    const on = el.checked;
+    if (id === "searchEnabled" && on) {
+      const cfg = (lastStatus && lastStatus.settings) || {};
+      if (!cfg.web_search_provider) {
+        // 没配服务商时直接开，多半是白开——先提示一句，别默默不生效
+        showToast("搜索服务商还没选，去下面「搜索参数」里配一下");
+      }
+    }
+    await saveSetting(key, on);
+  });
+}
+
+// ── 概览页：群里怎么触发 ─────────────────────────────────────────────
+//
+// 面板有十二页，但「在群里发什么能让它动」这件事从来没人说清楚过。
+// 这份清单按左边导航排，点标题直接跳过去
+
+const TRIGGER_HELP = [
+  {
+    tab: "library",
+    icon: "📚",
+    name: "学习库",
+    rows: [
+      ["命令", "<code>/学习风格</code> 立刻提炼一次本群，回你学到的稳定风格和场景化表达条数"],
+      ["命令", "<code>/风格状态</code> 看风格强度、特征条数、主动回复今日次数、搜索配额、今日消耗"],
+      ["命令", "<code>/记忆审核</code> 列出待审条目；<code>/记忆审核 批准 3</code>、<code>否决 3</code>、<code>全批准</code>"],
+      ["命令", "<code>/清空风格</code> 清掉这个群学到的风格，不影响手动加的"],
+      ["命令", "<code>/清空风格 全部</code> 然后在 60 秒内发 <code>/确认清空</code>，连手动记忆和待学习缓冲一起清"],
+      ["命令", "<code>/清空记忆</code> 只清手动记的；<code>/清空记录</code> 只清待学习的缓冲消息"],
+      ["自动", "攒够新消息数、且过了最小间隔，后台自动提炼一次。门槛在「参数 → 学习节奏」里调"],
+      ["注意", "以 <code>/</code> 开头的消息不进学习缓冲；60 秒内超过 15 条算刷屏，刷屏的那几条也不收"],
+    ],
+  },
+  {
+    tab: "bond",
+    icon: "🎭",
+    name: "人格与关系",
+    rows: [
+      ["命令", "<code>/关系</code> 看 bot 和这个群里每个人的好感档位、认识几天、聊过几轮"],
+      ["命令", "<code>/称呼 老王</code> 让它以后叫你老王；不带参数则清除，回落到群昵称"],
+      ["命令", "<code>/记得 我不吃香菜</code> 手动记一条（60 字以内，敏感信息会被拒收）"],
+      ["命令", "<code>/忘掉 香菜</code> 或 <code>/忘掉 f_0001</code> 删掉一条记忆"],
+      ["自动", "好感只在 bot 真的回过话之后才涨；群里旁听也涨，但涨得慢，且有每日上限"],
+      ["自动", "被短骂会掉好感：滚 / 闭嘴 / 讨厌你 / 傻逼 这类词命中才扣，长消息里的「不对」不算"],
+      ["自动", "说「不对 / 记错了 / 我没说过」会把 900 秒内注入过的那条事实标成「疑似记错」，本轮不再争辩"],
+      ["注意", "<code>/关系</code> 和 <code>/称呼</code> 需要先在面板里打开「关系」；<code>/记得</code> 和 <code>/忘掉</code> 需要打开「事实记忆」"],
+    ],
+  },
+  {
+    tab: "feed",
+    icon: "🍚",
+    name: "喂食",
+    rows: [
+      ["自动", "群友发 <code>吃什么</code>，另一个插件随机出菜时，这边自动记一次投喂并加好感"],
+      ["自动", "群友发 <code>点菜 红烧肉</code>，出菜时加得更多——明确说了要吃什么，比随手一问值钱"],
+      ["注意", "需要装「吃什么」插件，两边用同一个机器人账号。没装就是空转，不报错也没反应"],
+      ["注意", "每人每天有投喂次数上限，超了会回「今日投喂已到上限」，不再加分"],
+    ],
+  },
+  {
+    tab: "sticker",
+    icon: "🤣",
+    name: "表情包",
+    rows: [
+      // 命令排前面：这一块主要是给人查命令的，自动行为放折叠里够用
+      ["命令", "<code>/表情包</code> 看图库总数、今天发了多少次、各分类各有几张"],
+      ["命令", "<code>/收图 笑 熊猫头</code> 把这条消息里的图收进「笑」，后面的词当标签（管理员）"],
+      ["命令", "<code>/收表情</code> 只报这个号收藏了多少张表情，不下载"],
+      ["命令", "<code>/收表情 全部</code> 把收藏夹同步进图库，一次最多 200 张，按内容去重"],
+      ["命令", "<code>/收表情 50 笑</code> 只收前 50 张并放进「笑」；不带分类就进「待整理」"],
+      ["自动", "先说一句被关键词命中的话，命中后按概率发；群友发图时也会跟着甩一张"],
+      ["自动", "开了队形之后，30 秒内群里凑够 3 张图会跟着刷一张；开了连发，刚发完一张还会再补一张"],
+      ["注意", "关键词只在「关键词」模式下直接发图；换到「模型自报」或「事后分析」模式后，判断交给模型"],
+    ],
+  },
+  {
+    tab: "active",
+    icon: "🗣",
+    name: "主动回复",
+    rows: [
+      ["自动", "到点自己看一眼群里的动静，觉得该接话就接一句。按窗口掷骰不按消息，群越热闹越不容易被插话"],
+      ["自动", "有静默时段、冷却、群日限和单人日限；连续几次开口没人接会退避，冷却最多放大 4 倍"],
+      ["自动", "群里十分钟不足 3 条就不开口；纯图、纯表情、以 <code>/</code> 开头的消息都不算由头"],
+      ["注意", "这是唯一会凭空产生请求的功能，默认关。开着才有上面这些行为"],
+    ],
+  },
+  {
+    tab: "persona",
+    icon: "🧬",
+    name: "人格档案",
+    rows: [
+      ["纯面板", "每个群一份 markdown，自动段随学习更新，人工段永远归你。群里没有命令"],
+      ["自动", "学习结束后会按已生效的特征重写自动段；没有已生效特征时只写占位说明"],
+    ],
+  },
+  {
+    tab: "sessions",
+    icon: "💬",
+    name: "会话与特征",
+    rows: [
+      ["纯面板", "逐条看、改、删原始特征，也能单独开关某个会话的学习和注入"],
+      ["注意", "面板关掉某个会话的学习，后台调度也不会再提炼它——两边用的是同一份判定"],
+    ],
+  },
+  {
+    tab: "preview",
+    icon: "🔍",
+    name: "注入预览",
+    rows: [
+      ["纯面板", "输入一句话，看这一轮实际会往 prompt 里塞什么、让位概率多少。只算不写，不动任何数据"],
+      ["命令", "群里想看同类信息用 <code>/风格状态</code>（管理员）"],
+    ],
+  },
+  {
+    tab: "usage",
+    icon: "💸",
+    name: "Token 消费",
+    rows: [
+      ["命令", "<code>/消耗</code> 看今天花了多少、花在哪，附本群金额"],
+      ["命令", "<code>/token</code> 和 <code>/消耗</code> 完全同一份输出，记哪个都行"],
+      ["注意", "被叫回复和主动插话分开记，能看出钱花在「你问它」还是「它自己开口」"],
+      ["注意", "搜索按次单独计费，不占 token；主动插话那一轮永远不搜"],
+    ],
+  },
+  {
+    tab: "search",
+    icon: "🌐",
+    name: "联网搜索",
+    rows: [
+      ["自动", "模型自己判断这条需要查一下才搜，不是每条都搜。工具名和 AstrBot 内置的一致"],
+      ["注意", "总开关关着时连工具都不挂，模型不知道有这回事，也不会浪费 token 去试"],
+      ["注意", "配额按群算，当天用完就不再挂工具；只有拿到非空结果才扣次数"],
+    ],
+  },
+  {
+    tab: "settings",
+    icon: "⚙️",
+    name: "参数",
+    rows: [
+      ["纯面板", "剩下的不分页的开关：总开关、学习节奏、管理员对话调参、回复长度与拆条"],
+      ["命令", "管理员可以在群里直接说「把风格强度调到 80」，模型会调 <code>set_setting</code> 工具（需打开管理员工具）"],
+      ["注意", "只有白名单里的参数能这样改，其余会回「不支持修改这个配置项」"],
+    ],
+  },
+];
+
+// 每组默认只露前 5 条，剩下的折起来。命令类的东西列全才有用，
+// 但十几条一起铺开会把别的页面挤没
+const HELP_PREVIEW = 5;
+
+// 标签的中文只用来显示，样式挂英文 key——CSS 里写中文类名容易在手改时出错
+const KIND_TAG = { 命令: "cmd", 自动: "auto", 注意: "warn", 纯面板: "ui", 关键词: "kw" };
+
+function renderTriggerHelp() {
+  const box = $("triggerHelp");
+  if (!box) return;
+  const rowHtml = (rows) =>
+    `<ul class="help-rows">${rows
+      .map(
+        ([kind, text]) =>
+          `<li><em class="help-kind" data-k="${KIND_TAG[kind] || "ui"}">${esc(
+            kind,
+          )}</em><span>${text}</span></li>`,
+      )
+      .join("")}</ul>`;
+
+  box.innerHTML = TRIGGER_HELP.map((g) => {
+    const head = g.rows.slice(0, HELP_PREVIEW);
+    const rest = g.rows.slice(HELP_PREVIEW);
+    const more = rest.length
+      ? `<details class="help-more"><summary>展开另外 ${rest.length} 条</summary>${rowHtml(rest)}</details>`
+      : "";
+    return `<div class="help-group">
+      <button type="button" class="help-head" data-goto="${escAttr(g.tab)}"
+              title="跳到「${escAttr(g.name)}」">
+        <span>${g.icon}</span><b>${esc(g.name)}</b><i>→</i>
+      </button>
+      ${rowHtml(head)}${more}
+    </div>`;
+  }).join("");
 }
 
 // ── 今日消耗构成 ─────────────────────────────────────────────────────
@@ -1113,18 +1598,31 @@ function renderBars(days) {
   }
   const costs = days.map((d) => Number(d.cost) || 0);
   const max = Math.max(...costs, 0.0001);
+
+  // 90 天要画 90 根，但标签不能 90 个——每个都是一串日期，
+  // 挤在一起会糊成一条黑边（上一版就是这样，页面看着像卡死了）。
+  // 这里按「最多 8 个标签」抽稀，柱子照旧每根一个。
+  // 除以 7 而不是 8：最后一天无论是否命中倍数都会额外显示，
+  // 按 8 算实际会出 9 个标签，30 天时就挤了
+  const step = Math.ceil(days.length / 7);
   box.innerHTML = days
     .map((d, i) => {
       const cost = costs[i];
       const height = Math.max(2, Math.round((cost / max) * 100));
       const label = `${d.date} · ¥${fmtMoney(cost)} · ${d.calls ?? 0} 次调用`;
+      // 最后一个永远显示，不然「今天」那根没有标签
+      const show = i % step === 0 || i === days.length - 1;
+      const text = show ? String(d.date || "").slice(5) : "";
       return `<div class="bar${i === days.length - 1 ? " today" : ""}">
         <span class="bar-tip">${esc(label)}</span>
         <div class="bar-col"><i style="height:${height}%"></i></div>
-        <em>${esc(String(d.date || "").slice(5))}</em>
+        <em>${esc(text)}</em>
       </div>`;
     })
     .join("");
+  // 超过 10 根就进密集模式：7 天用正常间距好看，30 天再用 8px 间距
+  // 光间距就要 232px，柱子会被挤没、卡片会被撑破
+  box.classList.toggle("dense", days.length > 10);
 }
 
 // 「本群今日搜索 x/y」：优先用预览选中的会话，否则取搜得最多的那个群
@@ -1158,6 +1656,20 @@ function renderUsageSearch(data) {
 // 参数页的顺序不用定义顺序决定，看 order 字段——
 // 想调整分组位置只改数字，不用搬几十行代码。
 // 排法：先「这是谁、怎么说话」，再「怎么学、记什么」，最后是外部能力和运维。
+// 装了参数组的容器。新增一页带参数的，记得把容器 id 加进来，
+// 否则滑块不会联动、改了也不会落库
+const SETTING_HOSTS = [
+  "settings",
+  "feedSettings",
+  "activeSettings",
+  "bondStyleSettings",
+  "bondFactsSettings",
+  "stickerSettings",
+  "budgetSettings",
+  "priceSettings",
+  "searchSettings",
+];
+
 const SETTING_GROUPS = [
   {
     id: "global",
@@ -1227,6 +1739,8 @@ const SETTING_GROUPS = [
   {
     id: "style",
     order: 30,
+    // 和「关系」「事实」挤在一页：调风格强度时手边就是它影响的那些数据
+    pane: "bond",
     profileGroup: "style",
     title: "🎭 风格与人格",
     sub: "调低＝省钱＋更像人设，调高＝更像群里的人",
@@ -1266,6 +1780,7 @@ const SETTING_GROUPS = [
   {
     id: "facts",
     order: 60,
+    pane: "bond",
     profileGroup: "facts",
     title: "🧠 事实记忆与个人画像",
     sub: "上面三个是遗忘节奏（多久没提就忘），下面是画像（这个人是谁）",
@@ -1362,8 +1877,79 @@ const SETTING_GROUPS = [
     ],
   },
   {
+    id: "sticker",
+    order: 75,
+    // 参数和档位、图库放在同一页：调完立刻能看图
+    pane: "sticker",
+    title: "🤣 表情包",
+    sub: "命中关键词或群友发图时甩一张。本地判定，不发请求，token 0",
+    items: [
+      {
+        key: "sticker_mood_mode", label: "情绪从哪来", type: "select", default: "keyword",
+        options: [
+          ["off", "关闭：不发图"],
+          ["keyword", "关键词：只看字面（0 成本）"],
+          ["analyze", "事后分析：回复完另调小模型（约 26 token/轮）"],
+          ["marker", "模型自报：让模型在回复里打标记（约 70 token/轮）"],
+        ],
+        hint: "决定「什么时候该发」交给谁。keyword 不花钱但只认几个词；analyze 不碰回复格式，但看不到前文；marker 最准——模型本来就读完了上下文，顺手打个标记，发送前会剥掉，用户看不见。影响：前两项 0，后两项按上下文计 token。",
+      },
+      {
+        key: "sticker_mood_rate", label: "smart 模式的触发率", type: "slider",
+        min: 0, max: 100, step: 5, default: 30,
+        hint: "marker 模式是「多少比例的轮次告诉模型可以发表情」，analyze 是「多少轮次真的去调模型」。这是省钱的闸：30 表示七成轮次它根本不知道有这回事。影响：token 按比例线性变。",
+      },
+      {
+        key: "sticker_probability", label: "关键词命中后发出的概率", type: "slider",
+        min: 0, max: 100, step: 5, default: 25,
+        hint: "「哈哈」这种词群里一分钟能出现十次，每句都甩图就成了刷屏机器人。25 大致是偶尔接得住梗。marker / analyze 模式下模型已经判断过一次，这里可以放到 100。影响：token 0。",
+      },
+      {
+        key: "sticker_follow_image", label: "群友发图时跟着发一张", type: "bool", default: true,
+        hint: "斗图的本体。不判断对方发的是什么图——那要视觉模型，每张都要钱，而斗图本来也不需要对上意思。影响：token 0。",
+      },
+      {
+        key: "sticker_follow_probability", label: "跟图 / 连发的概率", type: "slider",
+        min: 0, max: 100, step: 5, default: 15,
+        hint: "群里发图很频繁，15% 加上冷却已经足够像在参与。开了连发时也复用这个概率。影响：token 0。",
+      },
+      {
+        key: "sticker_chain", label: "连发：发完一张再补一张", type: "bool", default: false,
+        hint: "刚甩完一张图，按上面的概率再补一张同类的。纯本地，0 成本。影响：token 0。",
+      },
+      {
+        key: "sticker_formation", label: "队形：群友刷图时跟着刷", type: "bool", default: false,
+        hint: "30 秒内群里有 3 张图，跟着甩一张。这是「大家都在发我也发」的从众，不判断该不该发。纯本地，0 成本。影响：token 0。",
+      },
+      {
+        key: "sticker_cooldown_seconds", label: "同群两次发图的最小间隔", type: "int",
+        min: 0, max: 3600, step: 30, default: 120,
+        hint: "所有来源共用这一道闸。调小会明显变吵。影响：token 0。",
+      },
+      {
+        key: "sticker_daily_limit", label: "每天最多发几张", type: "int",
+        min: 0, max: 500, step: 5, default: 40,
+        hint: "所有群合计，最硬的那道闸——概率写得再高也超不过它。0 = 当天不发。影响：token 0。",
+      },
+      {
+        key: "sticker_analyze_provider_id", label: "分析模式用的模型 ID", type: "text", default: "",
+        hint: "留空跟随当前会话。换成便宜的小模型能显著降低这一项开销。影响：token ↓（换便宜模型）。",
+      },
+      {
+        key: "sticker_search_first", label: "先按标签全库检索", type: "bool", default: true,
+        hint: "拿到回复原文后，拿它去撞每张图的标签，命中就直接发那一张——比「模型选分类、桶内随机」准，而且不发请求、不花 token。没命中再退回分类。影响：token 0。",
+      },
+      {
+        key: "sticker_search_threshold", label: "检索的最低分", type: "slider",
+        min: 0, max: 6, step: 0.1, default: 1.5,
+        hint: "1.5 表示只算内容标签——提到吃白饭、智械危机、离谱才算命中，光提一句「大肥鱼」不发图。稀有标签权重更高，到处都是的标签几乎不算分。调高更挑，调低更容易发。影响：token 0。",
+      },
+    ],
+  },
+  {
     id: "search",
     order: 70,
+    pane: "search",
     title: "🌐 联网搜索",
     sub: "每次搜索约多 1200 token",
     items: [
@@ -1401,8 +1987,28 @@ const SETTING_GROUPS = [
     ],
   },
   {
+    id: "budget",
+    order: 5,
+    // 只出现在「Token 消费」页：上限是跟着钱走的，和牌价放在同一页最顺
+    pane: "usage",
+    title: "🛑 每日预算",
+    sub: "花到上限自动收摊，跨零点恢复",
+    items: [
+      {
+        key: "daily_budget_enabled", label: "启用每日上限", type: "bool", default: false,
+        hint: "开启后，当天累计花费达到上限就自动停掉所有还会发请求的功能：学习、主动回复、画像生成、联网搜索；表情包退回关键词模式（还发图，不花判断的钱）。消息照常收集，恢复正常后不会断层。影响：token ↓↓（超支后）。",
+      },
+      {
+        key: "daily_budget_yuan", label: "每天最多花（元）", type: "float", min: 0, max: 200, step: 0.5, default: 2,
+        hint: "按面板估算的金额算，受下面「计价」里的牌价影响，不是账单。改完立刻生效，不用等明天。填 0 等于关掉。影响：token ↓↓（超支后）。",
+      },
+    ],
+  },
+  {
     id: "price",
     order: 90,
+    // 牌价只影响金额换算，放在「Token 消费」最底下最顺
+    pane: "usage",
     title: "💰 计价",
     sub: "只影响面板估的金额，不影响真实扣费",
     items: [
@@ -1453,12 +2059,15 @@ const PROFILE_LABELS = {
   learn: "学习强度",
   style: "风格档位",
   facts: "记忆档位",
+  sticker: "强度档位",
 };
 
-function profileBar(groupKey, settings) {
+function profileBar(groupKey, settings, override) {
   const all = (lastStatus && lastStatus.profiles) || {};
-  // 老浏览器缓存了旧 app.js 时只有 active_profiles，这里兜一下
+  // override 给「自带档位数据」的页面用（表情包页单独拉接口，
+  // 不一定是先打开概览才进得来）
   const profiles =
+    override ||
     all[groupKey] ||
     (groupKey === "active" && lastStatus && lastStatus.active_profiles) ||
     [];
@@ -1677,7 +2286,7 @@ function renderActiveStats() {
     .join("");
 
   const notes = [];
-  if (!activeGlobalOn) notes.push("总开关现在是关着的，下面群开了也不会插话——往上翻参数区打开它。");
+  if (!activeGlobalOn) notes.push("总开关现在是关着的，下面群开了也不会插话——打开这一页顶部的开关。");
   if (limit > 0 && total >= limit * Math.max(1, on)) {
     notes.push(`今天所有群都接近或达到上限（每群 ${limit} 次），想多说只能改「每群每日上限」。`);
   }
@@ -1784,11 +2393,14 @@ const feedQuery = { text: "" };
 
 // 参数区复用参数页那套渲染，输入框的 data-key 一样，保存走同一个接口。
 // 主动回复和喂食各自成页，但参数行的长相和交互不该有两套
-function renderPaneSettings(paneId, containerId, settings) {
+// 按「组 id」渲染到指定容器。一个页面可能要放好几组（人格与关系页要放
+// 风格、事实两组，各在自己的卡片里），所以这里不按 pane 找，直接点名
+function renderSettingGroupInto(containerId, groupId, settings) {
   const box = $(containerId);
-  if (!box) return;
-  const group = SETTING_GROUPS.find((g) => g.pane === paneId);
-  if (!group) return;
+  if (!box) return false;
+  const group = SETTING_GROUPS.find((g) => g.id === groupId);
+  if (!group) return false;
+
   const overrides = settings._runtime_overrides || {};
   const head = group.profileGroup ? profileBar(group.profileGroup, settings) : "";
   box.innerHTML =
@@ -1796,6 +2408,31 @@ function renderPaneSettings(paneId, containerId, settings) {
     `<div class="set-grid">${group.items
       .map((def) => settingRow(def, settings, overrides))
       .join("")}</div>`;
+
+  if (groupId === "search") {
+    if (!box.querySelector(".group-note")) {
+      box.insertAdjacentHTML(
+        "afterbegin",
+        '<span class="group-note" id="searchNote"></span>',
+      );
+    }
+    applySearchMode(settings.web_search_mode || "plugin");
+  }
+
+  // 风格组底下有一行「当前这套强度大概多少字」，渲染完要立刻算一次
+  if (groupId === "style") {
+    if (!box.querySelector(".compute")) {
+      box.insertAdjacentHTML("beforeend", '<p class="hint compute" id="styleNote"></p>');
+    }
+    updateStyleNote();
+  }
+  return true;
+}
+
+function renderPaneSettings(paneId, containerId, settings) {
+  const group = SETTING_GROUPS.find((g) => g.pane === paneId);
+  if (!group) return;
+  renderSettingGroupInto(containerId, group.id, settings);
 }
 
 function renderFeedSettings(settings) {
@@ -1844,7 +2481,7 @@ function renderFeedBoard() {
       ? `当前一次随机推荐 +${gainRandom} 点、一次点菜 +${gainOrder} 点好感。`
       : "两个加成都是 0，现在投喂只记次数、不加好感。",
   );
-  if (!enabled) notes.push("喂食总开关关着，投喂不会被记录。");
+  if (!enabled) notes.push("喂食总开关关着，投喂不会被记录——开关在页面顶部。");
   notes.push(
     "投喂的加分同样占「单日单人上限」的额度，所以它不会变成绕开日限的捷径；" +
       "打满之后就只记次数、不再涨分。",
@@ -4285,6 +4922,38 @@ Bridge.ready()
       }, 120);
     });
   }
+  // 消耗范围：今天 / 7 天 / 30 天 / 90 天 / 全部。数据已经在本地，
+  // 切范围只重画，不再往返
+  const rangeSeg = $("usageRange");
+  if (rangeSeg) {
+    rangeSeg.addEventListener("click", (e) => {
+      const btn = e.target.closest("button[data-range]");
+      if (!btn) return;
+      usageRange = Number(btn.dataset.range) || 0;
+      if (lastStatus) renderUsage(lastStatus);
+    });
+  }
+
+  // 预算条的「今天先放开 / 恢复限制」：按钮是重画出来的，走事件委托
+  const budgetBox = $("budgetBar");
+  if (budgetBox) {
+    budgetBox.addEventListener("click", async (e) => {
+      const btn = e.target.closest("[data-budget]");
+      if (!btn) return;
+      const on = btn.dataset.budget === "release";
+      try {
+        const res = unpack(
+          await Bridge.apiPost("manage", { action: "budget_release", on }),
+        );
+        if (res && res.success === false) throw new Error(res.message || "操作失败");
+        showToast((res && res.message) || (on ? "今天已放开" : "已恢复限制"));
+        await load();
+      } catch (err) {
+        showToast(err.message || "操作失败");
+      }
+    });
+  }
+
   // 24 小时图切「金额 / 次数」：只换这一张图，不重新请求
   const hourSeg = $("hourMetric");
   if (hourSeg) {
@@ -4381,6 +5050,7 @@ Bridge.ready()
     await loadFeed();
     showToast("已刷新投喂数据");
   });
+  bindSticker();
   $("activeRefresh").addEventListener("click", async () => {
     await loadActive();
     showToast("已刷新主动回复数据");
@@ -4403,9 +5073,13 @@ Bridge.ready()
     if (el.type === "range") updateSlider(el);
     if (STYLE_KEYS.includes(el.dataset.key)) updateStyleNote();
   };
-  $("settings").addEventListener("input", onSettingInput);
-  $("feedSettings").addEventListener("input", onSettingInput);
-  $("activeSettings").addEventListener("input", onSettingInput);
+  // 参数组现在分在六七个页面里，每个容器都要接同一套联动与落库处理。
+  // 漏一个的症状是「滑块拖了不动、改了不保存」，所以统一列在这里
+  SETTING_HOSTS.forEach((id) => {
+    const box = $(id);
+    if (!box) return;
+    box.addEventListener("input", onSettingInput);
+  });
 
   // 各组的一键预设：点一下整套参数一起写，不用逐个调。
   // 参数页和主动回复页都有预设条，绑同一个处理函数
@@ -4421,7 +5095,10 @@ Bridge.ready()
         await Bridge.apiPost("manage", { action: "apply_profile", group, profile: id }),
       );
       showToast(res.message || (res.ok ? "已切换" : "切换失败"));
-      if (res.ok) await load();
+      if (res.ok) {
+        await load();
+        if (group === "sticker") await loadSticker();
+      }
     } catch (err) {
       console.error("切换预设失败:", err);
       showToast("切换失败，请查看日志");
@@ -4431,6 +5108,7 @@ Bridge.ready()
   };
   $("settings").addEventListener("click", onProfileClick);
   $("activeSettings").addEventListener("click", onProfileClick);
+  if ($("stickerProfiles")) $("stickerProfiles").addEventListener("click", onProfileClick);
 
   const onSettingChange = async (e) => {
     const el = e.target;
@@ -4455,9 +5133,25 @@ Bridge.ready()
     if (key === "web_search_mode") applySearchMode(el.value);
     await saveSetting(key, parsed.value);
   };
-  $("settings").addEventListener("change", onSettingChange);
-  $("feedSettings").addEventListener("change", onSettingChange);
-  $("activeSettings").addEventListener("change", onSettingChange);
+  SETTING_HOSTS.forEach((id) => {
+    const box = $(id);
+    if (!box) return;
+    box.addEventListener("change", onSettingChange);
+  });
+
+  // 三个功能总开关：不塞进参数网格，各页顶部单独一个
+  bindFeatureSwitch("activeEnabled", "active_reply_enabled");
+  bindFeatureSwitch("feedEnabled", "feed_enabled");
+  bindFeatureSwitch("searchEnabled", "web_search_enabled");
+  bindFeatureSwitch("stickerEnabled", "sticker_enabled");
+
+  // 概览的触发清单：点标题跳到对应页
+  if ($("triggerHelp")) {
+    $("triggerHelp").addEventListener("click", (e) => {
+      const head = e.target.closest("[data-goto]");
+      if (head) switchTab(head.dataset.goto);
+    });
+  }
 
   // 记住哪些会话是展开的，刷新后还原
   $("sessions").addEventListener("toggle", (e) => {
@@ -4686,3 +5380,861 @@ Bridge.ready()
     }
     console.error("面板初始化失败:", err);
   });
+// ── 表情包 ──────────────────────────────────────────────────────────
+//
+// 图库里存的是磁盘文件，面板只看不改。缩略图单独走接口拿 base64：
+// 插件页面挂在 sandbox iframe 里，<img src> 带不上鉴权头，直接给地址会 401。
+
+let stickerData = null;
+// 空字符串 = 「全部」视图。上传/新建分类时要求非空。
+let stickerLabel = "";
+let stickerQuery = "";
+// 图库排序。默认「刚收的在前」——收藏夹导进来之后最想知道的就是新到的几张
+let stickerSortMode = "added_desc";
+// 词云视图：图库区整个换成标签云，点一个标签就回到网格并按它筛
+let stickerCloud = false;
+const stickerThumbs = new Map();
+const stickerObserver =
+  typeof IntersectionObserver === "function"
+    ? new IntersectionObserver(
+        (entries) => {
+          entries.forEach((entry) => {
+            if (!entry.isIntersecting) return;
+            stickerObserver.unobserve(entry.target);
+            paintStickerThumb(entry.target);
+          });
+        },
+        { rootMargin: "140px" },
+      )
+    : null;
+
+function fmtSize(bytes) {
+  const n = Number(bytes || 0);
+  if (n <= 0) return "—";
+  if (n < 1024) return `${n} B`;
+  return `${Math.round(n / 1024)} KB`;
+}
+
+async function loadSticker() {
+  try {
+    stickerData = unwrap(await Bridge.apiGet("sticker", {})) || {};
+  } catch (err) {
+    console.error("加载表情包失败:", err);
+    showToast("图库没拉下来，请查看 AstrBot 日志");
+    return;
+  }
+  const labels = stickerData.labels || [];
+  // 空字符串是「全部」，只有分类被删掉时才退回全部
+  if (stickerLabel && !labels.some((l) => l.key === stickerLabel)) {
+    stickerLabel = "";
+  }
+  renderSticker();
+}
+
+function renderSticker() {
+  const data = stickerData || {};
+  const labels = data.labels || [];
+  const total = Number(data.total || 0);
+  const todayTotal = Number(data.today_total || 0);
+  const byLabel = data.today_by_label || {};
+
+  let topLabel = "—";
+  let topCount = 0;
+  labels.forEach((l) => {
+    const n = Number(byLabel[l.key] || 0);
+    if (n > topCount) {
+      topCount = n;
+      topLabel = l.name;
+    }
+  });
+  const filled = labels.filter((l) => l.count > 0).length;
+
+  $("stickerStats").innerHTML = [
+    ["图库总数", `${total} 张`, "各分类加起来。空分类不会被触发"],
+    ["有图分类", `${filled} / ${labels.length}`, "至少放过一张图的分类数"],
+    ["今日发出", `${todayTotal} 次`, "所有群合计，上限在「参数」页调"],
+    ["今天最多", topCount ? `${topLabel} ${topCount} 次` : "—", "今天发得最多的分类"],
+  ]
+    .map(
+      ([k, v, tip]) =>
+        `<div class="stat"${tip ? ` title="${escAttr(tip)}"` : ""}><span>${esc(k)}</span><b>${esc(
+          v,
+        )}</b></div>`,
+    )
+    .join("");
+
+  const bar = $("stickerProfiles");
+  if (bar) {
+    bar.innerHTML = profileBar("sticker", data.settings || {}, data.profiles || []);
+  }
+  renderStickerCats();
+
+  const notes = [];
+  if (!data.enabled) {
+    notes.push("斗图还没开：打开这一页顶部的开关。图库空着的话，开着也不会有动静，先把图攒起来。");
+  }
+  if (data.note) notes.push(data.note);
+  $("stickerNote").textContent = notes.join(" ");
+
+  const allCount = labels.reduce((n, l) => n + (l.count || 0), 0);
+  // 全部排第一，其余按图数降序；空的沉到最后，带个灰显样式
+  const sorted = [...labels].sort((a, b) => (b.count || 0) - (a.count || 0));
+  const tabs = [{ key: "", name: "全部", count: allCount, empty: allCount === 0 }].concat(
+    sorted.map((l) => ({ ...l, empty: !l.count })),
+  );
+  $("stickerLabels").innerHTML = tabs
+    .map(
+      (l) =>
+        `<button type="button" class="sticker-tab${l.key === stickerLabel ? " on" : ""}${
+          l.empty ? " empty" : ""
+        }" data-label="${escAttr(l.key)}" title="${escAttr(
+          l.key === ""
+            ? `全部 ${l.count} 张，跨分类按当前排序看`
+            : `${l.name} · ${l.count} 张${l.empty ? "（空的，放几张图才会被触发）" : "，点一下只看这一类"}`,
+        )}">${esc(l.name)}<b>${l.count}</b></button>`,
+    )
+    .join("");
+
+  const keywords = data.keywords || {};
+  const names = Object.keys(keywords);
+  $("stickerKeywords").textContent = names.length
+    ? "触发词：" +
+      names
+        .map((name) => `${name}（${keywords[name].slice(0, 4).join(" / ")}）`)
+        .join("；")
+    : "";
+
+  renderStickerGrid();
+}
+
+function stickerAllItems() {
+  const labels = (stickerData && stickerData.labels) || [];
+  if (stickerLabel) {
+    const cur = labels.find((l) => l.key === stickerLabel);
+    return ((cur && cur.items) || []).map((it) => ({
+      ...it,
+      _cat: cur.key,
+      _catName: cur.name,
+    }));
+  }
+  // 全部：按分类顺序拼起来，每项记住自己属于哪个桶
+  const out = [];
+  labels.forEach((l) => {
+    (l.items || []).forEach((it) =>
+      out.push({ ...it, _cat: l.key, _catName: l.name }),
+    );
+  });
+  return out;
+}
+
+function stickerFiltered(items) {
+  const q = stickerQuery.trim().toLowerCase();
+  if (!q) return items;
+  return items.filter((it) => {
+    const hay = [
+      it.name,
+      it.desc || "",
+      (it.tags || []).join(" "),
+      it._catName || "",
+    ]
+      .join(" ")
+      .toLowerCase();
+    return hay.includes(q);
+  });
+}
+
+function sortStickerItems(items) {
+  const arr = items.slice();
+  const by = {
+    added_desc: (a, b) => (b.added_at || 0) - (a.added_at || 0),
+    added_asc: (a, b) => (a.added_at || 0) - (b.added_at || 0),
+    // 使用次数相同就按入库时间，否则同分项每次刷新都乱跳
+    used_desc: (a, b) =>
+      (b.used || 0) - (a.used || 0) || (b.added_at || 0) - (a.added_at || 0),
+    used_asc: (a, b) =>
+      (a.used || 0) - (b.used || 0) || (b.added_at || 0) - (a.added_at || 0),
+    mtime_desc: (a, b) => (b.mtime || 0) - (a.mtime || 0),
+    size_desc: (a, b) => (b.size || 0) - (a.size || 0),
+    name_asc: (a, b) => String(a.name).localeCompare(String(b.name)),
+  };
+  return arr.sort(by[stickerSortMode] || by.added_desc);
+}
+
+// 秒级时间戳 → 「3天前」。图库要的是「这张是不是刚收的」，不是精确到分
+function fmtAgo(ts) {
+  const t = Number(ts || 0);
+  if (!t) return "—";
+  const diff = Date.now() / 1000 - t;
+  if (diff < 60) return "刚刚";
+  if (diff < 3600) return `${Math.floor(diff / 60)} 分钟前`;
+  if (diff < 86400) return `${Math.floor(diff / 3600)} 小时前`;
+  if (diff < 86400 * 30) return `${Math.floor(diff / 86400)} 天前`;
+  if (diff < 86400 * 365) return `${Math.floor(diff / 86400 / 30)} 个月前`;
+  const d = new Date(t * 1000);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(
+    d.getDate(),
+  ).padStart(2, "0")}`;
+}
+
+function fmtFullTime(ts) {
+  const t = Number(ts || 0);
+  if (!t) return "";
+  const d = new Date(t * 1000);
+  const p = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(
+    d.getHours(),
+  )}:${p(d.getMinutes())}`;
+}
+
+function renderStickerGrid() {
+  const box = $("stickerGrid");
+  if (stickerCloud) {
+    renderStickerCloud();
+    return;
+  }
+  if (box) box.className = "sticker-grid";
+
+  const labels = (stickerData && stickerData.labels) || [];
+  const cur = labels.find((l) => l.key === stickerLabel);
+  const all = stickerAllItems();
+  const items = sortStickerItems(stickerFiltered(all));
+  const isAll = !stickerLabel;
+
+  const total = labels.reduce((n, l) => n + (l.count || 0), 0);
+  let note = isAll ? `全部 · ${total} 张` : `${cur ? cur.name : ""} · ${items.length} 张`;
+  if (stickerQuery.trim()) note += `（筛出 ${items.length} 张）`;
+  $("stickerPickNote").textContent = note;
+
+  // 「全部」视图下不能直接上传——没指定往哪个桶放
+  const addBtn = isAll
+    ? ""
+    : '<button type="button" class="sticker-add" data-act="add" title="往这个分类里放图">＋ 放图</button>';
+
+  if (!items.length) {
+    box.innerHTML = stickerQuery.trim()
+      ? `<p class="empty">没有匹配「${esc(stickerQuery.trim())}」的图</p>`
+      : `<p class="empty">这个分类还没有图。点「＋ 放图」上传，` +
+        `或者在群里发一张图再带 <code>/收图 ${esc(cur ? cur.name : "")}</code>。</p>${addBtn}`;
+    return;
+  }
+
+  box.innerHTML =
+    items
+      .map((it) => {
+        // 必须用这一项自己的分类，不能用 stickerLabel：
+        // 「全部」视图下 stickerLabel 是空串，拼出来是 "/文件名"，
+        // 后台拿不到分类就返回「缺少参数」，整个图库全变「读不出来」。
+        const key = `${it._cat}/${it.name}`;
+        const cached = stickerThumbs.get(key);
+        const img = cached
+          ? `<img src="${cached}" alt="" />`
+          : `<img data-thumb="${escAttr(key)}" alt="" />`;
+        const tags = it.tags || [];
+        // 卡片上只露两个，多了把缩略图挤没了；完整的在悬停提示和编辑弹窗里
+        const tagHtml = tags.length
+          ? `<div class="sticker-tags" title="${escAttr(tags.join("、"))}">${tags
+              .slice(0, 2)
+              .map((t) => `<i>${esc(t)}</i>`)
+              .join("")}</div>`
+          : "";
+        // 全部视图把分类压在图片左上角，元信息行让给「时间 · 大小」
+        const catBadge = isAll
+          ? `<span class="sticker-cat">${esc(it._catName)}</span>`
+          : "";
+        const tip =
+          `收于 ${fmtFullTime(it.added_at)} · ${fmtSize(it.size)}` +
+          (it.used ? ` · 发过 ${it.used} 次` : " · 还没发过") +
+          (it.disabled ? " · 已停用" : "") +
+          " · 点开改标签";
+        const offBadge = it.disabled ? '<span class="sticker-off">停用</span>' : "";
+        return `<div class="sticker${it.disabled ? " off" : ""}" data-name="${escAttr(it.name)}"
+                     data-cat="${escAttr(it._cat)}" title="${escAttr(tip)}">
+          <div class="sticker-img">${img}${catBadge}${offBadge}</div>
+          <div class="sticker-meta">${esc(fmtAgo(it.added_at))} · ${esc(
+            fmtSize(it.size),
+          )}</div>
+          ${tagHtml}
+          <button type="button" class="sticker-del" data-act="del"
+                  data-name="${escAttr(it.name)}" data-cat="${escAttr(it._cat)}"
+                  title="把这张从图库删掉（只删这一张，分类还在）">×</button>
+        </div>`;
+      })
+      .join("") + addBtn;
+
+  box.querySelectorAll("img[data-thumb]").forEach((img) => {
+    if (stickerObserver) stickerObserver.observe(img);
+    else paintStickerThumb(img);
+  });
+}
+
+// 标签词云。只做一件事：把库里所有标签按「多少张图带它」排出来，
+// 点一个就当搜索词。相比手打，省掉「记不住标签怎么写」这一步。
+function renderStickerCloud() {
+  const box = $("stickerGrid");
+  if (!box) return;
+  box.className = "sticker-grid cloud";
+
+  const all = stickerAllItems();
+  const counts = new Map();
+  all.forEach((it) => {
+    (it.tags || []).forEach((raw) => {
+      const tag = String(raw || "").trim();
+      if (tag) counts.set(tag, (counts.get(tag) || 0) + 1);
+    });
+  });
+  const rows = [...counts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 60);
+
+  const note = $("stickerPickNote");
+  if (note) {
+    note.textContent = rows.length
+      ? `标签词云 · ${rows.length} 个，点一个按它筛`
+      : "标签词云";
+  }
+
+  if (!rows.length) {
+    box.innerHTML =
+      '<p class="empty">还没有标签。点「识别未标注」让模型打，或者点一张图手动填。</p>';
+    return;
+  }
+
+  const max = rows[0][1] || 1;
+  box.innerHTML = rows
+    .map(([tag, n]) => {
+      // 12~26px：只差两三倍的量感，字号太夸张反而看不清
+      const size = 12 + Math.round((n / max) * 14);
+      return `<button type="button" class="cloud-tag" data-tag="${escAttr(tag)}"
+        style="font-size:${size}px"
+        title="${escAttr(tag)} · ${n} 张图带这个标签">${esc(tag)}<b>${n}</b></button>`;
+    })
+    .join("");
+}
+
+async function paintStickerThumb(img) {
+  const key = img.dataset.thumb;
+  if (!key || !img.isConnected) return;
+  if (stickerThumbs.has(key)) {
+    img.src = stickerThumbs.get(key);
+    return;
+  }
+  const cut = key.indexOf("/");
+  const label = key.slice(0, cut);
+  const name = key.slice(cut + 1);
+  try {
+    const data = unwrap(await Bridge.apiGet("sticker/thumb", { c: label, n: name }));
+    if (!data || !data.url) throw new Error("没有返回图片");
+    stickerThumbs.set(key, data.url);
+    if (img.isConnected) img.src = data.url;
+  } catch (err) {
+    console.warn("缩略图加载失败:", key, err);
+    if (img.isConnected) {
+      const span = document.createElement("span");
+      span.className = "sticker-broken";
+      span.textContent = "读不出来";
+      img.replaceWith(span);
+    }
+  }
+}
+
+async function uploadSticker(files) {
+  const list = Array.from(files || []);
+  if (!list.length) return;
+  if (!stickerLabel) {
+    showToast("先选一个分类");
+    return;
+  }
+  let done = 0;
+  const failed = [];
+  for (const file of list) {
+    if (file.size > 5 * 1024 * 1024) {
+      failed.push(`${file.name}（超过 5MB）`);
+      continue;
+    }
+    try {
+      const raw = await new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(String(reader.result || ""));
+        reader.onerror = () => reject(new Error("读取失败"));
+        reader.readAsDataURL(file);
+      });
+      const res = unpack(
+        await Bridge.apiPost("sticker", {
+          action: "add",
+          label: stickerLabel,
+          filename: file.name,
+          data: raw,
+        }),
+      );
+      if (res && res.success === false) throw new Error(res.message || "上传失败");
+      done += 1;
+    } catch (err) {
+      failed.push(`${file.name}（${err.message || "失败"}）`);
+    }
+  }
+  if (done) {
+    stickerThumbs.clear();
+    await loadSticker();
+  }
+  showToast(
+    failed.length
+      ? `传了 ${done} 张，失败 ${failed.length} 张：${failed.slice(0, 2).join("、")}`
+      : `传好 ${done} 张`,
+  );
+}
+
+async function removeSticker(label, name) {
+  if (!label || !name) return;
+  const yes = await askConfirm(`从图库删掉这张？（${label}/${name}）删了就找不回来。`);
+  if (!yes) return;
+  try {
+    const res = unpack(
+      await Bridge.apiPost("sticker", { action: "remove", label, name }),
+    );
+    if (res && res.success === false) throw new Error(res.message || "删除失败");
+    stickerThumbs.delete(`${label}/${name}`);
+    await loadSticker();
+    showToast("已删掉");
+  } catch (err) {
+    showToast(err.message || "删除失败");
+  }
+}
+
+function bindSticker() {
+  const refresh = $("stickerRefresh");
+  if (refresh) refresh.addEventListener("click", loadSticker);
+
+  const tabs = $("stickerLabels");
+  if (tabs) {
+    tabs.addEventListener("click", (ev) => {
+      const btn = ev.target.closest("[data-label]");
+      if (!btn) return;
+      stickerLabel = btn.dataset.label;
+      renderSticker();
+    });
+  }
+
+  const grid = $("stickerGrid");
+  if (grid) {
+    grid.addEventListener("click", (ev) => {
+      const tagBtn = ev.target.closest("[data-tag]");
+      if (tagBtn) {
+        stickerQuery = tagBtn.dataset.tag;
+        stickerCloud = false;
+        const cb = $("stickerCloudBtn");
+        if (cb) {
+          cb.classList.remove("on");
+          cb.textContent = "☁ 标签";
+        }
+        // 搜索框要跟着显示当前词，不然用户不知道现在筛的是什么
+        const search = $("stickerSearch");
+        if (search) search.value = stickerQuery;
+        renderStickerGrid();
+        return;
+      }
+
+      const del = ev.target.closest('[data-act="del"]');
+      if (del) {
+        ev.stopPropagation();
+        removeSticker(del.dataset.cat, del.dataset.name);
+        return;
+      }
+      if (ev.target.closest('[data-act="add"]')) {
+        $("stickerFile").click();
+        return;
+      }
+      // 点图本身：改标签 / 换分类
+      const card = ev.target.closest(".sticker[data-name]");
+      if (card) openStickerModal(card.dataset.cat, card.dataset.name);
+    });
+  }
+
+  const file = $("stickerFile");
+  if (file) {
+    file.addEventListener("change", () => {
+      uploadSticker(file.files);
+      file.value = "";
+    });
+  }
+
+  const cloudBtn = $("stickerCloudBtn");
+  if (cloudBtn) {
+    cloudBtn.addEventListener("click", () => {
+      stickerCloud = !stickerCloud;
+      cloudBtn.classList.toggle("on", stickerCloud);
+      cloudBtn.textContent = stickerCloud ? "☁ 关闭" : "☁ 标签";
+      renderStickerGrid();
+    });
+  }
+
+  const sortSel = $("stickerSort");
+  if (sortSel) {
+    sortSel.value = stickerSortMode;
+    sortSel.addEventListener("change", () => {
+      stickerSortMode = sortSel.value;
+      renderStickerGrid();
+    });
+  }
+
+  const search = $("stickerSearch");
+  if (search) {
+    search.addEventListener("input", () => {
+      stickerQuery = search.value || "";
+      renderStickerGrid();
+    });
+  }
+
+  bindStickerCats();
+  bindStickerTag();
+}
+
+
+// ── 表情包：分类管理 ────────────────────────────────────────────────
+
+function renderStickerCats() {
+  const box = $("stickerCats");
+  if (!box) return;
+  const data = stickerData || {};
+  const labels = data.labels || [];
+
+  const cost = $("stickerRuleCost");
+  if (cost) {
+    cost.textContent = data.rule_tokens
+      ? `规则约 ${data.rule_tokens} 字`
+      : "";
+  }
+
+  box.innerHTML =
+    labels
+      .map((c) => {
+        const kws = (c.keywords || []).join(" ");
+        const desc = c.desc || "";
+        return `<div class="cat-row" data-key="${escAttr(c.key)}">
+          <div class="cat-main">
+            <b>${esc(c.name)}</b>
+            <span class="cat-desc${desc ? "" : " empty"}">${esc(desc || "没有描述，模型只能靠名字猜")}</span>
+            <span class="cat-kw">${esc(kws || "无关键词")}</span>
+          </div>
+          <span class="cat-n" title="这个分类里有几张图">${c.count}</span>
+          <div class="cat-acts">
+            <button type="button" class="ghost tiny" data-cat="edit">改</button>
+            <button type="button" class="ghost tiny danger" data-cat="del"
+                    ${c.count ? `disabled title="分类里还有 ${c.count} 张图"` : ""}>删</button>
+          </div>
+        </div>`;
+      })
+      .join("") +
+    `<p class="hint">描述会拼进注入规则，只在「模型自报」模式的部分轮次里发出去；关键词只在本地匹配，不花钱。</p>`;
+}
+
+function catRowHtml(cat, isNew) {
+  return `<div class="cat-edit${isNew ? " new" : ""}" ${cat ? `data-key="${escAttr(cat.key)}"` : ""}>
+    <input class="ce-name" maxlength="12" placeholder="分类名，例如 猫猫"
+           value="${escAttr(cat ? cat.name : "")}" />
+    <input class="ce-desc" maxlength="60" placeholder="给模型看的描述，一句话说清这类图什么时候用"
+           value="${escAttr(cat ? cat.desc || "" : "")}" />
+    <input class="ce-kw" placeholder="本地关键词，空格分开"
+           value="${escAttr(cat ? (cat.keywords || []).join(" ") : "")}" />
+    <div class="cat-acts">
+      <button type="button" class="ghost tiny" data-cat="save">存</button>
+      <button type="button" class="ghost tiny" data-cat="cancel">取消</button>
+    </div>
+  </div>`;
+}
+
+function openCatEdit(key) {
+  const row = document.querySelector(`.cat-row[data-key="${key}"]`);
+  const cat = ((stickerData && stickerData.labels) || []).find((c) => c.key === key);
+  if (!row || !cat) return;
+  row.innerHTML = catRowHtml(cat, false);
+  row.querySelector(".ce-name").focus();
+}
+
+function openCatNew() {
+  const box = $("stickerCats");
+  if (!box || box.querySelector(".cat-edit.new")) return;
+  const div = document.createElement("div");
+  div.className = "cat-row";
+  div.innerHTML = catRowHtml(null, true);
+  box.prepend(div);
+  div.querySelector(".ce-name").focus();
+}
+
+async function saveCatRow(row) {
+  const name = row.querySelector(".ce-name").value.trim();
+  const desc = row.querySelector(".ce-desc").value.trim();
+  const kws = row
+    .querySelector(".ce-kw")
+    .value.split(/[\s,，、]+/)
+    .filter(Boolean);
+  const key = row.dataset.key || "";
+  if (!name) {
+    showToast("分类名不能空");
+    return;
+  }
+  const payload = key
+    ? { action: "update_category", key, name, desc, keywords: kws }
+    : { action: "add_category", name, desc, keywords: kws };
+  try {
+    const res = unpack(await Bridge.apiPost("sticker", payload));
+    if (res && res.success === false) throw new Error(res.message || "保存失败");
+    showToast(res.message || "已保存");
+    // 新建完直接跳过去，省得再点一下
+    if (!key && res.data && res.data.key) stickerLabel = res.data.key;
+    await loadSticker();
+  } catch (err) {
+    showToast(err.message || "保存失败");
+  }
+}
+
+async function removeCat(key, count) {
+  if (count > 0) {
+    showToast("分类里还有图，先把图删掉或挪走");
+    return;
+  }
+  const cat = ((stickerData && stickerData.labels) || []).find((c) => c.key === key);
+  const yes = await askConfirm(`删掉分类「${cat ? cat.name : key}」？`);
+  if (!yes) return;
+  try {
+    const res = unpack(
+      await Bridge.apiPost("sticker", { action: "remove_category", key }),
+    );
+    if (res && res.success === false) throw new Error(res.message || "删除失败");
+    showToast("已删除");
+    if (stickerLabel === key) stickerLabel = "";
+    await loadSticker();
+  } catch (err) {
+    showToast(err.message || "删除失败");
+  }
+}
+
+// ── 表情包：单张编辑（标签 / 换分类）────────────────────────────────
+
+let seTarget = { label: "", name: "" };
+
+function openStickerModal(label, name) {
+  const cur = ((stickerData && stickerData.labels) || []).find((c) => c.key === label);
+  const item = (((cur && cur.items) || []).find((x) => x.name === name)) || {};
+  seTarget = { label, name };
+
+  $("seFile").textContent = `${(cur && cur.name) || label} / ${name}`;
+  $("seTags").value = (item.tags || []).join(" ");
+  $("seOff").checked = !!item.disabled;
+  $("seMove").innerHTML = ((stickerData && stickerData.labels) || [])
+    .map(
+      (c) =>
+        `<option value="${escAttr(c.key)}"${c.key === label ? " selected" : ""}>${esc(
+          c.name,
+        )}</option>`,
+    )
+    .join("");
+  $("seErr").textContent = "";
+  $("seModal").hidden = false;
+  $("seTags").focus();
+}
+
+function closeStickerModal() {
+  $("seModal").hidden = true;
+}
+
+async function saveStickerModal() {
+  const tags = $("seTags")
+    .value.split(/[\s,，、]+/)
+    .filter(Boolean)
+    .slice(0, 12);
+  const target = $("seMove").value;
+  $("seErr").textContent = "";
+  try {
+    if (target && target !== seTarget.label) {
+      const moved = unpack(
+        await Bridge.apiPost("sticker", {
+          action: "move",
+          label: seTarget.label,
+          name: seTarget.name,
+          target,
+        }),
+      );
+      if (moved && moved.success === false) throw new Error(moved.message);
+      seTarget.label = target;
+    }
+    const res = unpack(
+      await Bridge.apiPost("sticker", {
+        action: "set_tags",
+        label: seTarget.label,
+        name: seTarget.name,
+        tags,
+      }),
+    );
+    if (res && res.success === false) throw new Error(res.message || "保存失败");
+
+    const wantOn = !$("seOff").checked;
+    const en = unpack(
+      await Bridge.apiPost("sticker", {
+        action: "set_enabled",
+        label: seTarget.label,
+        name: seTarget.name,
+        on: wantOn,
+      }),
+    );
+    if (en && en.success === false) throw new Error(en.message || "改停用状态失败");
+    closeStickerModal();
+    stickerThumbs.clear();
+    await loadSticker();
+    showToast("已保存");
+  } catch (err) {
+    $("seErr").textContent = err.message || "保存失败";
+  }
+}
+
+function bindStickerCats() {
+  const cats = $("stickerCats");
+  if (cats) {
+    cats.addEventListener("click", (ev) => {
+      const btn = ev.target.closest("[data-cat]");
+      if (!btn) return;
+      const act = btn.dataset.cat;
+      const row = btn.closest(".cat-row") || btn.closest(".cat-edit");
+      if (!row) return;
+      if (act === "edit") {
+        openCatEdit(row.dataset.key);
+      } else if (act === "save") {
+        saveCatRow(btn.closest(".cat-edit"));
+      } else if (act === "cancel") {
+        renderStickerCats();
+      } else if (act === "del") {
+        const cat = (stickerData.labels || []).find((c) => c.key === row.dataset.key);
+        removeCat(row.dataset.key, cat ? cat.count : 0);
+      }
+    });
+  }
+
+  if ($("stickerAddCat")) {
+    $("stickerAddCat").addEventListener("click", openCatNew);
+  }
+
+  if ($("seCancel")) $("seCancel").addEventListener("click", closeStickerModal);
+  if ($("seSave")) $("seSave").addEventListener("click", saveStickerModal);
+  if ($("seModal")) {
+    $("seModal").addEventListener("click", (e) => {
+      if (e.target === $("seModal")) closeStickerModal();
+    });
+  }
+  if ($("seDel")) {
+    $("seDel").addEventListener("click", async () => {
+      const yes = await askConfirm(`从图库删掉 ${seTarget.name}？删了找不回来。`);
+      if (!yes) return;
+      try {
+        const res = unpack(
+          await Bridge.apiPost("sticker", {
+            action: "remove",
+            label: seTarget.label,
+            name: seTarget.name,
+          }),
+        );
+        if (res && res.success === false) throw new Error(res.message);
+        closeStickerModal();
+        stickerThumbs.clear();
+        await loadSticker();
+        showToast("已删除");
+      } catch (err) {
+        $("seErr").textContent = err.message || "删除失败";
+      }
+    });
+  }
+}
+
+// ── 表情包：AI 识别标签 ─────────────────────────────────────────────
+
+let tagging = false;
+
+async function autoTagOne(label, name, apply) {
+  const res = unwrap(
+    await Bridge.apiPost("sticker", {
+      action: "auto_tag",
+      label,
+      name,
+      apply: apply !== false,
+    }),
+  );
+  if (res && res.success === false) throw new Error(res.message || "识别失败");
+  return res.data || { tags: [], desc: "" };
+}
+
+async function tagCurrent() {
+  const btn = $("seTag");
+  if (!btn || !seTarget.name) return;
+  $("seErr").textContent = "";
+  btn.disabled = true;
+  const old = btn.textContent;
+  btn.textContent = "识别中…";
+  try {
+    // apply=false：只填进输入框，用户点保存才落库
+    const data = await autoTagOne(seTarget.label, seTarget.name, false);
+    $("seTags").value = (data.tags || []).join(" ");
+    showToast("识别完了，可以改完再保存");
+  } catch (err) {
+    $("seErr").textContent = err.message || "识别失败";
+  } finally {
+    btn.disabled = false;
+    btn.textContent = old || "AI 识别";
+  }
+}
+
+async function tagAllUntagged() {
+  if (tagging) return;
+  const btn = $("stickerTagAll");
+  tagging = true;
+  try {
+    const list = unwrap(
+      await Bridge.apiPost("sticker", { action: "untagged", limit: 500 }),
+    );
+    const items = (list && list.items) || [];
+    if (!items.length) {
+      showToast("所有图都有标签了");
+      return;
+    }
+    const yes = await askConfirm(
+      `要给 ${items.length} 张图打标签？每张一次模型调用，大约一秒一张，会产生少量 token 费用。`,
+    );
+    if (!yes) return;
+
+    let done = 0;
+    let failed = 0;
+    const queue = items.slice();
+    if (btn) btn.disabled = true;
+
+    const worker = async () => {
+      while (queue.length) {
+        const it = queue.shift();
+        try {
+          await autoTagOne(it.label, it.name, true);
+        } catch (err) {
+          failed += 1;
+        }
+        done += 1;
+        if (btn) btn.textContent = `${done}/${items.length}`;
+      }
+    };
+    // 并发 2：再多容易触发上游限流
+    await Promise.all([worker(), worker()]);
+
+    stickerThumbs.clear();
+    await loadSticker();
+    showToast(
+      failed
+        ? `识别完 ${done - failed} 张，${failed} 张失败，可以再点一次重试`
+        : `识别完 ${done} 张`,
+    );
+  } catch (err) {
+    showToast(err.message || "批量识别失败");
+  } finally {
+    tagging = false;
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = "识别未标注";
+    }
+  }
+}
+
+function bindStickerTag() {
+  if ($("seTag")) $("seTag").addEventListener("click", tagCurrent);
+  if ($("stickerTagAll")) $("stickerTagAll").addEventListener("click", tagAllUntagged);
+}

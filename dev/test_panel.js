@@ -73,7 +73,17 @@ const f = new Function(
     " sortFacts," +
     " setFeedBoard: (v) => { feedBoard = v; }," +
     " setActiveGroups: (v, on, perUser) => { activeGroups = v; activeGlobalOn = on; activePerUserLimit = perUser || 0; }," +
-    " setStatus: (v) => { lastStatus = v; }};",
+    " setStatus: (v) => { lastStatus = v; }," +
+    " setSticker: (v) => { stickerData = v; }," +
+    " setStickerLabel: (v) => { stickerLabel = v; }," +
+    " setStickerQuery: (v) => { stickerQuery = v; }," +
+    " setStickerSort: (v) => { stickerSortMode = v; }," +
+    " setStickerCloud: (v) => { stickerCloud = v; }," +
+    " renderTriggerHelp, renderBudgetBar, renderFeatureSwitches, renderBars," +
+    " setLastStatus: (v) => { lastStatus = v; }," +
+    " sumUsageDays, usageSummaryOf, renderTotals," +
+    " setUsageRange: (v) => { usageRange = v; }," +
+    " renderStickerGrid, stickerAllItems};",
 );
 
 let api;
@@ -242,7 +252,17 @@ chk(
 const ordered = settingsGroups.slice().sort((a, b) => (a.order ?? 99) - (b.order ?? 99));
 chk("第一组是全局", ordered[0].id === "global");
 chk("主动回复排在运行与学习之前", ordered.findIndex((g) => g.id === "active") < ordered.findIndex((g) => g.id === "base"));
-chk("计价永远在最后", ordered[ordered.length - 1].id === "price");
+chk("参数页最后一组是管理工具", ordered[ordered.length - 1].id === "admin");
+// 参数组按主题拆到各页之后，参数页只剩「不分页的那几个」
+chk(
+  "风格/事实/表情包/搜索/计价/预算都挂到了各自的页",
+  ["style", "facts", "sticker", "search", "price", "budget"].every(
+    (id) => (api.SETTING_GROUPS.find((g) => g.id === id) || {}).pane,
+  ),
+);
+chk("参数页不再出现这些组",
+  settingsGroups.every((g) => !["style", "facts", "sticker", "search", "price", "budget"].includes(g.id)),
+  settingsGroups.map((g) => g.id).join(","));
 chk("每组都有 order", settingsGroups.every((g) => typeof g.order === "number"));
 chk("order 不重复", new Set(settingsGroups.map((g) => g.order)).size === settingsGroups.length);
 
@@ -391,6 +411,416 @@ const backOnly = (usageNodes.usageSource || {}).innerHTML || "";
 chk("回复没数据就不渲染回复块", !backOnly.includes("💬 回复"));
 chk("后台仍有数据时正常渲染", backOnly.includes("📚 学习风格"));
 global.document.getElementById = origGetById;
+
+// ── 表情包：全部视图下缩略图必须带分类前缀 ──
+// 踩过的坑：key 拼的是 stickerLabel，而「全部」视图它为空串，
+// 请求变成 c=&n=xxx，后台判「缺少参数」，整个图库全变「读不出来」
+const origGetById2 = document.getElementById;
+const boxes = {};
+const mkBox = () => {
+  const o = el();
+  let html = "";
+  let cls = "";
+  Object.defineProperty(o, "innerHTML", {
+    get: () => html,
+    set: (v) => { html = String(v == null ? "" : v); },
+  });
+  Object.defineProperty(o, "textContent", {
+    get: () => html,
+    set: (v) => { html = String(v == null ? "" : v); },
+  });
+  Object.defineProperty(o, "className", {
+    get: () => cls,
+    set: (v) => { cls = String(v == null ? "" : v); },
+  });
+  // classList 要和 className 联动：renderBars 用 toggle 加 dense，
+  // 只实现 add/remove 会让它在测试里直接抛 TypeError
+  o.classList = {
+    add: (c) => {
+      if (!cls.split(/\s+/).includes(c)) cls = (cls + " " + c).trim();
+    },
+    remove: (c) => {
+      cls = cls.split(/\s+/).filter((x) => x && x !== c).join(" ");
+    },
+    contains: (c) => cls.split(/\s+/).includes(c),
+    toggle: (c, on) => {
+      const has = cls.split(/\s+/).includes(c);
+      const want = on === undefined ? !has : !!on;
+      if (want && !has) cls = (cls + " " + c).trim();
+      if (!want && has) cls = cls.split(/\s+/).filter((x) => x && x !== c).join(" ");
+      return want;
+    },
+  };
+  return o;
+};
+document.getElementById = (id) => {
+  if (!boxes[id]) boxes[id] = mkBox();
+  return boxes[id];
+};
+
+api.setSticker({
+  labels: [
+    { key: "laugh", name: "笑", count: 1, items: [
+      { name: "a.jpg", size: 100, tags: ["笑死"], added_at: 1700000000, used: 5, mtime: 1700000000 },
+    ] },
+    { key: "cry", name: "哭", count: 1, items: [
+      { name: "b.png", size: 200, tags: [], added_at: 1790000000, used: 0, mtime: 1790000000 },
+    ] },
+  ],
+  total: 2,
+});
+
+api.setStickerLabel("");
+api.setStickerQuery("");
+api.renderStickerGrid();
+const allHtml = boxes["stickerGrid"].innerHTML;
+chk("全部视图缩略图带分类", allHtml.includes('data-thumb="laugh/a.jpg"'), allHtml.slice(0, 120));
+chk("全部视图第二张也带分类", allHtml.includes('data-thumb="cry/b.png"'));
+chk("不出现空分类前缀", !allHtml.includes('data-thumb="/'));
+
+api.setStickerLabel("laugh");
+api.renderStickerGrid();
+const oneHtml = boxes["stickerGrid"].innerHTML;
+chk("单分类视图照常", oneHtml.includes('data-thumb="laugh/a.jpg"'));
+chk("单分类只显示自己的图", !oneHtml.includes("b.png"));
+
+// 搜索过滤
+api.setStickerLabel("");
+api.setStickerQuery("笑");
+api.renderStickerGrid();
+const searchHtml = boxes["stickerGrid"].innerHTML;
+chk("按标签搜到对应图", searchHtml.includes("a.jpg"));
+chk("搜不到的不渲染", !searchHtml.includes("b.png"));
+api.setStickerQuery("");
+
+// ── 图库排序 ──
+// 默认「刚收的在前」：跨分类也要按时间，不能按分类顺序拼
+api.setStickerSort("added_desc");
+api.renderStickerGrid();
+const byNew = boxes["stickerGrid"].innerHTML;
+chk("默认新收的在前（跨分类）", byNew.indexOf("b.png") < byNew.indexOf("a.jpg"));
+
+api.setStickerSort("added_asc");
+api.renderStickerGrid();
+const byOld = boxes["stickerGrid"].innerHTML;
+chk("最早收的在前", byOld.indexOf("a.jpg") < byOld.indexOf("b.png"));
+
+api.setStickerSort("used_desc");
+api.renderStickerGrid();
+const byUsed = boxes["stickerGrid"].innerHTML;
+chk("按发得最多的排", byUsed.indexOf("a.jpg") < byUsed.indexOf("b.png"), "a 发过 5 次");
+
+api.setStickerSort("used_asc");
+api.renderStickerGrid();
+chk("按发得最少的排（找该删的）", boxes["stickerGrid"].innerHTML.indexOf("b.png") <
+  boxes["stickerGrid"].innerHTML.indexOf("a.jpg"));
+
+api.setStickerSort("size_desc");
+api.renderStickerGrid();
+chk("按文件大小排", boxes["stickerGrid"].innerHTML.indexOf("b.png") <
+  boxes["stickerGrid"].innerHTML.indexOf("a.jpg"));
+
+// 时间在卡片上要能看见
+api.setStickerSort("added_desc");
+api.renderStickerGrid();
+chk("卡片显示相对时间", /(\d+ (分钟|小时|天|个月)前|刚刚|\d{4}-\d{2}-\d{2})/.test(
+    boxes["stickerGrid"].innerHTML,
+  ),
+  boxes["stickerGrid"].innerHTML.match(/sticker-meta">[^<]*/)?.[0] || "");
+
+// ── 词云 ──
+
+api.setStickerLabel("");
+
+api.setStickerQuery("");
+
+api.setStickerCloud(true);
+
+api.renderStickerGrid();
+
+const cloudHtml = boxes["stickerGrid"].innerHTML;
+
+chk("词云渲染出标签", cloudHtml.includes("cloud-tag") && cloudHtml.includes("笑死"), cloudHtml.slice(0, 90));
+
+chk("词云带张数", /<b>\d+<\/b>/.test(cloudHtml));
+
+chk("词云容器换成 cloud 类", String(boxes["stickerGrid"].className).includes("cloud"),
+
+  String(boxes["stickerGrid"].className));
+
+api.setStickerCloud(false);
+
+api.renderStickerGrid();
+
+chk("退出词云回到网格", !boxes["stickerGrid"].innerHTML.includes("cloud-tag"));
+
+chk("退出后 class 复原", boxes["stickerGrid"].className === "sticker-grid",
+
+  String(boxes["stickerGrid"].className));
+
+
+
+// ── 停用卡片 ──
+
+api.setSticker({
+
+  labels: [
+
+    { key: "laugh", name: "笑", count: 1, items: [
+
+      { name: "off.jpg", size: 10, tags: ["笑"], added_at: 1700000000, disabled: true },
+
+    ] },
+
+  ],
+
+  total: 1,
+
+});
+
+api.setStickerLabel("");
+
+api.setStickerSort("added_desc");
+
+api.renderStickerGrid();
+
+const offHtml = boxes["stickerGrid"].innerHTML;
+
+chk("停用卡片带 off 类", offHtml.includes('class="sticker off"'), offHtml.slice(0, 70));
+
+chk("停用卡片有角标", offHtml.includes("sticker-off"));
+
+chk("停用卡片仍在（不是删掉）", offHtml.includes("off.jpg"));
+
+
+
+// ── 概览：触发清单 ──
+
+api.renderTriggerHelp();
+
+const helpHtml = boxes["triggerHelp"].innerHTML;
+
+chk("清单渲染出分组", helpHtml.includes("help-group") && helpHtml.includes("学习库"));
+
+chk("清单覆盖各页", ["人格与关系", "表情包", "主动回复", "联网搜索", "Token 消费"].every((n) => helpHtml.includes(n)));
+
+chk("清单带跳转锚点", helpHtml.includes('data-goto="sticker"'));
+
+chk("清单标出触发类型", helpHtml.includes('data-k="cmd"') && helpHtml.includes('data-k="auto"'));
+
+
+
+// ── Token 消费：预算条 ──
+
+api.renderBudgetBar({ budget: { enabled: false, limit: 2, spent: 0.5, remain: 1.5 } });
+
+chk("预算没开时给提示", boxes["budgetBar"].innerHTML.includes("上限没开"));
+
+
+
+api.renderBudgetBar({ budget: { enabled: true, limit: 2, spent: 0.5, remain: 1.5, exceeded: false, over_limit: false, bypassed: false } });
+
+const b1 = boxes["budgetBar"].innerHTML;
+
+chk("预算正常显示已花与上限", b1.includes("0.50") && b1.includes("2.00"));
+
+chk("预算正常时显示剩余", b1.includes("还能花"));
+
+chk("进度条按比例", b1.includes("width:25%"));
+
+
+
+api.renderBudgetBar({ budget: { enabled: true, limit: 2, spent: 2.6, remain: 0, exceeded: true, over_limit: true, bypassed: false } });
+
+const b2 = boxes["budgetBar"].innerHTML;
+
+chk("超支时明说收摊", b2.includes("已到上限") && b2.includes("收摊"));
+
+chk("超支进度条封顶且变红", b2.includes("width:100%") && b2.includes('class="over"'));
+chk("超支时给「今天先放开」按钮", b2.includes('data-budget="release"'));
+
+api.renderBudgetBar({ budget: { enabled: true, limit: 2, spent: 2.6, remain: 0, exceeded: false, over_limit: true, bypassed: true } });
+const b3 = boxes["budgetBar"].innerHTML;
+chk("已放开时说清明早恢复", b3.includes("今天已放开") && b3.includes("明早"));
+chk("已放开时给「恢复限制」按钮", b3.includes('data-budget="relock"'));
+chk("已放开时进度条不再标红", !b3.includes('<i class="over"'));
+
+api.renderBudgetBar({ budget: { enabled: true, limit: 2, spent: 0.5, remain: 1.5, exceeded: false, over_limit: false, bypassed: false } });
+chk("没超支时不显示任何按钮", !boxes["budgetBar"].innerHTML.includes("data-budget"));
+
+
+
+// ── 功能总开关状态同步 ──
+
+api.renderFeatureSwitches({ active_reply_enabled: true, feed_enabled: false, web_search_enabled: true });
+
+chk("主动回复开关跟着配置", boxes["activeEnabled"].checked === true);
+
+chk("喂食开关跟着配置", boxes["feedEnabled"].checked === false);
+
+chk("搜索开关跟着配置", boxes["searchEnabled"].checked === true);
+
+
+
+// ── 消耗范围聚合 ──
+
+const fakeDays = [
+
+  { date: "2026-11-20", cost: 1, calls: 10, search_calls: 1, tokens: { input_cached: 100, input_other: 50, output: 20 } },
+
+  { date: "2026-11-21", cost: 2, calls: 20, search_calls: 2, tokens: { input_cached: 200, input_other: 60, output: 30 } },
+
+  { date: "2026-11-22", cost: 3, calls: 30, search_calls: 3, tokens: { input_cached: 300, input_other: 70, output: 40 } },
+
+];
+
+const summed = api.sumUsageDays(fakeDays);
+
+chk("按天加总金额", summed.cost === 6, String(summed.cost));
+
+chk("按天加总调用", summed.calls === 60);
+
+chk("按天加总搜索", summed.searches === 6);
+
+chk("按天加总 token", summed.tokens.input_cached === 600 && summed.tokens.output === 90);
+
+
+
+const fakeUsage = {
+
+  today: { date: "2026-11-22", cost: 3, calls: 30, search_calls: 3, tokens: { input_cached: 300, input_other: 70, output: 40 } },
+
+  days: fakeDays,
+
+  totals: { days: 40, cost: 80, calls: 800, searches: 8 },
+
+};
+
+
+
+api.setUsageRange(1);
+
+const rToday = api.usageSummaryOf(fakeUsage);
+
+chk("今天用日文件", rToday.label === "今天" && rToday.cost === 3, String(rToday.cost));
+
+
+
+api.setUsageRange(7);
+
+const r7 = api.usageSummaryOf(fakeUsage);
+
+chk("近 7 天聚合全部样本", r7.cost === 6 && r7.days === 3, `${r7.cost}/${r7.days}`);
+
+chk("区间带出首末日期", String(r7.span).includes("2026-11-20") && String(r7.span).includes("2026-11-22"), r7.span);
+
+
+
+api.setUsageRange(0);
+
+const rAll = api.usageSummaryOf(fakeUsage);
+
+chk("全部走 totals", rAll.label === "全部" && rAll.cost === 80 && rAll.days === 40, `${rAll.cost}/${rAll.days}`);
+
+
+
+api.setUsageRange(1);
+
+
+
+// ── 清单折叠与收表情文案 ──
+
+chk("清单超 5 条的组默认折叠", helpHtml.includes("help-more") && helpHtml.includes("展开另外"));
+
+chk("折叠里有具体条数", /展开另外 \d+ 条/.test(helpHtml));
+
+chk("前 5 条不折", (helpHtml.match(/<ul class="help-rows">/g) || []).length >= 11);
+
+chk("收表情说明带用法", helpHtml.includes("/收表情 全部") && helpHtml.includes("/收表情 50 笑"));
+
+
+
+// ── 累计消耗面板 ──
+
+api.renderTotals({
+
+  totals: {
+
+    days: 40, cost: 12.5, calls: 900, searches: 30,
+
+    by_source: { learn: 200, reply: 600, active: 50, sticker: 20, profile: 10, search: 30 },
+
+  },
+
+});
+
+const totHtml = boxes["usageTotal"].innerHTML;
+
+chk("累计显示金额", totHtml.includes("12.50"), totHtml.slice(0, 80));
+
+chk("累计显示调用与搜索", totHtml.includes("900") && totHtml.includes("30"));
+
+chk("累计显示记录天数", totHtml.includes("40 天"));
+
+chk("累计显示日均", totHtml.includes("0.31") || totHtml.includes("0.3125"), totHtml);
+
+
+
+const totSrc = boxes["usageTotalSource"].innerHTML;
+
+chk("来源条按次数排", totSrc.indexOf("被叫回复") < totSrc.indexOf("学习提炼"), totSrc.slice(0, 120));
+
+chk("来源条有计数", totSrc.includes("600"));
+
+chk("没出现的来源不渲染", !totSrc.includes("插话判定") && !totSrc.includes("图片打标"));
+
+
+
+api.renderTotals({ totals: { days: 0, cost: 0, calls: 0, searches: 0, by_source: {} } });
+
+chk("没有记录时给提示", boxes["usageTotalSource"].innerHTML.includes("还没有"));
+
+
+
+// ── 柱状图密度 ──
+
+const mkDays = (n) => Array.from({ length: n }, (_, i) => ({
+
+  date: `2026-11-${String((i % 28) + 1).padStart(2, "0")}`, cost: i + 1, calls: i + 1,
+
+}));
+
+api.renderBars(mkDays(7));
+
+chk("7 天用正常间距", !String(boxes["usageBars"].className).includes("dense"),
+
+  String(boxes["usageBars"].className));
+
+const sevenHtml = boxes["usageBars"].innerHTML;
+
+chk("7 天每根都有标签", (sevenHtml.match(/<em>\d\d-\d\d<\/em>/g) || []).length === 7,
+
+  String((sevenHtml.match(/<em>/g) || []).length));
+
+
+
+api.renderBars(mkDays(30));
+
+chk("30 天进密集模式", String(boxes["usageBars"].className).includes("dense"),
+
+  String(boxes["usageBars"].className));
+
+const thirtyHtml = boxes["usageBars"].innerHTML;
+
+const labels = (thirtyHtml.match(/<em>\d\d-\d\d<\/em>/g) || []).length;
+
+chk("30 天标签抽稀到 8 个以内", labels <= 8 && labels >= 4, String(labels));
+
+chk("30 天柱子一根不少", (thirtyHtml.match(/class="bar-col"/g) || []).length === 30);
+
+
+
+document.getElementById = origGetById2;
 
 console.log("\n" + (ok ? "全部通过" : "有失败项"));
 process.exit(ok ? 0 : 1);

@@ -84,7 +84,12 @@ body {
 .side-actions { display: flex; flex-direction: column; gap: 6px; }
 .side-actions button { text-align: left; }
 
-.content { min-width: 0; }
+.content {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+.content > .pane { flex: none; }
 .pane { display: none; }
 .pane.on { display: block; }
 
@@ -1925,4 +1930,517 @@ h3 small { font-weight: 400; font-size: 11px; color: #6c7484; margin-left: 6px; 
   padding: 2px 10px;
   font-size: 12px;
   white-space: nowrap;
+}
+
+/* ── 表情包 ───────────────────────────────────────────────────────── */
+
+.sticker-tabs {
+  display: flex; flex-wrap: wrap; gap: 8px; margin: 4px 0 14px;
+}
+
+.sticker-tab {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 5px 12px; border-radius: 999px;
+  border: 1px solid var(--line); background: transparent;
+  color: var(--muted); font-size: 13px; cursor: pointer;
+  transition: border-color .15s, color .15s, background .15s;
+}
+.sticker-tab:hover { border-color: var(--accent); color: var(--text); }
+.sticker-tab.on {
+  border-color: var(--accent); color: var(--text);
+  background: rgba(110, 168, 254, .12);
+}
+.sticker-tab b {
+  font-weight: 600; font-size: 11px; color: var(--muted);
+  background: rgba(255, 255, 255, .06); border-radius: 999px; padding: 0 6px;
+}
+.sticker-tab.on b { color: var(--accent); }
+
+/* 图库限高：图片再多也不许把整页撑长，滚动条只在这一块里 */
+.sticker-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(112px, 1fr));
+  gap: 10px;
+  align-content: start;
+  max-height: 540px;
+  overflow-y: auto;
+  padding-right: 6px;
+  overscroll-behavior: contain;
+}
+.sticker-grid::-webkit-scrollbar { width: 8px; }
+.sticker-grid::-webkit-scrollbar-track { background: transparent; }
+.sticker-grid::-webkit-scrollbar-thumb { background: #2a2f3a; border-radius: 4px; }
+.sticker-grid::-webkit-scrollbar-thumb:hover { background: #3a4150; }
+
+/* 词云视图：不滚、不限高，标签自己换行 */
+.sticker-grid.cloud {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  align-content: flex-start;
+  gap: 8px 12px;
+  max-height: none;
+  overflow: visible;
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, .02);
+}
+.cloud-tag {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 4px;
+  padding: 1px 7px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text);
+  font-family: inherit;
+  line-height: 1.5;
+  cursor: pointer;
+  transition: border-color .12s, color .12s, background .12s;
+}
+.cloud-tag:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: rgba(110, 168, 254, .1);
+}
+.cloud-tag b {
+  font-size: 10px;
+  font-weight: 500;
+  color: var(--muted);
+}
+.cloud-tag:hover b { color: var(--accent); }
+
+.sticker {
+  position: relative; border: 1px solid var(--line); border-radius: 10px;
+  background: var(--card); overflow: hidden;
+}
+
+.sticker-img {
+  aspect-ratio: 1 / 1; display: flex; align-items: center; justify-content: center;
+  background: #10131a; overflow: hidden;
+}
+.sticker-img img {
+  max-width: 100%; max-height: 100%; object-fit: contain; display: block;
+}
+.sticker-broken {
+  font-size: 11px; color: var(--muted); text-align: center; padding: 4px;
+}
+
+.sticker-meta {
+  font-size: 11px; color: var(--muted); padding: 4px 8px 6px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+
+.sticker-del {
+  position: absolute; top: 4px; right: 4px;
+  width: 20px; height: 20px; line-height: 18px; padding: 0;
+  border-radius: 50%; border: none; cursor: pointer;
+  background: rgba(0, 0, 0, .55); color: #fff; font-size: 14px;
+  opacity: 0; transition: opacity .15s, background .15s;
+}
+.sticker:hover .sticker-del { opacity: 1; }
+.sticker-del:hover { background: var(--danger); }
+
+.sticker-add {
+  aspect-ratio: 1 / 1; display: flex; align-items: center; justify-content: center;
+  border: 1px dashed var(--line); border-radius: 10px;
+  background: transparent; color: var(--muted); font-size: 13px; cursor: pointer;
+  transition: border-color .15s, color .15s;
+}
+.sticker-add:hover { border-color: var(--accent); color: var(--accent); }
+
+/* ── 表情包：分类管理 ─────────────────────────────────────────────── */
+
+/* 分类最多 24 个，全铺开会把图库挤到屏幕外，这里单独滚 */
+.cat-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 6px;
+  max-height: 296px;
+  overflow-y: auto;
+  padding-right: 4px;
+  overscroll-behavior: contain;
+}
+.cat-list::-webkit-scrollbar { width: 8px; }
+.cat-list::-webkit-scrollbar-track { background: transparent; }
+.cat-list::-webkit-scrollbar-thumb { background: #2a2f3a; border-radius: 4px; }
+.cat-list::-webkit-scrollbar-thumb:hover { background: #3a4150; }
+
+.cat-row {
+  display: flex; align-items: center; gap: 10px;
+  padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px;
+  background: rgba(255, 255, 255, .02);
+}
+.cat-main { flex: 1; min-width: 0; display: flex; align-items: baseline; gap: 10px; }
+.cat-main b { font-size: 13px; flex: none; }
+.cat-desc {
+  color: var(--muted); font-size: 12px; flex: 1; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.cat-desc.empty { color: #c98a3a; font-style: italic; }
+.cat-kw {
+  color: var(--muted); font-size: 11px; flex: none; max-width: 190px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  opacity: .75;
+}
+.cat-n {
+  flex: none; min-width: 26px; text-align: right;
+  font-size: 12px; color: var(--muted);
+}
+.cat-row .cat-acts { flex: none; display: flex; gap: 6px; }
+
+.cat-edit {
+  display: grid; grid-template-columns: 110px 1fr 1fr auto;
+  gap: 8px; align-items: center;
+  padding: 8px 10px; border: 1px dashed var(--accent); border-radius: 8px;
+}
+.cat-edit input {
+  min-width: 0; padding: 5px 8px; font-size: 12px;
+  border: 1px solid var(--line); border-radius: 6px;
+  background: var(--bg); color: var(--text);
+}
+.cat-edit input:focus { outline: none; border-color: var(--accent); }
+
+.sticker-tags {
+  display: flex; flex-wrap: wrap; gap: 3px; padding: 0 8px 6px;
+  overflow: hidden; max-height: 34px;
+}
+.sticker-tags i {
+  font-style: normal; font-size: 10px; line-height: 1.5;
+  padding: 0 5px; border-radius: 4px;
+  background: rgba(110, 168, 254, .16); color: var(--accent);
+  white-space: nowrap;
+}
+
+@media (max-width: 720px) {
+  .cat-edit { grid-template-columns: 1fr 1fr; }
+  .cat-kw { display: none; }
+}
+
+/* 空的分类压暗，别和"有图"的抢注意力 */
+.sticker-tab.empty { opacity: .42; }
+.sticker-tab.empty.on { opacity: .8; }
+
+/* 图库排序下拉：和搜索框同一行、同一种边框 */
+.list-select {
+  flex: none;
+  width: 128px;
+  padding: 4px 6px;
+  font: inherit;
+  font-size: 12px;
+  color: var(--text);
+  background: #0d1016;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  cursor: pointer;
+}
+.list-select:focus { outline: none; border-color: var(--accent); }
+
+/* 全部视图：分类压在图片左上角，不占元信息行的位置 */
+.sticker-cat {
+  position: absolute;
+  top: 6px;
+  left: 6px;
+  padding: 1px 6px;
+  font-size: 10px;
+  line-height: 1.6;
+  border-radius: 4px;
+  background: rgba(0, 0, 0, .62);
+  color: #cfd8e6;
+  pointer-events: none;
+}
+.sticker-img { position: relative; }
+
+/* ── 停用：留图不留用 ─────────────────────────────────────────────── */
+
+.sticker.off { opacity: .5; }
+.sticker.off .sticker-img img { filter: grayscale(.75); }
+.sticker.off:hover { opacity: .85; }
+
+.sticker-off {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  padding: 1px 6px;
+  font-size: 10px;
+  line-height: 1.6;
+  border-radius: 4px;
+  background: rgba(180, 60, 60, .82);
+  color: #fff;
+  pointer-events: none;
+}
+
+/* 弹窗里的复选行：和 label 上下结构不同，要横排 */
+.field.row-check {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  color: var(--text);
+}
+.field.row-check input {
+  width: auto;
+  margin: 0;
+  accent-color: var(--accent);
+}
+.field.row-check span { font-size: 12px; }
+
+.ghost.on {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: rgba(110, 168, 254, .12);
+}
+
+/* ── 功能总开关（主动回复 / 喂食 / 联网搜索 页顶部）─────────────────── */
+
+.feat-card { padding: 14px 16px; }
+
+.feat-toggle {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  cursor: pointer;
+  user-select: none;
+}
+/* 原生 checkbox 藏起来但保留可聚焦，键盘和读屏都能用 */
+.feat-toggle input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+}
+.ft-track {
+  flex: none;
+  width: 46px;
+  height: 26px;
+  border-radius: 999px;
+  background: #2a2f3a;
+  position: relative;
+  transition: background .18s;
+}
+.ft-knob {
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: #8b93a3;
+  transition: transform .18s, background .18s;
+}
+.feat-toggle input:checked + .ft-track { background: rgba(110, 168, 254, .32); }
+.feat-toggle input:checked + .ft-track .ft-knob {
+  transform: translateX(20px);
+  background: var(--accent);
+}
+.feat-toggle input:focus-visible + .ft-track { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+.ft-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.ft-text b { font-size: 14px; }
+.ft-text i { font-style: normal; font-size: 12px; color: var(--muted); line-height: 1.5; }
+
+/* ── 每日预算条 ───────────────────────────────────────────────────── */
+
+.budget-bar { margin-bottom: 14px; }
+.budget-line {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 12px;
+  flex-wrap: wrap;
+  font-size: 12px;
+  color: var(--muted);
+  margin-bottom: 7px;
+}
+.budget-line b { color: var(--text); font-size: 15px; }
+.budget-line .over { color: #e08a8a; }
+.budget-track {
+  height: 8px;
+  border-radius: 5px;
+  background: #1a1e26;
+  overflow: hidden;
+}
+.budget-track i {
+  display: block;
+  height: 100%;
+  border-radius: 5px;
+  background: linear-gradient(90deg, #4f7fd6, #6ea8fe);
+  transition: width .25s;
+}
+.budget-track i.over { background: linear-gradient(90deg, #b04a4a, #e07a7a); }
+
+/* ── 概览：群里怎么触发 ───────────────────────────────────────────── */
+
+.help-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(330px, 1fr));
+  gap: 12px;
+}
+.help-group {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 10px 12px 12px;
+  background: rgba(255, 255, 255, .02);
+}
+.help-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 0 0 8px;
+  border: none;
+  border-bottom: 1px dashed var(--line);
+  background: none;
+  color: var(--text);
+  font: inherit;
+  cursor: pointer;
+  text-align: left;
+}
+.help-head b { font-size: 13px; }
+.help-head i { margin-left: auto; color: var(--muted); font-style: normal; }
+.help-head:hover b { color: var(--accent); }
+
+.help-rows {
+  list-style: none;
+  margin: 8px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+.help-rows li {
+  display: flex;
+  gap: 8px;
+  font-size: 12px;
+  line-height: 1.65;
+  color: var(--muted);
+}
+.help-kind {
+  flex: none;
+  align-self: flex-start;
+  margin-top: 2px;
+  font-style: normal;
+  font-size: 10px;
+  line-height: 16px;
+  padding: 0 5px;
+  border-radius: 4px;
+  background: rgba(255, 255, 255, .06);
+  color: var(--muted);
+  white-space: nowrap;
+}
+.help-kind[data-k="cmd"] { background: rgba(110, 168, 254, .16); color: #8ab4ff; }
+.help-kind[data-k="auto"] { background: rgba(126, 200, 140, .16); color: #7ec88c; }
+.help-kind[data-k="warn"] { background: rgba(216, 164, 90, .18); color: #d8a45a; }
+.help-kind[data-k="kw"] { background: rgba(190, 140, 240, .16); color: #c08cf0; }
+.help-rows code {
+  background: #0d1016;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 0 4px;
+  font-size: 11px;
+  color: var(--text);
+}
+
+/* ── 页脚署名 ─────────────────────────────────────────────────────── */
+
+/* 页脚：所有页面共用一份，两个圆头像夹住文字，整体居中。
+   margin-top:auto 让它永远贴在内容区最底——内容短的时候也不会浮在中间 */
+/* 页脚：所有页面共用一份，两个圆头像夹住文字，整体居中。
+   不再用 margin:auto 贴屏幕底——内容少的时候它会飘到半屏中间，
+   下方留一大片空白。现在紧跟内容，滚到底就能看到 */
+.sign {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  flex-wrap: wrap;
+  margin: 24px 0 4px;
+  padding: 14px 4px 4px;
+  border-top: 1px solid var(--line);
+}
+.sign-face,
+.sign-logo {
+  width: 34px;
+  height: 34px;
+  flex: none;
+  border-radius: 50%;
+  object-fit: cover;
+  border: 1px solid var(--line);
+  background: #0d1016;
+}
+.sign-logo { object-fit: contain; padding: 2px; }
+.sign-text { min-width: 0; text-align: center; }
+.sign-line { margin: 0 0 3px; font-size: 12px; color: var(--text); line-height: 1.5; }
+.sign-meta { margin: 0; font-size: 11px; color: var(--muted); line-height: 1.5; }
+.sign-meta b { color: var(--text); font-weight: 600; }
+.sign a { color: var(--accent); text-decoration: none; }
+.sign a:hover { text-decoration: underline; }
+
+/* 按群控制那一栏：群多的时候本来就长，单独给个更矮的限高 */
+.scroll-box.short { max-height: 360px; }
+
+/* 90 天 / 一年那种密度。
+   真正的坑是 gap：8px × 89 根 = 700 多像素，柱子本身一点空间都没有，
+   整条图会撑出卡片外。密集模式下把间距压到 1px。 */
+.bars.dense { gap: 1px; }
+.bars .bar em:empty { height: 14px; }
+.bars.dense .bar { min-width: 0; }
+.bars.dense .bar-col { min-width: 1px; }
+.bars.dense .bar em { font-size: 9px; letter-spacing: -.2px; }
+
+/* 清单折叠：默认露 5 条，剩下的点开看 */
+.help-more { margin-top: 9px; }
+.help-more summary {
+  list-style: none;
+  cursor: pointer;
+  font-size: 12px;
+  color: var(--accent);
+  padding: 2px 0;
+  user-select: none;
+}
+.help-more summary::-webkit-details-marker { display: none; }
+.help-more summary::before { content: "▸ "; }
+.help-more[open] summary::before { content: "▾ "; }
+.help-more summary:hover { text-decoration: underline; }
+.help-more .help-rows { margin-top: 8px; }
+
+/* 预算条右侧的状态 + 按钮 */
+.budget-acts { display: inline-flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.budget-acts .over { color: #e08a8a; }
+.budget-acts .bypass { color: #7ec88c; }
+
+/* 累计消耗：按来源的横向次数条 */
+.ub-title {
+  margin: 14px 0 8px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.tot-row {
+  display: grid;
+  grid-template-columns: 84px 1fr 64px;
+  align-items: center;
+  gap: 10px;
+  margin-top: 6px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.tot-row span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.tot-row i {
+  display: block;
+  height: 8px;
+  border-radius: 4px;
+  background: linear-gradient(90deg, #4f7fd6, #6ea8fe);
+}
+.tot-row b {
+  text-align: right;
+  color: var(--text);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
 }

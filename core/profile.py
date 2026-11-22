@@ -271,6 +271,12 @@ class ProfileStore:
         因为用户主动点了就是要现在看到结果。日限仍然生效——不然连点几下
         就能绕过所有节流。
         """
+        # 预算超支：画像是一次完整请求，而且不是聊天的必需环节，先停。
+        # 连「重新生成」也拦——force 只跳过间隔，不跳过钱
+        budget = getattr(self.plugin, "budget", None)
+        if budget is not None and budget.exceeded():
+            return False
+
         try:
             if force:
                 if not self.enabled() or self.quota_of(sender_id) <= 0:

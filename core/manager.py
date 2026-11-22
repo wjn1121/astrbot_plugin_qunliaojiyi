@@ -84,6 +84,17 @@ class Manager:
         if now < self._first_allowed_at:
             return
 
+        # 预算超支：后台提炼是纯花钱不出声的行为，第一个停。
+        # 消息还在正常收，所以恢复后历史不会断一截
+        budget = getattr(self.plugin, "budget", None)
+        if budget is not None and budget.exceeded():
+            self.last_run_result = {
+                "sessions": 0,
+                "ok": 0,
+                "skipped": "今日预算已用完，学习暂停",
+            }
+            return
+
         mode = self._learn_mode()
         if mode == "replace":
             if now < self.next_run_at:
@@ -161,6 +172,18 @@ class Manager:
     # ── 手动 ────────────────────────────────────────────────────────────
 
     async def learn_now(self, session_id: str) -> dict:
+        # 手动学习也要过预算闸。用户点「立即学习」是知情的选择，但上限在那儿
+        # 还硬跑，等于给了个能悄悄突破上限的后门——想学就先调高上限
+        budget = getattr(self.plugin, "budget", None)
+        if budget is not None and budget.exceeded():
+            snap = budget.snapshot()
+            return {
+                "ok": False,
+                "skipped": (
+                    f"今日预算已用完（¥{snap['spent']:.2f} / ¥{snap['limit']:.2f}），"
+                    "学习暂停。可在「Token 消费」页调高上限或关掉限额"
+                ),
+            }
         provider_id = str(self.settings.get("analysis_provider_id") or "").strip()
         return await self.learner.learn(session_id, provider_id, manual=True)
 
@@ -181,4 +204,9 @@ class Manager:
             "interval": int(self.settings.get("analysis_interval_seconds")),
             "increment_messages": int(self.settings.get("learn_increment_messages") or 30),
             "min_interval": int(self.settings.get("learn_min_interval") or 1800),
+            "budget": (
+                getattr(self.plugin, "budget", None).snapshot()
+                if getattr(self.plugin, "budget", None) is not None
+                else {}
+            ),
         }

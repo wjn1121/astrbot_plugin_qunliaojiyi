@@ -17,14 +17,16 @@
       <nav class="nav" id="nav">
         <button type="button" class="nav-item on" data-tab="overview" title="运行状态、主人是谁、累计花了多少">📊 <span>概览</span></button>
         <button type="button" class="nav-item" data-tab="library" title="按群 / 私聊看学到了什么，可批准、否决、钉住、删除">📚 <span>学习库</span><b class="nav-badge" id="navPending" hidden>0</b></button>
-        <button type="button" class="nav-item" data-tab="bond" title="好感档位、事实记忆与画像、输出层调试">🎭 <span>关系与输出</span></button>
+        <button type="button" class="nav-item" data-tab="bond" title="风格与人格、事实记忆与画像、好感关系、输出层调试">🎭 <span>人格与关系</span></button>
         <button type="button" class="nav-item" data-tab="feed" title="群友用「吃什么」点菜时自动加好感，这里看投喂榜和调加成">🍚 <span>喂食</span></button>
+        <button type="button" class="nav-item" data-tab="sticker" title="关键词或群友发图时甩一张表情包。本地判定，不发请求、不花 token">🤣 <span>表情包</span></button>
         <button type="button" class="nav-item" data-tab="active" title="bot 自己找时机接话。按群开关、调多久说一次、看今天说了几次">🗣 <span>主动回复</span></button>
         <button type="button" class="nav-item" data-tab="persona" title="每个群一份 markdown：自动段随学习更新，人工段永远归你">🧬 <span>人格档案</span></button>
         <button type="button" class="nav-item" data-tab="sessions" title="每个会话的原始特征明细，可逐条编辑、删除、单独开关">💬 <span>会话与特征</span></button>
         <button type="button" class="nav-item" data-tab="preview" title="输入一句话，看这一轮实际会往 prompt 里塞什么（不改任何数据）">🔍 <span>注入预览</span></button>
         <button type="button" class="nav-item" data-tab="usage" title="今天花了多少、花在哪、近 7 天趋势">💸 <span>Token 消费</span></button>
-        <button type="button" class="nav-item" data-tab="settings" title="所有可热调的开关，改完下一轮就生效，不用重启">⚙️ <span>参数</span></button>
+        <button type="button" class="nav-item" data-tab="search" title="联网搜索的总开关、服务商、按群限次和费用">🌐 <span>联网搜索</span></button>
+        <button type="button" class="nav-item" data-tab="settings" title="剩下那些不分页的开关：总开关、学习节奏、管理员工具">⚙️ <span>参数</span></button>
       </nav>
 
       <div class="side-actions">
@@ -55,6 +57,14 @@
           <h2>累计成本 <small>统计的是本插件自己发起的请求量，不含正常聊天</small></h2>
           <div id="cost" class="grid"></div>
         </section>
+
+        <section class="card">
+          <h2 class="card-title">
+            <span>🧭 群里怎么触发 <small>按左边每一页整理，点标题跳过去；在群里 @我说「群聊记忆帮助」会回一张菜单图</small></span>
+          </h2>
+          <div id="triggerHelp" class="help-list"></div>
+        </section>
+
       </section>
 
       <section class="pane" data-pane="library">
@@ -139,9 +149,10 @@
       <section class="pane" data-pane="usage">
         <section class="card">
           <h2 class="card-title">
-            <span>💸 今日消耗</span>
+            <span>💸 <span id="usageTitle">今日消耗</span></span>
             <small>按北京时间自然日，只计本插件发起的请求</small>
           </h2>
+          <p class="hint" id="usageSpan"></p>
           <div id="usageTop" class="usage-top"></div>
           <div id="usageSource" class="usage-breakdown"></div>
           <div id="usageTokens" class="grid"></div>
@@ -150,7 +161,16 @@
 
         <section class="card">
           <h2 class="card-title">
-            <span>今日调用分布 <small>按小时，悬停看这一小时的明细</small></span>
+            <span>🛑 每日预算 <small>花到上限就自动收摊，跨零点自己恢复</small></span>
+          </h2>
+          <div id="budgetBar" class="budget-bar"></div>
+          <div id="budgetSettings" class="settings"></div>
+          <p class="hint">超支后会停掉：学习提炼、主动回复、画像生成、联网搜索；表情包退回关键词模式——还发图，但不花「判断该不该发」的钱。群消息照常收集，所以恢复正常后历史不会断一截。</p>
+        </section>
+
+        <section class="card" id="hourCard">
+          <h2 class="card-title">
+            <span>今日调用分布 <small>按小时，悬停看这一小时的明细。只有「今天」有这张图</small></span>
             <span class="seg" id="hourMetric">
               <button type="button" data-metric="cost" class="on" title="按 DeepSeek 牌价估算的金额">金额</button>
               <button type="button" data-metric="calls" title="调用次数（不看钱、只看频次时用这个）">次数</button>
@@ -162,11 +182,72 @@
 
         <section class="card">
           <h2 class="card-title">
-            <span>近 7 天</span>
-            <small>每天一根，悬停看当天金额与调用次数</small>
+            <span>📈 消耗趋势 <small id="usageBarsNote">每天一根，悬停看当天金额与调用次数</small></span>
+            <span class="seg" id="usageRange">
+              <button type="button" data-range="7" class="on" title="含今天在内的最近 7 天，每天一根">近 7 天</button>
+              <button type="button" data-range="30" title="含今天在内的最近 30 天，每天一根">近 30 天</button>
+            </span>
           </h2>
           <div id="usageBars" class="bars"></div>
           <p class="hint" id="usageSearch"></p>
+        </section>
+
+        <section class="card">
+          <h2 class="card-title">
+            <span>📦 累计消耗 <small>从装上到现在，受「计价」里的保留天数限制</small></span>
+          </h2>
+          <div id="usageTotal" class="grid"></div>
+          <div id="usageTotalSource" class="usage-breakdown"></div>
+          <p class="hint" id="usageTotalNote"></p>
+        </section>
+
+        <section class="card">
+          <h2 class="card-title">
+            <span>💰 计价 <small>只影响面板估的金额，不影响真实扣费</small></span>
+          </h2>
+          <div id="priceSettings" class="settings"></div>
+        </section>
+      </section>
+
+      <section class="pane" data-pane="search">
+        <section class="card feat-card">
+          <label class="feat-toggle" title="关着的时候连搜索工具都不挂，模型不知道能搜，也就不会浪费 token 去试">
+            <input type="checkbox" id="searchEnabled" />
+            <span class="ft-track"><span class="ft-knob"></span></span>
+            <span class="ft-text">
+              <b>联网搜索</b>
+              <i>关着时工具不挂载。每次搜索约多 1200 token，默认关</i>
+            </span>
+          </label>
+        </section>
+
+        <section class="card">
+          <h2 class="card-title">
+            <span>🌐 当前状态 <small>配了 key 不等于能搜，这里给的是实际会不会挂工具</small></span>
+            <span class="title-actions">
+              <button type="button" id="searchRefresh" class="ghost" title="重新读一遍服务商和配额">刷新</button>
+            </span>
+          </h2>
+          <div id="searchStatus" class="grid"></div>
+          <p class="hint" id="searchNote"></p>
+        </section>
+
+        <section class="card">
+          <h2 class="card-title">
+            <span>⚙️ 搜索参数</span>
+            <small>接管模式决定谁来挂工具，服务商决定钱和额度怎么算</small>
+          </h2>
+          <div id="searchSettings" class="settings"></div>
+          <p class="hint err" id="searchMsg"></p>
+        </section>
+
+        <section class="card">
+          <h2 class="card-title"><span>什么时候会搜</span></h2>
+          <p class="hint">
+            模型自己在聊天中判断「这条需要查一下」时才搜，不是每条都搜。
+            主动插话那一轮永远不搜——为一句吐槽等 8 秒不值得。
+            按群限次是在「插件接管」模式下生效的，额度用完当天不再挂工具。
+          </p>
         </section>
       </section>
 
@@ -189,7 +270,21 @@
       <section class="pane" data-pane="bond">
         <section class="card">
           <h2 class="card-title">
-            <span>🧠 事实记忆</span>
+            <span>🎭 风格与人格 <small>调低＝省钱＋更像人设，调高＝更像群里的人</small></span>
+          </h2>
+          <div id="bondStyleSettings" class="settings"></div>
+        </section>
+
+        <section class="card">
+          <h2 class="card-title">
+            <span>🧠 事实记忆与个人画像 <small>前半是遗忘节奏（多久没提就忘），后半决定画像什么时候重写</small></span>
+          </h2>
+          <div id="bondFactsSettings" class="settings"></div>
+        </section>
+
+        <section class="card">
+          <h2 class="card-title">
+            <span>📋 事实记忆</span>
             <span class="title-actions">
               <button id="factsRefresh" class="ghost" title="重新拉一遍事实与画像数据">刷新</button>
             </span>
@@ -290,6 +385,17 @@
       </section>
 
       <section class="pane" data-pane="feed">
+        <section class="card feat-card">
+          <label class="feat-toggle" title="关掉之后不再记投喂、不再加好感，已有的投喂榜数据保留">
+            <input type="checkbox" id="feedEnabled" />
+            <span class="ft-track"><span class="ft-knob"></span></span>
+            <span class="ft-text">
+              <b>喂食</b>
+              <i>群友用「吃什么」点菜时记一次并加好感。关掉后已有数据保留</i>
+            </span>
+          </label>
+        </section>
+
         <section class="card">
           <h2 class="card-title">
             <span>🍚 今日投喂 <small>群友用「吃什么」点菜时自动记一次，加多少好感在这里调</small></span>
@@ -350,10 +456,106 @@
         </section>
       </section>
 
-      <section class="pane" data-pane="active">
+      <section class="pane" data-pane="sticker">
+        <section class="card feat-card">
+          <label class="feat-toggle" title="关掉之后既不主动发图，也不跟图。图库和标签都保留">
+            <input type="checkbox" id="stickerEnabled" />
+            <span class="ft-track"><span class="ft-knob"></span></span>
+            <span class="ft-text">
+              <b>表情包斗图</b>
+              <i>命中关键词或群友发图时甩一张。全程本地判定，不发请求、不花 token</i>
+            </span>
+          </label>
+        </section>
+
         <section class="card">
           <h2 class="card-title">
-            <span>🗣 今日主动回复 <small>bot 自己找时机接的话，这是唯一会凭空产生请求的功能</small></span>
+            <span>🤣 表情包斗图 <small>命中关键词或群友发图时随手甩一张，全程不发请求、不花 token</small></span>
+            <span class="title-actions">
+              <button type="button" id="stickerRefresh" class="ghost" title="重新扫一遍图库">刷新</button>
+            </span>
+          </h2>
+          <div id="stickerStats" class="grid"></div>
+          <p class="hint" id="stickerNote"></p>
+        </section>
+
+        <section class="card">
+          <h2 class="card-title">
+            <span>⚙️ 强度与细节 <small>上面一排档位是一键套一组值，下面是单项微调；改完下一轮生效</small></span>
+          </h2>
+          <div id="stickerProfiles"></div>
+          <div id="stickerSettings" class="settings"></div>
+        </section>
+
+        <section class="card">
+          <h2 class="card-title">
+            <span>图库 <small>点一张图可以改它的标签</small></span>
+            <span class="title-actions">
+              <button type="button" id="stickerTagAll" class="ghost"
+                      title="让视觉模型给还没标签的图打标签，每张一次调用，会花一点钱">识别未标注</button>
+            </span>
+          </h2>
+          <div id="stickerLabels" class="sticker-tabs"></div>
+          <div class="list-head">
+            <p class="hint" id="stickerPickNote"></p>
+            <button type="button" id="stickerCloudBtn" class="ghost tiny"
+                    title="看所有标签，点一个就按它筛">☁ 标签</button>
+            <select id="stickerSort" class="list-select" title="图库按什么排">
+              <option value="added_desc">刚收的在前</option>
+              <option value="added_asc">最早收的在前</option>
+              <option value="used_desc">发得最多的</option>
+              <option value="used_asc">发得最少的</option>
+              <option value="mtime_desc">最近改过</option>
+              <option value="size_desc">文件最大的</option>
+              <option value="name_asc">文件名</option>
+            </select>
+            <input id="stickerSearch" class="list-search" type="search" autocomplete="off"
+                   placeholder="搜文件名 / 标签 / 描述" />
+          </div>
+          <div id="stickerGrid" class="sticker-grid"></div>
+          <input type="file" id="stickerFile" accept="image/*" multiple hidden />
+        </section>
+
+        <section class="card">
+          <h2 class="card-title">
+            <span>分类 <small>名字和描述会拼进提示词——描述写得准，模型才选得对</small></span>
+            <span class="title-actions">
+              <span id="stickerRuleCost" class="hint"></span>
+              <button type="button" id="stickerAddCat" class="ghost" title="新建一个分类">＋ 新建</button>
+            </span>
+          </h2>
+          <div id="stickerCats" class="cat-list"></div>
+        </section>
+
+        <section class="card">
+          <h2 class="card-title">
+            <span>怎么攒图</span>
+            <small>三种来源，挑顺手的</small>
+          </h2>
+          <p class="hint">
+            <b>面板上传</b>：点上面的分类，再点「＋ 放图」，一次可以选多张；
+            <b>从群里收</b>：发一张图并带上 <code>/收图 笑</code>，管理员限定，收的是群里正在流行的图，最贴口味；
+            <b>直接丢文件</b>：图放进 <code>data/stickers/&lt;分类&gt;/</code>，刷新就出现。
+          </p>
+          <p class="hint" id="stickerKeywords"></p>
+        </section>
+      </section>
+
+      <section class="pane" data-pane="active">
+        <section class="card feat-card">
+          <label class="feat-toggle" title="这是唯一会凭空产生请求的功能，默认关。开着之后才按下面的参数找时机接话">
+            <input type="checkbox" id="activeEnabled" />
+            <span class="ft-track"><span class="ft-knob"></span></span>
+            <span class="ft-text">
+              <b>主动回复</b>
+              <i>bot 自己找时机接话。唯一会凭空产生请求的功能，默认关</i>
+            </span>
+          </label>
+        </section>
+
+        <section class="card">
+          <h2 class="card-title">
+            <span>🗣 今日主动回复 <small>今天自己插了几次话、被挡了几次</small></span>
             <span class="title-actions">
               <button id="activeRefresh" class="ghost" title="重新拉一遍各群的开关和计数">刷新</button>
             </span>
@@ -364,11 +566,20 @@
 
         <section class="card">
           <h2 class="card-title">
-            <span>按群控制</span>
-            <small>关掉的群只在被 @ 或回复时说话，不会自己插话</small>
+            <span>⚙️ 参数 <small>先选一档，再按需微调；改完下一轮就生效</small></span>
+          </h2>
+          <div id="activeSettings" class="settings"></div>
+          <p class="hint err" id="activeMsg"></p>
+        </section>
+
+        <section class="card">
+          <h2 class="card-title">
+            <span>📋 按群控制 <small>关掉的群只在被 @ 或回复时说话，不会自己插话</small></span>
+            <span class="title-actions">
+              <span class="hint" id="activeListNote"></span>
+            </span>
           </h2>
           <div class="list-head">
-            <p class="hint" id="activeListNote"></p>
             <input id="activeSearch" class="list-search" type="search" autocomplete="off"
                    placeholder="搜群号 / 群名" title="输入群号或群名即时过滤；和「群」列头共用同一个条件" />
           </div>
@@ -389,15 +600,7 @@
             <span class="hint" id="activeFilterNote"></span>
             <div class="gf-pop" id="activeFilterPop" hidden></div>
           </div>
-          <div id="activeList" class="scroll-box"></div>
-        </section>
-
-        <section class="card">
-          <h2 class="card-title">
-            <span>⚙️ 参数 <small>先选一档，再按需微调；改完下一轮就生效</small></span>
-          </h2>
-          <div id="activeSettings" class="settings"></div>
-          <p class="hint err" id="activeMsg"></p>
+          <div id="activeList" class="scroll-box short"></div>
         </section>
       </section>
 
@@ -449,6 +652,22 @@
           <div id="sessions" class="scroll-box tall"></div>
         </section>
       </section>
+      <footer class="sign">
+        <img class="sign-face" src="./avatar.jpg" alt="wjn1121" />
+        <div class="sign-text">
+          <p class="sign-line">
+            如果这个插件帮你省下了 token 钱，去
+            <a href="https://github.com/wjn1121/astrbot_plugin_qunliaojiyi"
+               target="_blank" rel="noopener noreferrer">GitHub</a>
+            点个 ⭐
+          </p>
+          <p class="sign-meta">
+            <a href="https://github.com/wjn1121" target="_blank" rel="noopener noreferrer">wjn1121</a>
+            · 问题 / 想法欢迎来 QQ 群 <b>1038882918</b>
+          </p>
+        </div>
+        <img class="sign-logo" src="./logo.png" alt="群聊记忆" />
+      </footer>
     </main>
   </div>
 
@@ -458,6 +677,32 @@
       <div class="modal-actions">
         <button id="confirmCancel" class="ghost">取消</button>
         <button id="confirmOk" class="danger">确认</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="seModal" class="modal" hidden>
+    <div class="modal-box">
+      <h3>编辑表情</h3>
+      <p class="hint" id="seFile"></p>
+      <label class="field">
+        标签
+        <input id="seTags" type="text" placeholder="空格或逗号分开，例如：猫猫 笑死" />
+      </label>
+      <label class="field">
+        移到别的分类
+        <select id="seMove"></select>
+      </label>
+      <label class="field row-check" title="停用不删文件，只是让它不参与发图">
+        <input type="checkbox" id="seOff" />
+        <span>停用这张（留着，但不发出去）</span>
+      </label>
+      <p class="hint" id="seErr"></p>
+      <div class="modal-actions">
+        <button type="button" id="seTag" class="ghost" title="让视觉模型看图，生成标签填进上面的框">AI 识别</button>
+        <button type="button" id="seDel" class="ghost danger">删除这张</button>
+        <button type="button" id="seCancel" class="ghost">取消</button>
+        <button type="button" id="seSave" class="danger">保存</button>
       </div>
     </div>
   </div>

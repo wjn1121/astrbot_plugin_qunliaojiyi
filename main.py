@@ -28,6 +28,7 @@ from pathlib import Path
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.message_components import Image as AstrImage
 from astrbot.api.star import Context, Star, StarTools, register
 
 from . import api
@@ -36,9 +37,12 @@ from .core import Manager, Settings, Storage
 from .core.active import ActiveReply
 from .core.admin import admin_summary, cost_summary, is_admin
 from .core.bond import BondStore
+from .core.budget import Budget
 from .core.facts import FactStore
 from .core.feed import record_feed
+from .core.menu import build_menu_image, menu_text
 from .core.profile import ProfileStore
+from .core.sticker import StickerStore
 from .core.persona import PersonaStore
 from .core.usage import UsageTracker
 from .hooks import (
@@ -46,9 +50,13 @@ from .hooks import (
     apply_tone,
     collect_message,
     detect_correction,
+    extract_sticker_mood,
+    inject_sticker_rule,
     inject_style,
     maybe_active_reply,
+    maybe_send_sticker,
     record_llm_usage,
+    send_sticker_after_reply,
     touch_relation,
     truncate_result,
 )
@@ -76,6 +84,9 @@ class QunliaoJiyi(Star):
         self.storage.migrate_traits()
         # usage 要在 manager 之前：learner 学习完就调 plugin.usage.record
         self.usage = UsageTracker(self.data_dir, self.settings)
+        # 每日预算闸：必须在所有「会发请求」的模块之前装配，
+        # manager / active / sticker / search 都要问它一句
+        self.budget = Budget(self)
         # 人格档案落在插件数据目录之外，插件升级不会覆盖用户手写的内容
         self.persona = PersonaStore(self.data_dir)
         self.manager = Manager(self, self.storage, self.settings)
@@ -86,6 +97,8 @@ class QunliaoJiyi(Star):
         # 个人画像：数据落在 storage.profiles。装配在 facts 之后，
         # 因为它要读事实来生成；facts 那边只通过 getattr 取它，不反向依赖
         self.profile = ProfileStore(self, self.storage, self.settings)
+        # 表情包：只读本地目录 + 记账，不碰模型，也不进注入
+        self.sticker = StickerStore(self)
 
         # 待确认的清空操作：{session_id: (scope, 发起时间)}
         self._pending_clear: dict[str, tuple[str, float]] = {}
@@ -112,15 +125,57 @@ class QunliaoJiyi(Star):
 
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def on_all_message(self, event: AstrMessageEvent):
-        """收集消息，顺便看看要不要主动插话。
+        """收集消息，顺手接个图，再看看要不要主动插话。
 
         必须是 async generator：命中主动回复时要 ``yield event.request_llm(...)``，
         普通 async 函数接不住这个返回值。
+
+        表情包放在最前面判断：它是纯本地的轻量互动，发完这一轮就不再主动插话了——
+        一张图加一段话连着来，在群里看着像刷屏。
         """
         await collect_message(self, event)
         await detect_correction(self, event)
+        if await maybe_send_sticker(self, event):
+            return
         async for result in maybe_active_reply(self, event):
             yield result
+
+    @filter.event_message_type(filter.EventMessageType.ALL)
+    async def on_menu_help(self, event: AstrMessageEvent):
+        """@我说「群聊记忆帮助」，回一张命令菜单图。
+
+        只认短句且必须同时出现「群聊记忆」和「帮助/菜单/命令」，
+        免得群里正常聊天提到插件名就被塞一张图。
+        画不出图时退回纯文字，内容同一份来源，不会两边不同步。
+        """
+        text = str(getattr(event, "message_str", "") or "").strip()
+        if not text or len(text) > 30:
+            return
+        if "群聊记忆" not in text:
+            return
+        if not any(w in text.lower() for w in ("帮助", "菜单", "命令", "help")):
+            return
+
+        # 这一轮不用再让模型答一遍：用户要的是菜单，不是一段解释
+        try:
+            event.should_call_llm(False)
+        except Exception:  # noqa: BLE001 - 老版本没这个方法，忽略
+            pass
+
+        path = None
+        try:
+            path = build_menu_image(self)
+        except Exception as e:  # noqa: BLE001 - 画图失败不能连文字一起没了
+            logger.warning(f"[群聊记忆] 生成菜单图失败，退回文字: {e}")
+
+        try:
+            if path is not None:
+                yield event.chain_result([AstrImage.fromFileSystem(str(path))])
+            else:
+                yield event.plain_result(menu_text())
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[群聊记忆] 发送菜单失败: {e}")
+            yield event.plain_result(menu_text())
 
     @filter.after_message_sent()
     async def on_after_message_sent(self, event: AstrMessageEvent):
@@ -136,14 +191,21 @@ class QunliaoJiyi(Star):
         # 喂食要在关系之后：touch 可能因为冷却/刷屏提前放行，
         # 而投喂有自己的一套限制（每日次数），不该被它挡掉
         await record_feed(self, event)
+        # 表情包放最后：marker 模式的标签在 on_llm_response 已经剥好，
+        # analyze 模式要读这一轮的最终正文
+        await send_sticker_after_reply(self, event)
 
     @filter.on_llm_request(priority=17)
     async def on_llm_request(self, event: AstrMessageEvent, req):
         await inject_style(self, event, req)
+        # marker 模式：掷骰命中才告诉模型「这轮你可以发表情」
+        inject_sticker_rule(self, event, req)
 
     @filter.on_llm_response()
     async def on_llm_response(self, event: AstrMessageEvent, response):
         await record_llm_usage(self, event, response)
+        # 在这一步剥标记：进对话历史、进学习材料的都是干净文本
+        await extract_sticker_mood(self, event, response)
 
     @filter.on_decorating_result()
     async def on_decorating_result(self, event: AstrMessageEvent):
@@ -154,6 +216,159 @@ class QunliaoJiyi(Star):
         await apply_feed_note(self, event)
 
     # ── 命令 ────────────────────────────────────────────────────────────
+
+    @filter.command("表情包")
+    async def cmd_sticker_status(self, event: AstrMessageEvent):
+        """看表情包图库的状态：各分类几张、今天发了多少。"""
+        cfg = self.sticker.config()
+        counts = self.sticker.counts()
+        lines = [
+            f"表情包：{self.sticker.total()} 张，今天发了 {self.sticker.today_total()} 次"
+            f"（上限 {int(cfg.get('daily_limit', 40) or 0)}）"
+        ]
+        detail = " · ".join(
+            f"{c['name']} {counts.get(c['key'], 0)}" for c in self.sticker.categories
+        )
+        lines.append(detail)
+        lines.append(
+            "已开启，命中关键词或跟图时会发。" if cfg.get("enabled")
+            else "斗图还没开。管理员可在插件配置的「表情包」里打开。"
+        )
+        yield event.plain_result("\n".join(lines))
+
+    @filter.command("收图")
+    async def cmd_collect_sticker(self, event: AstrMessageEvent):
+        """把这条消息里的图收进图库。用法：发图 + /收图 笑
+
+        群友的表情包是最好的素材来源——比自己找的图贴群里的口味。
+        """
+        if not is_admin(self, event):
+            return
+
+        raw = str(getattr(event, "message_str", "") or "").strip()
+        # 同样是先滤空串再切命令名，「/收图 笑」不能被解析成 want="收图"
+        tokens = [t for t in raw.replace("/", " ").split() if t]
+        args = tokens[1:]
+        want = args[0] if args else ""
+        # /收图 笑 熊猫头 笑死 —— 后面几个词当标签存进去
+        extra_tags = args[1:]
+
+        cat = self.sticker.find(want)
+        if cat is None:
+            names = " / ".join(self.sticker.names())
+            yield event.plain_result(
+                f"要指定收进哪个分类：/收图 {self.sticker.names()[0]}\n可选：{names}"
+            )
+            return
+        key = cat["key"]
+
+        imgs = [
+            comp
+            for comp in (event.get_messages() or [])
+            if type(comp).__name__ == "Image"
+        ]
+        if not imgs:
+            yield event.plain_result("这条消息里没有图。发一张图再带上 /收图 试试。")
+            return
+
+        try:
+            local = await imgs[0].convert_to_file_path()
+            blob = Path(local).read_bytes()
+        except Exception as e:  # noqa: BLE001 - 平台给的图可能下不下来
+            logger.warning(f"[群聊记忆] 收图失败: {e}")
+            yield event.plain_result("这张图没取到，可能链接过期了。")
+            return
+
+        ok, info = self.sticker.add_file(key, str(local), blob, extra_tags)
+        if not ok:
+            yield event.plain_result(f"没收成：{info}")
+            return
+        tag_note = f"，标签：{' / '.join(extra_tags)}" if extra_tags else ""
+        yield event.plain_result(
+            f"收进「{cat['name']}」了{tag_note}，"
+            f"这个分类现在 {self.sticker.counts().get(key, 0)} 张。"
+        )
+
+    @filter.command("收表情")
+    async def cmd_import_qq_faces(self, event: AstrMessageEvent):
+        """把 bot 这个 QQ 号的收藏表情同步进图库。
+
+        用法：
+          /收表情           只看收藏了多少张
+          /收表情 全部       全收（一次最多 200）
+          /收表情 50         只收前 50 张
+          /收表情 50 笑      收进「笑」分类（分类不存在会新建）
+        """
+        if not is_admin(self, event):
+            return
+
+        raw = str(getattr(event, "message_str", "") or "").strip()
+        # 先滤掉空串再丢掉第一个 token。之前的写法是 parts[1:]，而
+        # "/收表情" split 出来是 ["", "收表情"]，切掉第一个空串之后
+        # 命令名本身留在了 args 里，被当成了分类名。
+        tokens = [t for t in raw.replace("/", " ").split() if t]
+        args = tokens[1:]
+
+        limit = 0
+        category = ""
+        for item in args:
+            if item.isdigit():
+                limit = int(item)
+            elif item == "全部":
+                limit = 200
+            else:
+                category = item
+
+        # 不带参数：只报数量，别一上来就下几百张
+        if not args:
+            try:
+                urls = await self.sticker.fetch_qq_faces()
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"[群聊记忆] 拉收藏表情失败: {e}")
+                urls = []
+            if not urls:
+                yield event.plain_result(
+                    "没拿到收藏表情。可能是协议端不支持 fetch_custom_face（LLBot / NapCat 一般都支持），"
+                    "或者这个号确实没有收藏。"
+                )
+                return
+            yield event.plain_result(
+                f"这个号收藏了 {len(urls)} 张表情。\n"
+                f"「/收表情 全部」全收进图库（一次上限 200）\n"
+                f"「/收表情 50 笑」只收前 50 张并放进「笑」"
+            )
+            return
+
+        if not limit:
+            limit = 50
+
+        try:
+            res = await self.sticker.import_qq_faces(limit=limit, category=category)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[群聊记忆] 导入收藏表情失败: {e}")
+            yield event.plain_result(f"没收成：{e}")
+            return
+
+        if res.get("error"):
+            yield event.plain_result(f"没收成：{res['error']}")
+            return
+        if not res.get("fetched"):
+            yield event.plain_result("没拿到收藏表情。")
+            return
+
+        cat = self.sticker.category_of(res.get("category", "")) or {}
+        lines = [
+            f"收藏夹里有 {res['fetched']} 张，这次收进「{cat.get('name') or res.get('category')}」"
+            f" {res['saved']} 张。"
+        ]
+        if res.get("skipped"):
+            lines.append(f"跳过 {res['skipped']} 张重复的。")
+        if res.get("failed"):
+            lines.append(f"{res['failed']} 张没下下来。")
+        if res["fetched"] > limit:
+            lines.append(f"还剩 {res['fetched'] - limit} 张，再发一次命令接着收。")
+        lines.append("接下来可以在面板点「识别未标注」给它们打标签。")
+        yield event.plain_result("\n".join(lines))
 
     @filter.command("关系")
     async def cmd_relation(self, event: AstrMessageEvent):

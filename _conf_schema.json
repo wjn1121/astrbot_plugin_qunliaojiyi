@@ -211,6 +211,120 @@
     "default": true,
     "hint": "从事实里提炼一段「这个人是谁」，按好感给字数（陌生 120 → 老友 420，主人 800），注入时单独一段，和事实明细分开。不待见档不生成也不注入。影响：token ↑（每轮多几十到四百多字）。"
   },
+  "sticker_enabled": {
+    "description": "启用表情包斗图",
+    "type": "bool",
+    "default": false,
+    "hint": "命中关键词或群友发图时，从本地图库甩一张。全程不发请求、不进 prompt，token 为 0。默认关——它会往外发图，属于会打扰人的能力。图在面板「表情包」页上传，或者用 /收图 从群里收藏。"
+  },
+  "sticker_probability": {
+    "description": "关键词命中后发出的概率（%）",
+    "type": "int",
+    "default": 25,
+    "hint": "「哈哈」这种词群里一分钟能出现十次，每句都甩图就成了刷屏机器人。25 大致是「偶尔接得住梗」。影响：token 0。"
+  },
+  "sticker_follow_image": {
+    "description": "群友发图时跟着发一张",
+    "type": "bool",
+    "default": true,
+    "hint": "斗图的本体。不判断对方发的是什么图——那要视觉模型，每张都要钱，而斗图本来也不需要对上意思。影响：token 0。"
+  },
+  "sticker_follow_probability": {
+    "description": "跟图的概率（%）",
+    "type": "int",
+    "default": 15,
+    "hint": "比关键词低，因为群里发图很频繁。15% 加上冷却已经足够像在参与。影响：token 0。"
+  },
+  "sticker_cooldown_seconds": {
+    "description": "同群两次发图的最小间隔（秒）",
+    "type": "int",
+    "default": 120,
+    "hint": "关键词和跟图共用这一道闸。调小会明显变吵。影响：token 0。"
+  },
+  "sticker_daily_limit": {
+    "description": "每天最多发几张",
+    "type": "int",
+    "default": 40,
+    "hint": "所有群合计，最硬的那道闸——概率写得再高也超不过它。设 0 等于当天不发。影响：token 0。"
+  },
+  "sticker_mood_mode": {
+    "description": "情绪从哪来",
+    "type": "string",
+    "default": "keyword",
+    "options": [
+      [
+        "off",
+        "关闭：不发图"
+      ],
+      [
+        "keyword",
+        "关键词：只看字面（0 成本）"
+      ],
+      [
+        "analyze",
+        "事后分析：回复完另调小模型（每轮约 26 token）"
+      ],
+      [
+        "marker",
+        "模型自报：让模型在回复里打标记（每轮约 70 token）"
+      ]
+    ],
+    "hint": "决定「什么时候该发」这件事交给谁。keyword 完全不花钱但只认几个词；analyze 不碰回复格式，但看不到前文；marker 最准——模型本来就读完了上下文，顺手打个标记，发送前会剥掉，用户看不见。影响：keyword/off 为 0，analyze 约 26 token/轮，marker 约 70 token/轮。"
+  },
+  "sticker_mood_rate": {
+    "description": "smart 模式的触发率（%）",
+    "type": "int",
+    "default": 30,
+    "hint": "marker 模式是「多少比例的轮次告诉模型可以发表情」，analyze 模式是「多少轮次真的去调模型」。这是省钱的闸：30 表示七成轮次它根本不知道有这回事。影响：按比例线性影响 token。"
+  },
+  "sticker_chain": {
+    "description": "连发：发完一张再补一张",
+    "type": "bool",
+    "default": false,
+    "hint": "刚甩完一张图，按跟图概率再补一张同类的。纯本地，0 成本。影响：token 0。"
+  },
+  "sticker_formation": {
+    "description": "队形：群友刷图时跟着刷",
+    "type": "bool",
+    "default": false,
+    "hint": "30 秒内群里有 3 张图，跟着甩一张。这是「大家都在发我也发」的从众行为，不判断该不该发。纯本地，0 成本。影响：token 0。"
+  },
+  "sticker_analyze_provider_id": {
+    "description": "分析模式用的模型 ID",
+    "type": "string",
+    "default": "",
+    "hint": "留空跟随当前会话。换成便宜的小模型能显著降低这一项的开销。影响：token ↓（换便宜模型）。"
+  },
+  "sticker_search_first": {
+    "description": "先按标签全库检索",
+    "type": "bool",
+    "default": true,
+    "hint": "拿到回复原文后，拿它去撞每张图的标签，命中就用那一张——比「模型选分类、桶内随机」准，而且不发请求、不花 token。没命中再退回分类。影响：token 0。"
+  },
+  "sticker_search_threshold": {
+    "description": "检索的最低分",
+    "type": "float",
+    "default": 1.5,
+    "hint": "1.5 表示只算「内容标签」——回复里提到吃白饭、智械危机、离谱这些才算命中；只是提了一句「大肥鱼」不发图。稀有标签权重更高，常见标签几乎不算分。调高会更挑，宁可不发也不乱发。影响：token 0。"
+  },
+  "sticker_tag_provider_id": {
+    "description": "自动打标用的视觉模型 ID",
+    "type": "string",
+    "default": "",
+    "hint": "留空用 AstrBot 全局配置的「默认图片转述模型」。模型必须支持图片输入。打标是每张图一次调用的一次性成本，标完之后检索和发图都不再花钱。"
+  },
+  "daily_budget_enabled": {
+    "description": "每日花费上限（到点自动收摊）",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后，当天累计花费达到下面的金额，就自动停掉所有还会产生新请求的功能：学习、主动回复、画像生成、联网搜索，表情包退回关键词模式。跨零点自动恢复。消息照常收集，只是不再提炼，恢复正常后不会断层。影响：token ↓↓（超支后）。"
+  },
+  "daily_budget_yuan": {
+    "description": "每天最多花多少钱（元）",
+    "type": "float",
+    "default": 2.0,
+    "hint": "按面板估算的金额算（受「计价」里的牌价影响，不是账单）。改成 0 等于关掉。面板「Token 消费」页可以随时改。影响：token ↓↓（超支后）。"
+  },
   "profile_min_facts": {
     "description": "🧬 画像最少几条事实",
     "type": "int",
@@ -715,6 +829,12 @@
     "default": "plugin",
     "hint": "plugin = 插件自己挂搜索工具，能按群限次（推荐，也是默认）；inherit = 完全沿用 AstrBot 全局设置，但插件看不到搜了几次、管不了上限；off = 就算 AstrBot 全局开着也把搜索工具摘掉。影响：token ↑（每次搜索约多 1200 token）。"
   },
+  "web_search_enabled": {
+    "description": "启用联网搜索",
+    "type": "bool",
+    "default": false,
+    "hint": "总开关，默认关。关着的时候连搜索工具都不挂——模型根本不知道有这回事，不会浪费 token 去试着搜。打开之后才按下面的「接管模式」决定怎么接。影响：token ↑（每次搜索约 1200 token）。"
+  },
   "web_search_provider": {
     "description": "[联网搜索] 服务商",
     "type": "string",
@@ -820,7 +940,7 @@
   "token_stats_keep_days": {
     "description": "[计价] 消耗记录保留天数",
     "type": "int",
-    "default": 7,
-    "hint": "消耗记录按天存成文件，留几天。默认 7，超出的自动删。这些文件只存数字不存聊天内容，即使泄露也不含隐私。影响：只占磁盘，与 token 无关。"
+    "default": 400,
+    "hint": "用量文件留多少天。默认 400 天——面板要按周/月/年看，留太短就只剩最近几天有数。一天一个几 KB 的小文件，一年也就几百 KB。影响：token 0（只影响历史能回看多久）。"
   }
 }

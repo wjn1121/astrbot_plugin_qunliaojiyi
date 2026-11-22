@@ -6,13 +6,26 @@
 
 from __future__ import annotations
 
+import base64
+import io
 import json
+import os
 import re
 import time
+from pathlib import Path
 
 from quart import jsonify, request
 
 from astrbot.api import logger
+
+# 缩略图用 Pillow 生成。它不是本插件的依赖（requirements.txt 保持为空），
+# AstrBot 自带的依赖里通常有——没有就退回原图，慢一点但功能不缺。
+try:
+    from PIL import Image as PILImage
+    _HAS_PIL = True
+except ImportError:  # pragma: no cover - 取决于宿主环境
+    PILImage = None  # type: ignore[assignment]
+    _HAS_PIL = False
 
 from .constants import PLUGIN_VERSION
 from .core.learn_gate import is_private_session, learn_enabled as learn_gate_enabled
@@ -27,6 +40,7 @@ from .core.facts import (
     tier_of as TIER_OF,
 )
 from .core.settings import ACTIVE_PROFILES, GROUP_PROFILES
+from .core.settings import STICKER_PROFILES
 from .core.storage import MANUAL_MAX_PER_SESSION, trait_score
 from .core.tone import clean_text, split_segments
 from .utils import display_name
@@ -48,6 +62,8 @@ def register(plugin) -> None:
         (f"/{plugin.plugin_name}/facts", api_facts, ["GET", "POST"], "事实记忆"),
         (f"/{plugin.plugin_name}/feed", api_feed, ["GET"], "喂食与投喂榜"),
         (f"/{plugin.plugin_name}/active", api_active_groups, ["GET"], "主动回复按群开关"),
+        (f"/{plugin.plugin_name}/sticker", api_sticker, ["GET", "POST"], "表情包图库"),
+        (f"/{plugin.plugin_name}/sticker/thumb", api_sticker_thumb, ["GET"], "表情包缩略图"),
     )
     for route, func, methods, desc in routes:
         try:
@@ -246,10 +262,25 @@ async def api_status(plugin):
 
 def _safe_usage(plugin) -> dict:
     try:
-        return plugin.usage.summary()
+        data = plugin.usage.summary()
     except Exception as e:  # noqa: BLE001 - 统计坏了面板也要能打开
         logger.warning(f"[群聊记忆] 读取消耗统计失败: {e}")
-        return {"today": {}, "days": [], "hours": [], "current_hour": 0, "search_used_by_session": {}}
+        data = {"today": {}, "days": [], "hours": [], "current_hour": 0, "search_used_by_session": {}}
+
+    # 累计（从装上到现在）和今日预算，概览页和消费页都要用。
+    # 分两个 try：任一块坏了不该把整个状态接口拖垮
+    try:
+        data["totals"] = plugin.usage.totals()
+    except Exception as e:  # noqa: BLE001
+        logger.debug(f"[群聊记忆] 读取累计消耗失败: {e}")
+        data["totals"] = {}
+    try:
+        budget = getattr(plugin, "budget", None)
+        data["budget"] = budget.snapshot() if budget is not None else {}
+    except Exception as e:  # noqa: BLE001
+        logger.debug(f"[群聊记忆] 读取预算状态失败: {e}")
+        data["budget"] = {}
+    return data
 
 
 def _search_summary(plugin) -> dict:
@@ -634,6 +665,24 @@ async def api_manage(plugin):
     session_id = str(body.get("session_id") or "")
 
     try:
+        if action == "budget_release":
+            budget = getattr(plugin, "budget", None)
+            if budget is None:
+                return jsonify({"success": False, "message": "预算模块没装配上"})
+            # 只到当天：不动机器人的任何配置，第二天额度刷新后自动回到正常拦截
+            if bool(body.get("on", True)):
+                day = budget.release_today()
+                return jsonify(
+                    {
+                        "success": True,
+                        "message": f"今天（{day}）已放开，明早自动恢复限制",
+                        "data": budget.snapshot(),
+                    }
+                )
+            budget.relock()
+            return jsonify(
+                {"success": True, "message": "已恢复限制", "data": budget.snapshot()}
+            )
         if action == "learn":
             return jsonify({"success": True, "data": await plugin.manager.learn_now(session_id)})
         if action == "add_trait":
@@ -1978,3 +2027,248 @@ async def api_export(plugin):
             },
         }
     )
+
+
+# ── 表情包 ──────────────────────────────────────────────────────────────
+
+
+def _make_thumb(path: Path, max_side: int = 200) -> bytes:
+    """把一张图压成缩略图。GIF 取第一帧，动图在网格里也不需要动。"""
+    if not _HAS_PIL:
+        return path.read_bytes()
+    try:
+        with PILImage.open(path) as im:  # type: ignore[union-attr]
+            try:
+                im.seek(0)
+            except (EOFError, AttributeError):
+                pass
+            frame = im.convert("RGB")
+            frame.thumbnail((max_side, max_side), PILImage.LANCZOS)  # type: ignore[union-attr]
+            buf = io.BytesIO()
+            frame.save(buf, "JPEG", quality=82, optimize=True)
+            return buf.getvalue()
+    except Exception as e:  # noqa: BLE001 - 坏图不该让整个面板 500
+        logger.debug(f"[群聊记忆] 缩略图生成失败 {path}: {e}")
+        return path.read_bytes()
+
+
+def _thumb_data_url(plugin, label: str, name: str) -> str | None:
+    """缩略图的 data URL，带磁盘缓存。
+
+    面板挂在 iframe 里，<img src> 带不上鉴权头，所以图片一律走这个接口
+    返回 base64，再由前端塞进 img.src。缓存按源图 mtime 判断失效。
+    """
+    store = getattr(plugin, "sticker", None)
+    if store is None:
+        return None
+    src = store.path_of(label, name)
+    if not src.is_file():
+        return None
+
+    cache = plugin.data_dir / "sticker_thumbs" / label / f"{Path(name).stem}.jpg"
+    try:
+        if cache.is_file() and cache.stat().st_mtime >= src.stat().st_mtime:
+            blob = cache.read_bytes()
+        else:
+            blob = _make_thumb(src)
+            cache.parent.mkdir(parents=True, exist_ok=True)
+            cache.write_bytes(blob)
+    except OSError:
+        blob = _make_thumb(src)
+
+    return "data:image/jpeg;base64," + base64.b64encode(blob).decode()
+
+
+async def api_sticker(plugin):
+    """图库列表 / 增删。GET 只给文件名和大小，缩略图单独拉，免得一次几 MB。"""
+    store = getattr(plugin, "sticker", None)
+    if store is None:
+        return jsonify({"success": False, "message": "表情包模块没装配上"})
+
+    if (request.method or "").upper() == "POST":
+        body = await request.get_json(silent=True) or {}
+        action = str(body.get("action") or "").strip()
+        label = str(body.get("label") or "").strip()
+
+        if action == "add":
+            name = str(body.get("filename") or "")
+            raw = str(body.get("data") or "")
+            if not raw:
+                return jsonify({"success": False, "message": "没有收到图片数据"})
+            if raw.startswith("data:") and "," in raw:
+                raw = raw.split(",", 1)[1]
+            try:
+                blob = base64.b64decode(raw)
+            except Exception:  # noqa: BLE001
+                return jsonify({"success": False, "message": "图片数据解不开"})
+            tags = body.get("tags") or []
+            ok, info = store.add_file(label, name, blob, tags)
+            if not ok:
+                return jsonify({"success": False, "message": info})
+            return jsonify(
+                {
+                    "success": True,
+                    "message": "已收进图库",
+                    "data": {"name": info, "total": store.total()},
+                }
+            )
+
+        if action == "add_category":
+            ok, info = store.add_category(
+                str(body.get("name") or ""),
+                str(body.get("desc") or ""),
+                body.get("keywords") or [],
+            )
+            return jsonify(
+                {
+                    "success": ok,
+                    "message": info if not ok else "已新建",
+                    "data": {"key": info if ok else "", "total": store.total()},
+                }
+            )
+
+        if action == "update_category":
+            ok, msg = store.update_category(
+                str(body.get("key") or ""),
+                name=body.get("name"),
+                desc=body.get("desc"),
+                keywords=body.get("keywords"),
+            )
+            return jsonify({"success": ok, "message": msg})
+
+        if action == "remove_category":
+            ok, msg = store.remove_category(str(body.get("key") or ""))
+            return jsonify({"success": ok, "message": msg})
+
+        if action == "set_enabled":
+            ok, msg = store.set_enabled(
+                label,
+                str(body.get("name") or "").strip(),
+                bool(body.get("on", True)),
+            )
+            return jsonify({"success": ok, "message": msg})
+
+        if action == "set_tags":
+            ok, msg = store.set_tags(
+                label,
+                str(body.get("name") or "").strip(),
+                body.get("tags") or [],
+            )
+            return jsonify({"success": ok, "message": msg})
+
+        if action == "auto_tag":
+            target = str(body.get("name") or "").strip()
+            apply = bool(body.get("apply", True))
+            ok, msg = await store.auto_tag(label, target, apply=apply)
+            if not ok:
+                return jsonify({"success": False, "message": msg})
+            if apply:
+                data = {"tags": store.meta_of(label, target)["tags"]}
+            else:
+                # 只识别不落库：msg 里是 {"tags": [...], "desc": "..."}
+                try:
+                    data = json.loads(msg)
+                except json.JSONDecodeError:
+                    data = {"tags": [], "desc": ""}
+            return jsonify({"success": True, "message": "识别完成", "data": data})
+
+        if action == "untagged":
+            rows = store.untagged(limit=int(body.get("limit") or 500))
+            return jsonify(
+                {
+                    "success": True,
+                    "data": {
+                        "items": [{"label": c, "name": n} for c, n in rows],
+                        "total": store.total(),
+                    },
+                }
+            )
+
+        if action == "move":
+            ok, msg = store.move_file(
+                label,
+                str(body.get("name") or "").strip(),
+                str(body.get("target") or "").strip(),
+            )
+            return jsonify({"success": ok, "message": msg, "data": {"total": store.total()}})
+
+        if action == "remove":
+            name = str(body.get("name") or "").strip()
+            ok, msg = store.remove(label, name)
+            return jsonify(
+                {"success": ok, "message": msg, "data": {"total": store.total()}}
+            )
+
+        return jsonify({"success": False, "message": "不认识的操作"})
+
+    # GET
+    idx = store.index()
+    snap = store.snapshot()
+    labels = []
+    for cat in snap["labels"]:
+        key = cat["key"]
+        items = []
+        for name in idx.get(key, []):
+            path = store.path_of(key, name)
+            try:
+                stat = path.stat()
+                size, mtime = stat.st_size, stat.st_mtime
+            except OSError:
+                size, mtime = 0, 0
+            row = store._meta_of(key, name)
+            # 入库时间：老图没有这个字段，用文件 mtime 兜底，
+            # 这样「按上传时间排序」在所有图上都成立，不用改历史数据
+            added = float(row.get("added_at") or mtime or 0)
+            items.append(
+                {
+                    "name": name,
+                    "size": size,
+                    "tags": store.meta_of(key, name)["tags"],
+                    "desc": row.get("desc", ""),
+                    "used": int(row.get("used") or 0),
+                    "added_at": added,
+                    "mtime": mtime,
+                    "last_used": float(row.get("last_used") or 0),
+                    "disabled": bool(row.get("disabled")),
+                }
+            )
+        labels.append({**cat, "items": items})
+    return jsonify(
+        {
+            "success": True,
+            "data": {
+                "labels": labels,
+                "enabled": snap["enabled"],
+                "total": snap["total"],
+                "today_total": snap["today_total"],
+                "today_by_label": snap["today_by_label"],
+                "keywords": snap["keywords"],
+                "rule_tokens": snap["rule_tokens"],
+                "max_categories": snap["max_categories"],
+                "note": snap["note"],
+                "has_pillow": _HAS_PIL,
+                # 档位条要用的两份数据：当前扁平配置 + 七档定义。
+                # 表情包页不依赖概览接口，单独进来也能渲染
+                "settings": plugin.settings.snapshot(),
+                "profiles": STICKER_PROFILES,
+            },
+        }
+    )
+
+
+async def api_sticker_thumb(plugin):
+    """一张缩略图。查询参数 c=分类目录名，n=文件名。"""
+    label = str(request.args.get("c") or "").strip()
+    name = str(request.args.get("n") or "").strip()
+    if not label or not name:
+        return jsonify({"success": False, "message": "缺少参数"})
+    store = getattr(plugin, "sticker", None)
+    if store is None or store.category_of(label) is None:
+        return jsonify({"success": False, "message": "没有这个分类"})
+    if os.path.basename(name) != name:
+        return jsonify({"success": False, "message": "文件名不合法"})
+
+    url = _thumb_data_url(plugin, label, name)
+    if not url:
+        return jsonify({"success": False, "message": "这张图已经没了"})
+    return jsonify({"success": True, "data": {"url": url}})

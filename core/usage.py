@@ -51,7 +51,8 @@ ALL_SOURCES = TOKEN_SOURCES + ("search",)
 DAY_FILE_FORMAT = "%Y-%m-%d"
 SAVE_DELAY = 30.0
 # 单次 snapshot 最多回看的天数，防止面板传个离谱的数字把磁盘扫一遍
-SNAPSHOT_MAX_DAYS = 60
+# 面板要能按周/月/年看，快照上限跟保留天数一起放到一年
+SNAPSHOT_MAX_DAYS = 400
 
 
 class TokenCounts(TypedDict):
@@ -369,11 +370,13 @@ class UsageTracker:
             return default
 
     def _keep_days(self) -> int:
+        # 默认留一年：以前是 7 天，结果「月/年花了多少」永远只有 7 天有数。
+        # 一天一个小 json，一年也就几百 KB
         try:
-            days = int(self._cfg("token_stats_keep_days", 7))
+            days = int(self._cfg("token_stats_keep_days", 400))
         except (TypeError, ValueError):
-            days = 7
-        return days if days >= 1 else 1
+            days = 400
+        return max(1, days)
 
     def peak_multiplier(self, at: datetime | None = None) -> float:
         """给定时刻的峰谷倍率。关闭峰谷计价或不在高峰时段时返回 1.0。"""
@@ -653,6 +656,56 @@ class UsageTracker:
             limit = 20
         return max(0, limit - self.search_used(session_id))
 
+    def today_cost(self) -> float:
+        """今天累计花了多少元。
+
+        给预算闸用：只读 cost 一个字段，不做 deepcopy——主链路一轮要问好几次，
+        按 ``today()`` 那份开销走没必要。
+        """
+        with self._lock:
+            self._ensure_day_locked()
+            return _as_float(self._data.get("cost"))
+
+    def totals(self) -> dict:
+        """从装上到现在一共多少（受保留天数限制）。
+
+        只把各天文件里已经存下的金额和次数加起来，不重算 token——
+        历史那几天的牌价可能和今天不一样，重算等于悄悄改旧账。
+
+        图片和画像这两类单独拆出来，是因为它们和「聊天花钱」不是一回事：
+        画像是一次性重写，打标是每张图一次，用户想知道自己在这两块上花了多少。
+        """
+        cost = 0.0
+        calls = 0
+        searches = 0
+        days = 0
+        by_source: dict[str, int] = {}
+        try:
+            files = sorted(self.dir.glob("*.json"))
+        except OSError:
+            files = []
+        for path in files:
+            try:
+                doc = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if not isinstance(doc, dict):
+                continue
+            days += 1
+            cost += _as_float(doc.get("cost"))
+            calls += _as_int(doc.get("calls"))
+            searches += _as_int(doc.get("search_calls"))
+            for name, bucket in (doc.get("by_source") or {}).items():
+                if isinstance(bucket, dict):
+                    by_source[name] = by_source.get(name, 0) + _as_int(bucket.get("calls"))
+        return {
+            "days": days,
+            "cost": round(cost, 4),
+            "calls": calls,
+            "searches": searches,
+            "by_source": by_source,
+        }
+
     def today(self) -> dict:
         """今日整份数据（面板展示用），返回副本，外部随便改。"""
         with self._lock:
@@ -786,7 +839,9 @@ class UsageTracker:
                 "calls": _as_int(doc.get("calls")),
             },
             "by_source": by_source,
-            "days": self.snapshot(),
+            # 一次给 90 天：面板的「近 7 天 / 近 30 天 / 近 90 天」都在本地聚合，
+            # 切换范围不用再往返。再长的一年数据靠 totals() 给汇总
+            "days": self.snapshot(90),
             "hours": self.hours(),
             "current_hour": now_beijing().hour,
             "search_used_by_session": used_by_session,

@@ -111,6 +111,40 @@ DEFAULTS: dict[str, Any] = {
     # 从事实里提炼「这个人是谁」，按好感档位给字数（陌生 120 → 老友 420，主人 800）。
     # 默认开：不待见档直接不生成，陌生人只有 60 字，成本可控；
     # 关掉等于回到「只有事实、没有画像」。
+    # ── 表情包斗图 ──────────────────────────────────────────────────────
+    # 扁平项而不是分组：面板的参数页只能热调扁平 key（set_runtime 走 runtime.json），
+    # 做成 bond/facts 那种 object 就只能去 AstrBot 配置页改，而图库在面板里。
+    "sticker_enabled": False,
+    # 「哈哈」群里一分钟能出现十次，100% 就是刷屏机器人
+    "sticker_probability": 25,
+    "sticker_follow_image": True,
+    "sticker_follow_probability": 15,
+    "sticker_cooldown_seconds": 120,
+    "sticker_daily_limit": 40,
+    # 情绪从哪来。off 不发；keyword 本地词表；analyze 回复后另调小模型；
+    # marker 让模型在回复末尾打标记、发送前剥掉
+    "sticker_mood_mode": "keyword",
+    # smart 模式的触发率（%）：marker 是「多少轮次告诉它可以发」，
+    # analyze 是「多少轮次真的去调模型」。两个都靠这个省钱的闸
+    "sticker_mood_rate": 30,
+    "sticker_chain": False,
+    "sticker_formation": False,
+    # 分析模式用的模型，留空跟随当前会话
+    "sticker_analyze_provider_id": "",
+    # 拿到回复后先按标签全库检索一遍。0 成本，命中就用那张，
+    # 比"模型选分类、桶内随机"准得多
+    "sticker_search_first": True,
+    # 检索的最低分。1.0 = 至少命中一个标签；调高只会更挑
+    "sticker_search_threshold": 1.5,
+    # 自动打标用的视觉模型。留空用 AstrBot 全局的「默认图片转述模型」
+    "sticker_tag_provider_id": "",
+    # ── 每日预算 ────────────────────────────────────────────────────
+    # 花超了就自动收摊：学习/主动回复/画像生成停，表情包退回关键词，搜索摘掉工具。
+    # 跨零点自动恢复，因为用量是按天分文件的
+    "daily_budget_enabled": False,
+    "daily_budget_yuan": 2.0,
+    # 联网搜索总闸。关着的时候连工具都不挂，模型根本不知道能搜
+    "web_search_enabled": False,
     "profile_enabled": True,
     # 至少攒够这么多条事实才写第一版画像。太少写出来是复述，没有提炼价值
     "profile_min_facts": 3,
@@ -207,7 +241,9 @@ DEFAULTS: dict[str, Any] = {
     "token_price_output": 4.5,
     "token_price_peak_multiplier": 2.0,
     "token_price_peak_enabled": True,
-    "token_stats_keep_days": 7,
+    # 面板要按周 / 月 / 年回看，留太短就只剩最近几天有数。
+    # 一天一个几 KB 的小文件，一年也就几百 KB（与 _conf_schema.json 保持一致）
+    "token_stats_keep_days": 400,
     # 求助/说正事的轮次收起玩梗和亲昵称呼。
     # 默认开——它只做减法，不会引入任何新行为，也不会多花 token。
     "serious_mode": True,
@@ -574,11 +610,136 @@ FACTS_PROFILES: list[dict[str, Any]] = [
 ]
 
 # 组 id → 预设列表。前端只认这一份，不在 JS 里写死数值
+
+# ── 表情包的七档预设（按效果递增）────────────────────────────────────
+#
+# 档位只是「一键套一组值」，套完之后每一项仍能在参数页单独热调——
+# 和主动回复那五档一样。所以这里写的是「一个典型用户在这个强度下
+# 想要的样子」，不是硬约束。
+#
+# 为什么按效果排而不是按成本排：成本都在一块钱以内，用户真正要选的是
+# 「bot 像不像群友」，不是「省几分钱」。第 4 档比第 5 档略贵，但它是
+# 唯一不碰回复格式的智能档，所以排在第 5 档前面（效果更弱）。
+STICKER_PROFILES: list[dict[str, Any]] = [
+    {
+        "id": "off",
+        "label": "⏸ 关闭",
+        "desc": "完全不发。图库照常管理，不产生任何请求",
+        "values": {
+            "sticker_enabled": False,
+            "sticker_mood_mode": "off",
+            "sticker_mood_rate": 0,
+            "sticker_probability": 0,
+            "sticker_follow_probability": 0,
+            "sticker_chain": False,
+            "sticker_formation": False,
+            "sticker_daily_limit": 0,
+        },
+    },
+    {
+        "id": "literal",
+        "label": "🔤 字面",
+        "desc": "只认关键词：哈哈哈、笑死、无语、破防。不花一分钱",
+        "values": {
+            "sticker_enabled": True,
+            "sticker_mood_mode": "keyword",
+            "sticker_mood_rate": 0,
+            "sticker_probability": 25,
+            "sticker_follow_probability": 15,
+            "sticker_chain": False,
+            "sticker_formation": False,
+            "sticker_cooldown_seconds": 120,
+            "sticker_daily_limit": 40,
+        },
+    },
+    {
+        "id": "follow",
+        "label": "👥 跟风",
+        "desc": "关键词 + 会跟队形、会连发。群友刷图时跟着刷一张",
+        "values": {
+            "sticker_enabled": True,
+            "sticker_mood_mode": "keyword",
+            "sticker_mood_rate": 0,
+            "sticker_probability": 30,
+            "sticker_follow_probability": 20,
+            "sticker_chain": True,
+            "sticker_formation": True,
+            "sticker_cooldown_seconds": 90,
+            "sticker_daily_limit": 60,
+        },
+    },
+    {
+        "id": "after",
+        "label": "🔍 事后",
+        "desc": "回复发完后另调小模型猜情绪。不改回复格式，每月约一毛",
+        "values": {
+            "sticker_enabled": True,
+            "sticker_mood_mode": "analyze",
+            "sticker_mood_rate": 15,
+            "sticker_probability": 100,
+            "sticker_follow_probability": 20,
+            "sticker_chain": True,
+            "sticker_formation": True,
+            "sticker_cooldown_seconds": 90,
+            "sticker_daily_limit": 60,
+        },
+    },
+    {
+        "id": "light",
+        "label": "💡 轻度",
+        "desc": "三成的轮次让模型自己判断该发什么。能读懂反讽和上下文",
+        "values": {
+            "sticker_enabled": True,
+            "sticker_mood_mode": "marker",
+            "sticker_mood_rate": 30,
+            "sticker_probability": 100,
+            "sticker_follow_probability": 20,
+            "sticker_chain": True,
+            "sticker_formation": True,
+            "sticker_cooldown_seconds": 90,
+            "sticker_daily_limit": 60,
+        },
+    },
+    {
+        "id": "steady",
+        "label": "⚖️ 标准",
+        "desc": "六成的轮次让模型判断，冷却缩到一分钟。像群里爱发表情的人",
+        "values": {
+            "sticker_enabled": True,
+            "sticker_mood_mode": "marker",
+            "sticker_mood_rate": 60,
+            "sticker_probability": 100,
+            "sticker_follow_probability": 25,
+            "sticker_chain": True,
+            "sticker_formation": True,
+            "sticker_cooldown_seconds": 60,
+            "sticker_daily_limit": 100,
+        },
+    },
+    {
+        "id": "full",
+        "label": "🔥 全开",
+        "desc": "每轮都让模型判断，队列里最活跃的那个。每月约四毛",
+        "values": {
+            "sticker_enabled": True,
+            "sticker_mood_mode": "marker",
+            "sticker_mood_rate": 100,
+            "sticker_probability": 100,
+            "sticker_follow_probability": 30,
+            "sticker_chain": True,
+            "sticker_formation": True,
+            "sticker_cooldown_seconds": 45,
+            "sticker_daily_limit": 150,
+        },
+    },
+]
+
 GROUP_PROFILES: dict[str, list[dict[str, Any]]] = {
     "active": ACTIVE_PROFILES,
     "learn": LEARN_PROFILES,
     "style": STYLE_PROFILES,
     "facts": FACTS_PROFILES,
+    "sticker": STICKER_PROFILES,
 }
 
 # 允许在面板热调、且会写进 runtime.json 的字段。
@@ -596,6 +757,24 @@ RUNTIME_KEYS = {
     "profile_daily_cap",
     # 喂食与刷屏检测
     "feed_enabled",
+    # 表情包斗图：6 项都能面板热调，改完下一轮生效
+    "sticker_enabled",
+    "sticker_probability",
+    "sticker_follow_image",
+    "sticker_follow_probability",
+    "sticker_cooldown_seconds",
+    "sticker_daily_limit",
+    "sticker_mood_mode",
+    "sticker_mood_rate",
+    "sticker_chain",
+    "sticker_formation",
+    "sticker_analyze_provider_id",
+    "sticker_search_first",
+    "sticker_search_threshold",
+    "sticker_tag_provider_id",
+    "daily_budget_enabled",
+    "daily_budget_yuan",
+    "web_search_enabled",
     "feed_gain_random",
     "feed_gain_order",
     "feed_daily_limit",

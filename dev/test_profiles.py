@@ -40,7 +40,8 @@ GROUP_PROFILES = settings.GROUP_PROFILES
 RUNTIME_KEYS = settings.RUNTIME_KEYS
 DEFAULTS = settings.DEFAULTS
 
-chk("四组都有预设", set(GROUP_PROFILES) == {"active", "learn", "style", "facts"})
+chk("五组都有预设", set(GROUP_PROFILES) == {"active", "learn", "style", "facts", "sticker"})
+chk("表情包是七档", len(GROUP_PROFILES["sticker"]) == 7)
 
 for group, profiles in GROUP_PROFILES.items():
     chk(f"{group} 至少三档", len(profiles) >= 3, f"{len(profiles)} 档")

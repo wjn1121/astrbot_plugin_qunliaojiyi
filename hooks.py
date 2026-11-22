@@ -11,11 +11,13 @@ AstrBot 靠类方法反射收集 handler，方法必须在 Star 子类上定义�
 
 from __future__ import annotations
 
+import asyncio
 import time
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
-from astrbot.api.message_components import Plain
+from astrbot.api.message_components import Image, Plain
+from astrbot.core.message.message_event_result import MessageChain
 
 from .core.admin import build_admin_tool
 from .core.feed import FEED_EXTRA_KEY, build_note, settle as settle_feed
@@ -508,6 +510,15 @@ def apply_search_tools(plugin, req, session_id: str, active: bool) -> bool:
     - plugin 模式配了 key 但没配上（key 空/不支持的服务商）时，**连同内置的一起摘掉**。
       留着的后果是模型绕过配额照搜，那每日上限就成了摆设。
     """
+    # 总闸先过：关着的时候连工具都不挂，模型看不到工具名就不会反复尝试
+    try:
+        if not plugin.settings.get("web_search_enabled"):
+            _remove_search_tools(req)
+            return False
+    except Exception:  # noqa: BLE001 - 老配置没有这一项，按关处理
+        _remove_search_tools(req)
+        return False
+
     mode = str(plugin.settings.get("web_search_mode") or "plugin").strip().lower()
 
     if active:
@@ -518,6 +529,13 @@ def apply_search_tools(plugin, req, session_id: str, active: bool) -> bool:
         return False
 
     if mode == "off":
+        _remove_search_tools(req)
+        return False
+
+    # 预算超支：搜索是单次最贵的动作（一次约 1200 token），
+    # 而且模型不知道钱的事，会搜得很自然。超支就直接把工具摘掉
+    budget = getattr(plugin, "budget", None)
+    if budget is not None and budget.exceeded():
         _remove_search_tools(req)
         return False
 
@@ -755,6 +773,11 @@ async def maybe_active_reply(plugin, event: AstrMessageEvent):
         return
     if not plugin.settings.get("active_reply_enabled"):
         return
+    # 预算超支就先不说话。主动插话是「凭空产生一次完整请求」，
+    # 而它本来就不是必需行为，停掉最不伤体验
+    budget = getattr(plugin, "budget", None)
+    if budget is not None and budget.exceeded():
+        return
 
     try:
         info = await plugin.active.maybe_active(event)
@@ -788,6 +811,254 @@ async def maybe_active_reply(plugin, event: AstrMessageEvent):
         )
     except Exception as e:  # noqa: BLE001
         logger.warning(f"[群聊记忆] 主动回复请求失败: {e}")
+
+
+async def maybe_send_sticker(plugin, event: AstrMessageEvent) -> bool:
+    """命中就发一张表情包，返回是否真的发出去了。
+
+    这里用 ``event.send`` 直接发，而不是 ``yield`` 结果：``on_all_message``
+    上还挂着主动回复和宿主的正常 LLM 回复，yield 一条消息有可能被框架
+    当成「这条消息已经处理完了」，把该说的话吞掉。直接 send 是旁路，
+    主流程一个字都不改。
+
+    全程不发请求、不进 prompt，判定是本地字符串命中加一次掷骰，
+    所以它和「学习」那条链路的成本完全无关。
+    """
+    store = getattr(plugin, "sticker", None)
+    if store is None or not store.enabled():
+        return False
+
+    try:
+        session_id = str(event.unified_msg_origin or "")
+    except Exception:  # noqa: BLE001
+        return False
+    if not session_id:
+        return False
+
+    sender_id = str(event.get_sender_id() or "")
+    if not session_allowed(plugin, session_id, sender_id):
+        return False
+
+    text = str(getattr(event, "message_str", "") or "")
+    try:
+        has_image = any(
+            type(comp).__name__ == "Image" for comp in (event.get_messages() or [])
+        )
+    except Exception:  # noqa: BLE001 - 读消息链失败就当没图，不拦正常聊天
+        has_image = False
+
+    # 队形优先：群友在刷图时跟着刷，比「该不该发表情」更直接。
+    # note_image 凑够阈值会自清，所以不会刷起来没完。
+    hit = None
+    if has_image and store.note_image(session_id):
+        hit = store.pick_formation(session_id)
+    if not hit:
+        hit = store.decide(session_id, text, has_image)
+    if not hit:
+        return False
+
+    if not await _emit_sticker(plugin, event, session_id, hit):
+        return False
+
+    # 连发：刚甩完一张，按概率再补一张同类的
+    label = hit[0]
+    extra = store.chain_follow(session_id, label)
+    if extra:
+        await _emit_sticker(plugin, event, session_id, extra)
+    return True
+
+
+async def _emit_sticker(plugin, event, session_id: str, hit: tuple[str, object]) -> bool:
+    """把一张图发出去并记账。失败返回 False，不改上层流程。"""
+    store = getattr(plugin, "sticker", None)
+    label, path = hit
+    try:
+        img = Image.fromFileSystem(str(path))
+    except Exception as e:  # noqa: BLE001
+        logger.debug(f"[群聊记忆] 表情包构造失败 {path}: {e}")
+        return False
+
+    try:
+        result = event.send(MessageChain([img]))
+        # send 在新旧版本里一个是同步一个是 async，两种都兜住
+        if asyncio.iscoroutine(result):
+            await result
+    except Exception as e:  # noqa: BLE001 - 发不出去就安静跳过
+        logger.warning(f"[群聊记忆] 表情包发送失败: {e}")
+        return False
+
+    if store is not None:
+        store.record(session_id, label, getattr(path, "name", ""))
+    cat = store.category_of(label) if store is not None else None
+    logger.info(
+        f"[群聊记忆] 表情包 · {session_id} · "
+        f"{(cat or {}).get('name', label)} · {getattr(path, 'name', path)}"
+    )
+    return True
+
+
+# ── 表情包：注入规则 / 剥标记 / 回复后配图 ──────────────────────────────
+#
+# marker 模式和 analyze 模式的发图时机都在「回复已发出」之后——
+# 真人也是先打字再甩表情，拼成一条反而不像。
+
+STICKER_RULE_EXTRA = "_qunliao_sticker_rule"
+STICKER_MOOD_EXTRA = "_qunliao_sticker_mood"
+STICKER_SENT_EXTRA = "_qunliao_sticker_sent"
+
+
+def inject_sticker_rule(plugin, event: AstrMessageEvent, req) -> None:
+    """marker 模式：这一轮告诉模型「你可以发表情」。
+
+    只在掷骰命中的轮次注入。没命中的轮次模型不知道有这回事，
+    自然不会想着加标记——比「告诉了再按概率丢掉」更省，也更像
+    「偶尔想发一条」而不是「每句都在盘算发什么图」。
+    """
+    store = getattr(plugin, "sticker", None)
+    if store is None:
+        return
+    try:
+        if not store.should_inject_rule():
+            return
+    except Exception as e:  # noqa: BLE001
+        logger.debug(f"[群聊记忆] 表情包注入判定失败: {e}")
+        return
+    try:
+        _append_temp(req, store.rule_text())
+        event.set_extra(STICKER_RULE_EXTRA, True)
+    except Exception as e:  # noqa: BLE001
+        logger.debug(f"[群聊记忆] 表情包规则注入失败: {e}")
+
+
+async def extract_sticker_mood(plugin, event: AstrMessageEvent, response) -> None:
+    """把回复里的情绪标记剥掉，标签存起来等发图用。
+
+    在 ``on_llm_response`` 就剥，而不是等到发送前——这样进 AstrBot
+    对话历史的也是干净文本，不会把 ``<emo:笑>`` 喂给下一轮，
+    也不会被学习链路收进风格库。
+    """
+    store = getattr(plugin, "sticker", None)
+    if store is None or not store.enabled():
+        return
+
+    try:
+        text = getattr(response, "completion_text", "") or ""
+    except Exception:  # noqa: BLE001
+        return
+    if not text or "emo" not in text.lower():
+        return
+
+    try:
+        cleaned, hits = store.strip_marks(text)
+    except Exception as e:  # noqa: BLE001
+        logger.debug(f"[群聊记忆] 表情标记解析失败: {e}")
+        return
+    if not hits:
+        return
+
+    try:
+        response.completion_text = cleaned
+    except Exception as e:  # noqa: BLE001 - 改写失败就放弃发图，别把标记漏出去
+        logger.warning(f"[群聊记忆] 改写回复文本失败，本轮不发图: {e}")
+        return
+    try:
+        event.set_extra(STICKER_MOOD_EXTRA, hits[0])
+    except Exception:  # noqa: BLE001
+        pass
+
+
+async def send_sticker_after_reply(plugin, event: AstrMessageEvent) -> None:
+    """回复发完后配一张表情包。
+
+    marker 模式用模型自己打的标记；analyze 模式现场问一次小模型。
+    两种都要过日限和冷却，并且同一条回复只发一次——分段回复会让
+    ``after_message_sent`` 触发多次，不去重的话一句话能配三张图。
+    """
+    store = getattr(plugin, "sticker", None)
+    if store is None or not store.enabled():
+        return
+    try:
+        if event.get_extra(STICKER_SENT_EXTRA):
+            return
+        session_id = str(event.unified_msg_origin or "")
+    except Exception:  # noqa: BLE001
+        return
+    if not session_id:
+        return
+
+    sender_id = str(event.get_sender_id() or "")
+    if not session_allowed(plugin, session_id, sender_id):
+        return
+
+    cfg = store.config()
+    mode = cfg.get("mode")
+
+    hit = None
+
+    # ① 全库标签检索：拿回复原文去撞每张图的标签。
+    # 这一步比「模型选分类、桶内随机」准得多，而且不花钱，
+    # 所以在分类之前先跑。日限和冷却照样要过。
+    if cfg.get("search_first") and store.gate_ok(session_id):
+        text = _reply_text(event)
+        if text:
+            try:
+                found = store.search(text)
+            except Exception as e:  # noqa: BLE001 - 检索坏了退回分类
+                logger.debug(f"[群聊记忆] 表情包标签检索失败: {e}")
+                found = None
+            if found:
+                hit = found
+
+    mood = ""
+    try:
+        mood = str(event.get_extra(STICKER_MOOD_EXTRA) or "")
+    except Exception:  # noqa: BLE001
+        mood = ""
+
+    if hit:
+        pass
+    elif mode == "marker" and mood:
+        hit = store.decide(session_id, mood=mood)
+    elif mode == "analyze":
+        try:
+            if not store.should_analyze():
+                return
+        except Exception:  # noqa: BLE001
+            return
+        text = _reply_text(event)
+        if not text:
+            return
+        try:
+            label = await store.analyze_mood(session_id, text)
+        except Exception as e:  # noqa: BLE001 - 分析坏了绝不影响回复
+            logger.debug(f"[群聊记忆] 表情包分析异常: {e}")
+            return
+        if not label:
+            return
+        hit = store.decide(session_id, mood=label)
+    else:
+        return
+
+    if not hit:
+        return
+    try:
+        event.set_extra(STICKER_SENT_EXTRA, True)
+    except Exception:  # noqa: BLE001
+        pass
+    await _emit_sticker(plugin, event, session_id, hit)
+
+
+def _reply_text(event: AstrMessageEvent) -> str:
+    """取本轮回复的正文，给分析模式用。"""
+    try:
+        result = event.get_result()
+        chain = getattr(result, "chain", None) if result is not None else None
+        if not chain:
+            return ""
+        parts = [getattr(c, "text", "") or "" for c in chain]
+        return " ".join(p for p in parts if p).strip()
+    except Exception:  # noqa: BLE001
+        return ""
 
 
 # ── 回复后：记账与截断 ──────────────────────────────────────────────────
