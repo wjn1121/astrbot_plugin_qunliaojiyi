@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import random
 import re
 import time
@@ -71,6 +72,14 @@ MIN_SELF_GAP = 25
 # 退避最多把冷却放大到 4 倍：再大就等于永久闭嘴，用户会以为功能失效。
 MAX_BACKOFF_FACTOR = 4
 RECENT_MAX = 20
+
+# 配额滴出时允许「比时间进度多跑」几小时。
+#
+# 日限是个整天的池子，早起一看群里热闹就一口气把 20 次说完，晚上回来
+# 只能干看着——这是「一天 20 次」最容易被抱怨的形态。所以把额度按
+# 可说话时段的时间进度慢慢解冻，再给两小时提前量：太严会把「上午活跃、
+# 下午没人」的群卡死，两小时刚好够它把上午那一波吃下来。
+PACE_LEAD_HOURS = 2.0
 
 # llm_judge 跑在消息链路上，超时宁可判 SKIP 也不能拖住正常回复
 JUDGE_TIMEOUT = 20.0
@@ -177,6 +186,7 @@ class ActiveReply:
             "enabled": False,
             "mode": mode,
             "today_count": 0,
+            "quota_now": self.paced_quota(daily_limit),
             "daily_limit": daily_limit,
             "next_roll_in": None,
             "no_reply_streak": 0,
@@ -208,6 +218,9 @@ class ActiveReply:
                 {
                     "enabled": self._session_enabled(session_id, state),
                     "today_count": int(state.get("today_count") or 0),
+                    # 此刻解冻到几次。日限是整天的池子，这个数是「现在最多能说到几」，
+                    # 面板上两个都给出来，用户才不会以为额度丢了
+                    "quota_now": self.paced_quota(daily_limit),
                     "next_roll_in": (
                         max(0, int(next_roll_at - now)) if next_roll_at > now else None
                     ),
@@ -303,9 +316,15 @@ class ActiveReply:
             return None
 
         # 10. 日限（today_count 已在 _load_state 里按自然日惰性重置）
+        #
+        # 不再直接比 daily_limit：额度按当天的时间进度解冻，
+        # 早上只放四分之一出去，免得一上午就把一天的额度用完。
+        # 面板上显示的「现在最多还能说到 N 次」就是 getattr(quota) 这个数。
         daily_limit = self._int_setting("active_reply_daily_limit")
-        if daily_limit > 0 and int(state.get("today_count") or 0) >= daily_limit:
-            return None
+        if daily_limit > 0:
+            quota = self.paced_quota(daily_limit)
+            if int(state.get("today_count") or 0) >= quota:
+                return None
 
         # 10.5 单人日限：别把整个群今天的额度都用在一个人身上。
         #
@@ -416,6 +435,68 @@ class ActiveReply:
         except Exception as e:  # noqa: BLE001 - 拿不到上下文不该阻止插话
             logger.debug(f"[群聊记忆] 获取会话上下文失败（忽略）: {e}")
             return None
+
+    # ── 日限：按时间滴出 ────────────────────────────────────────────────
+
+    def paced_quota(self, daily_limit: int, now: datetime | None = None) -> int:
+        """此刻允许的累计次数上限。
+
+        日限原本是「0 点一次性给满」，早上群里热闹，20 次可能在两小时内
+        说完，后面一整天都不吭声。这里按「可说话时段已过多少」解冻额度，
+        总数不变，只是摊开：9 点只放出四分之一，晚上才给满。
+
+        静默时段不计入分母——那段时间本来就不说话，算了等于凭空多给额度。
+        """
+        if daily_limit <= 0:
+            return 0
+        # 关掉「全天平均」就退回老行为：0 点一次性给满。
+        # 读不到这个键（老配置 / 测试桩）一律按开着处理——它是默认行为
+        try:
+            flag = self.settings.get("active_reply_pace_enabled")
+            if flag is not None and not bool(flag):
+                return daily_limit
+        except Exception:  # noqa: BLE001
+            pass
+        moment = now or datetime.now(BEIJING_TZ)
+        quiet = str(self.settings.get("active_reply_quiet_hours") or "")
+        span = parse_quiet_hours(quiet)
+
+        live_hours: list[int] = []
+        for hour in range(24):
+            if span is not None and in_quiet_hours(
+                quiet, moment.replace(hour=hour, minute=0)
+            ):
+                continue
+            live_hours.append(hour)
+
+        total = len(live_hours)
+        if total <= 0:  # 配成 24 小时全静默，交给静默闸去管，这里不拦
+            return daily_limit
+
+        passed = float(sum(1 for hour in live_hours if hour < moment.hour))
+        if moment.hour in live_hours:
+            # 当前这一小时按已过分钟折算，09:50 和 09:05 不该一样
+            passed += moment.minute / 60
+        ratio = min(1.0, (passed + PACE_LEAD_HOURS) / total)
+        return max(1, min(daily_limit, math.ceil(daily_limit * ratio)))
+
+    def note_extra_reply(self, session_id: str, sender_id: str = "") -> None:
+        """补记一次「bot 说了话」，给发图用。
+
+        表情包不走 ``_evaluate``，是另开一条路发出去的，但它确实占了一次
+        发言机会。不补记的话，主动回复的「今日已回」永远比实际少，
+        而日限又是按这个数算的，等于变相放宽了上限。
+        """
+        try:
+            state = self._load_state(session_id)
+            state["today_count"] = int(state.get("today_count") or 0) + 1
+            if sender_id:
+                bucket = dict(state.get("per_user") or {})
+                bucket[sender_id] = int(bucket.get(sender_id) or 0) + 1
+                state["per_user"] = bucket
+            self._save(session_id, state)
+        except Exception as e:  # noqa: BLE001 - 记账失败不影响发图本身
+            logger.debug(f"[群聊记忆] 补记主动回复次数失败: {e}")
 
     # ── rule 模式 ───────────────────────────────────────────────────────
 

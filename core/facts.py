@@ -1386,25 +1386,57 @@ class FactStore:
             return item
         return None
 
+    def _forget_rank(self, item: dict, now: float) -> tuple[float, int, int]:
+        """淘汰顺序：先看「有多快忘了」，再看重要性。
+
+        用户的原话是「达上限后新条目自动覆盖遗忘曲线最低的」——
+        所以这里的首要键是衰减后的新鲜度 ``keep_ratio``（T/2 剩 75%、
+        T 天归零），不是综合分。综合分里重要性占一半权重，会出现
+        「一条很久没人提的五分事」压住「昨天刚说的两分事」，
+        和「快忘了的先忘」正好相反。
+
+        次要键才是重要性和命中次数：新鲜度一样时，先丢不要紧的。
+        """
+        kind = str(item.get("kind") or KIND_FACT)
+        if kind in DECAY_EXEMPT_KINDS:
+            fresh = 1.0  # 边界类不衰减，等于永远轮不到它
+        else:
+            days = max(0.0, (now - _as_float(item.get("last_seen"), now)) / 86400.0)
+            fresh = self.keep_ratio(days)
+        return (fresh, _as_int(item.get("importance"), 3), _as_int(item.get("hits"), 0))
+
     def _trim(self, items: list[dict], limit: int) -> None:
-        """超出上限时淘汰低分条目：标 rejected 而不是删除，留档可恢复。"""
+        """超出上限时淘汰「最该忘」的条目：标 rejected 而不是删除，留档可恢复。
+
+        淘汰顺序见 :meth:`_forget_rank`：遗忘曲线最低的排最前，其次才看重要性。
+        **新条目一定能进来**——它刚被写进去，``last_seen`` 是当下，
+        遗忘曲线满格，永远排在待淘汰队列的最后。
+
+        以前的写法只取「超出的那几条」来淘汰，遇到钉住 / 核心 / 深层就跳过，
+        结果实际一条都没淘汰、总数一直超着上限。现在改成从最该忘的开始
+        往下扫，扫够该淘汰的条数为止。
+        """
         if limit <= 0:
             return
         alive = [i for i in items if i.get("status") != STATUS_REJECTED]
-        if len(alive) <= limit:
+        need = len(alive) - limit
+        if need <= 0:
             return
+
         now = time.time()
-        scored = sorted(alive, key=lambda i: self._score(i, "", now))
-        for item in scored[: len(alive) - limit]:
+        for item in sorted(alive, key=lambda i: self._forget_rank(i, now)):
+            if need <= 0:
+                break
             if item.get("pinned"):
                 continue  # 钉住的不淘汰
             # 核心 / 深层也不淘汰：超额时应该由 _refresh_tiers 先按名额和
             # 熟练度把它降档，再参与这里的排序——直接在这里砍会和「核心名额」
-            # 互相打架。实际淘汰的永远是浅层里最不熟的那几条
+            # 互相打架。实际淘汰的永远是浅层里最该忘的那几条
             if tier_of(item) in (TIER_CORE, TIER_DEEP):
                 continue
             item["status"] = STATUS_REJECTED
             item["rejected_at"] = now
+            need -= 1
 
     # ── 打分与注入 ──────────────────────────────────────────────────────
 

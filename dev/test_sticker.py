@@ -196,9 +196,70 @@ chk("日限到了不触发", capped.decide("qq:Group:2", "哈哈哈哈", False) 
 
 cool = make_store({"cooldown_seconds": 600})
 cool.add_file("laugh", "a.jpg", b"\xff\xd8x")
+# 先攒够回复数，否则比例闸（默认 30%）会先把这一张拦住
+for _ in range(10):
+    cool.note_reply()
 cool.record("qq:Group:1", "laugh")
 chk("同群冷却中", cool.decide("qq:Group:1", "哈哈哈哈", False) is None)
 chk("别的群不受影响", cool.decide("qq:Group:9", "哈哈哈哈", False) is not None)
+
+# 比例闸：图不能比话多。
+# ratio_ok 问的是「现在再发一张还合不合规」，所以分子分母都要 +1
+ratio = make_store({"reply_ratio": 30, "daily_limit": 100})
+ratio.add_file("laugh", "a.jpg", b"\xff\xd8x")
+chk("当天还没发过图，第一张放行", ratio.ratio_ok() is True)
+
+for _ in range(20):
+    ratio.note_reply()          # 20 条回复
+ratio.record("qq:Group:1", "laugh")   # 21 条回复 / 1 张图
+chk("21 句 1 张，再发一张也才 9%", ratio.ratio_ok() is True)
+
+for _ in range(6):
+    ratio.record("qq:Group:1", "laugh")   # 27 句 / 7 张 = 26%
+chk("7 张 27 句，再发一张 8/28=28%，放行", ratio.ratio_ok() is True)
+ratio.record("qq:Group:1", "laugh")       # 28 句 / 8 张 = 29%
+chk("8 张 28 句，再发一张 9/29=31%，拦住", ratio.ratio_ok() is False)
+
+r2 = make_store()
+before = r2.today_replies()
+r2.record("qq:Group:1", "laugh")
+chk("记一张图也算一条回复", r2.today_replies() == before + 1)
+
+zero = make_store({"reply_ratio": 0})
+chk("比例设 0 等于关掉这道闸", zero.ratio_ok() is True)
+
+# 升级当天：老账里已经发了 16 张、但没有回复数。
+# 不特殊处理的话分母是 0，比例闸会把当天剩下的时间一路锁到零点
+legacy = make_store({"reply_ratio": 30})
+legacy._stats = {  # noqa: SLF001 - 模拟升级前写下的文件
+    "date": sticker.today_str(),
+    "total": 16,
+    "by_label": {"laugh": 16},
+    "by_session": {},
+}
+chk("老账当天不锁死", legacy.ratio_ok() is True)
+chk("老账把已发张数补成回复数", legacy.today_replies() == 16, str(legacy.today_replies()))
+
+legacy.note_reply()
+chk("老账当天继续记账也不锁", legacy.ratio_ok() is True)
+
+# 日限按全天平均解冻
+from datetime import datetime  # noqa: E402
+
+paced = make_store({"daily_limit": 60, "pace_enabled": True})
+t8 = datetime(2026, 11, 23, 8, 0, tzinfo=sticker.BEIJING_TZ)
+t14 = datetime(2026, 11, 23, 14, 0, tzinfo=sticker.BEIJING_TZ)
+t23 = datetime(2026, 11, 23, 23, 30, tzinfo=sticker.BEIJING_TZ)
+chk("早上 8 点只放出四成", paced.paced_limit(t8) == 25, str(paced.paced_limit(t8)))
+chk("下午比早上多", paced.paced_limit(t14) > paced.paced_limit(t8))
+chk("深夜给满", paced.paced_limit(t23) == 60, str(paced.paced_limit(t23)))
+chk("任何时刻不超过日限", max(paced.paced_limit(t) for t in (t8, t14, t23)) <= 60)
+
+flat = make_store({"daily_limit": 60, "pace_enabled": False})
+chk("关掉全天平均就一次性给满", flat.paced_limit(t8) == 60)
+
+nodaily = make_store({"daily_limit": 0})
+chk("日限 0 就是 0", nodaily.paced_limit(t8) == 0)
 
 form = make_store({"formation": True})
 form.add_file("laugh", "a.jpg", b"\xff\xd8x")

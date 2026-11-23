@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>群聊记忆</title>
-  <link rel="stylesheet" href="./style.css" />
+  <link rel="stylesheet" href="./style.css?v=20261123" />
 </head>
 <body>
   <div class="shell">
@@ -156,7 +156,7 @@
           <div id="usageTop" class="usage-top"></div>
           <div id="usageSource" class="usage-breakdown"></div>
           <div id="usageTokens" class="grid"></div>
-          <p class="hint usage-note">金额按 DeepSeek 牌价估算，节假日会略微高估；全机消耗是下限值（多轮工具调用中间请求会漏计）。「被叫回复」是从这一版起才分开记的，更早的消耗都算在「其他回复」里。</p>
+          <p class="hint usage-note">金额按 DeepSeek 牌价估算，节假日会略微高估。只统计<b>本插件发起</b>的请求——同一个 key 还被别的插件或正常聊天用着的话，官方账单会比这个大；多轮工具调用的中间请求只记最终那一轮，所以这里是个下限。「被叫回复」是从 1.7.0 起才分开记的，更早的消耗都在「其他回复」里。</p>
         </section>
 
         <section class="card">
@@ -785,6 +785,6 @@
   <div id="toast" class="toast" hidden></div>
 
   <script src="/api/plugin/page/bridge-sdk.js"></script>
-  <script src="./app.js"></script>
+  <script src="./app.js?v=20261123"></script>
 </body>
 </html>

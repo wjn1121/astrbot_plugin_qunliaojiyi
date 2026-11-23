@@ -36,7 +36,12 @@ from astrbot.api import logger
 BEIJING_TZ = timezone(timedelta(hours=8))
 
 # 高峰时段（北京时间，周一至周五）：09:00-12:00、14:00-18:00
-PEAK_RANGES = ((9, 12), (14, 18))
+# 区间定义放在 utils 里，调度器和账单共用一份，避免两处漂移。
+# 单独加载本模块的测试脚本没有父包，退回本地同值定义
+try:
+    from ..utils import PEAK_RANGES
+except ImportError:  # pragma: no cover - 仅离线单测会走到
+    PEAK_RANGES = ((9, 12), (14, 18))
 
 # 会产生 token 的来源；search 只计次数不计 token（搜索本身由服务商计费）
 #
@@ -44,8 +49,10 @@ PEAK_RANGES = ((9, 12), (14, 18))
 # - reply：有人 @bot、回复 bot、或者私聊，属于「点名要你说」
 # - active：插件自己插话，凭空产生，是唯一可以整块关掉的
 # - bot：其余回调（例如群里配置成全量回复），历史上也落在这里
-# - learn / profile / judge：插件自己的后台请求，和聊天无关
-TOKEN_SOURCES = ("learn", "profile", "judge", "bot", "reply", "active")
+# - learn / profile / judge / sticker：插件自己的后台请求，和聊天无关。
+#   sticker 是「给这条回复配哪张图」那次判断，analyze 模式下每轮一次；
+#   它以前不在这个元组里，被兜底归进了 bot，面板上看着像「其他回复」的花费
+TOKEN_SOURCES = ("learn", "profile", "judge", "bot", "reply", "active", "sticker")
 ALL_SOURCES = TOKEN_SOURCES + ("search",)
 
 DAY_FILE_FORMAT = "%Y-%m-%d"
@@ -64,9 +71,16 @@ class TokenCounts(TypedDict):
 
 
 class SourceCounts(TypedDict, total=False):
-    """按来源的计数。search 只有 calls，其余三项是 token。"""
+    """按来源的计数。search 只有 calls，其余是 token 三段加一笔金额。
+
+    ``cost`` 是逐笔累加的真实金额，和 ``DayDoc.cost`` 同一口径；
+    面板拿它分块显示，各块加起来必须等于全天总额。早先这里只有 token、
+    金额是按「当前时刻倍率」现算的，一到高峰时段就和总额对不上
+    （高峰那几笔按 2 倍记账，面板却按平价重算），差得还挺明显。
+    """
 
     calls: int
+    cost: float
     input_other: int
     input_cached: int
     output: int
@@ -128,7 +142,7 @@ def _empty_tokens() -> TokenCounts:
 
 
 def _empty_source(name: str) -> SourceCounts:
-    bucket: SourceCounts = {"calls": 0}
+    bucket: SourceCounts = {"calls": 0, "cost": 0.0}
     if name != "search":
         bucket.update(_empty_tokens())  # type: ignore[typeddict-item]
     return bucket
@@ -432,6 +446,9 @@ class UsageTracker:
                     continue
                 bucket = _empty_source(name)
                 bucket["calls"] = _as_int(counts.get("calls"))
+                # 老文件没有 cost，这里读不到就留 0；summary() 会按 token 把
+                # 当天总额分摊下来，保证面板各块加起来仍然等于总额
+                bucket["cost"] = round(_as_float(counts.get("cost")), 6)
                 if name != "search":
                     for field in ("input_other", "input_cached", "output"):
                         bucket[field] = _as_int(counts.get(field))  # type: ignore[literal-required]
@@ -566,6 +583,9 @@ class UsageTracker:
                     bucket = _empty_source(name)
                     data["by_source"][name] = bucket
                 bucket["calls"] = int(bucket.get("calls") or 0) + 1
+                # 金额按笔累加，和 data["cost"] 同一口径：面板分块显示时
+                # 各块加起来必须等于总额，不能再拿当前倍率重算
+                bucket["cost"] = round(float(bucket.get("cost") or 0.0) + cost, 6)
                 if name != "search":
                     bucket["input_other"] = int(bucket.get("input_other") or 0) + input_other
                     bucket["input_cached"] = int(bucket.get("input_cached") or 0) + input_cached
@@ -711,7 +731,9 @@ class UsageTracker:
         with self._lock:
             self._ensure_day_locked()
             doc = copy.deepcopy(dict(self._data))
-        doc["cost"] = round(_as_float(doc.get("cost")), 4)
+        # 六位小数：面板按来源拆开的金额也保留六位，两边加起来才严格相等
+        # （四位的话，几个来源各自舍一次，加起来会和总额差几厘）
+        doc["cost"] = round(_as_float(doc.get("cost")), 6)
         return doc
 
     def snapshot(self, days: int = 7) -> list[dict]:
@@ -803,11 +825,21 @@ class UsageTracker:
             sid: _as_int(counts.get("search_calls"))
             for sid, counts in (doc.get("by_session") or {}).items()
         }
-        # 按来源拆一份，面板上「今日被叫回复」和「主动插话」各自花了多少就靠它。
-        # 日文件里每个来源只存 token 不存金额（金额是全天累加的一个数），所以
-        # 这里按此刻牌价折算——同一天内不会有偏差，跨到高峰边界会有几厘误差。
-        multiplier = self.peak_multiplier()
+        # 按来源拆一份，面板上「被叫回复」和「主动插话」各自花了多少就靠它。
+        #
+        # 金额直接用日文件里逐笔累加的 cost —— 和顶部「今日金额」是一个口径，
+        # 各块加起来必然等于总额。早先是拿当天全部 token × 当前时刻倍率重算，
+        # 一跨过高峰边界就对不上（高峰那几笔按 2 倍进了总账，这里按平价重算），
+        # 用户看到的是「回复 0.49 + 后台 0.56，顶部却是 1.80」。
+        #
+        # 老日文件没有这个字段，用 token 折算出的平价金额当权重，
+        # 把「总额 − 已知来源之和」这块差额按权重摊下去，仍然对得上总额。
+        total_cost = round(_as_float(doc.get("cost")), 6)
         by_source: dict[str, dict] = {}
+        weights: dict[str, float] = {}
+        known = 0.0
+        missing: list[str] = []
+
         for name, counts in (doc.get("by_source") or {}).items():
             calls = _as_int(counts.get("calls"))
             if name == "search":
@@ -818,22 +850,31 @@ class UsageTracker:
                 "input_cached": _as_int(counts.get("input_cached")),
                 "output": _as_int(counts.get("output")),
             }
-            by_source[name] = {
-                "calls": calls,
-                "cost": round(
-                    self._tokens_cost(
-                        tokens["input_other"],
-                        tokens["input_cached"],
-                        tokens["output"],
-                        multiplier,
-                    ),
-                    6,
-                ),
-                "tokens": tokens,
-            }
+            cost = round(_as_float(counts.get("cost")), 6)
+            weights[name] = self._tokens_cost(
+                tokens["input_other"], tokens["input_cached"], tokens["output"], 1.0
+            )
+            if cost > 0:
+                known += cost
+            elif calls > 0:
+                missing.append(name)
+            by_source[name] = {"calls": calls, "cost": cost, "tokens": tokens}
+
+        gap = total_cost - known
+        if missing and gap > 0:
+            weight_sum = sum(weights.get(name, 0.0) for name in missing)
+            if weight_sum <= 0:  # 全是 0 token 的调用，按次数平摊
+                share = gap / len(missing)
+                for name in missing:
+                    by_source[name]["cost"] = round(share, 6)
+            else:
+                for name in missing:
+                    by_source[name]["cost"] = round(
+                        gap * weights.get(name, 0.0) / weight_sum, 6
+                    )
         return {
             "today": {
-                "cost": round(_as_float(doc.get("cost")), 4),
+                "cost": round(_as_float(doc.get("cost")), 6),
                 "tokens": dict(doc.get("tokens") or _empty_tokens()),
                 "search_calls": _as_int(doc.get("search_calls")),
                 "calls": _as_int(doc.get("calls")),

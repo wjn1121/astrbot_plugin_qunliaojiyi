@@ -73,6 +73,41 @@ chk("输出单独记", reply_tokens.get("output") == 100, str(reply_tokens))
 chk("金额算得出来", float(by_source.get("reply", {}).get("cost") or 0) > 0)
 chk("总调用数对得上", data["today"]["calls"] == 5, str(data["today"]["calls"]))
 
+# 各来源金额加起来必须等于顶部总额。以前这里是拿当天 token
+# 乘「当前时刻倍率」现算的，高峰时段那几笔按 2 倍进总账，
+# 面板却按平价重算，用户就会看到「0.49 + 0.56，顶部却是 1.80」
+parts = sum(float(b.get("cost") or 0) for b in by_source.values())
+total = float(data["today"]["cost"])
+chk("分来源金额之和 == 总额", abs(parts - total) < 1e-6, f"{parts:.6f} vs {total:.6f}")
+
+# 高峰时段混着记：一半按 2 倍、一半平价，仍然要对得上。
+# 直接伪造一份日文件，模拟「上午高峰 + 下午空闲」的真实账
+peak_settings = {"token_price_peak_enabled": True, "token_price_peak_multiplier": 2.0}
+old_doc = {
+    "date": usage_mod.today_key(),
+    "calls": 2,
+    "cost": 1.0,
+    "tokens": {"input_other": 100000, "input_cached": 0, "output": 0},
+    "by_source": {
+        # 老文件：有 token 没 cost，得按权重把 1.0 分摊下去
+        "learn": {"calls": 1, "input_other": 70000, "input_cached": 0, "output": 0},
+        "bot": {"calls": 1, "input_other": 30000, "input_cached": 0, "output": 0},
+    },
+}
+tmp2 = Path(tempfile.mkdtemp(prefix="qunliao_usage2_"))
+(tmp2 / "token").mkdir(parents=True, exist_ok=True)
+(tmp2 / "token" / f"{usage_mod.today_key()}.json").write_text(
+    __import__("json").dumps(old_doc), encoding="utf-8"
+)
+t2 = UsageTracker(tmp2, peak_settings)
+d2 = t2.summary()
+b2 = d2.get("by_source") or {}
+parts2 = sum(float(b.get("cost") or 0) for b in b2.values())
+chk("老账也没有差额", abs(parts2 - float(d2["today"]["cost"])) < 1e-6,
+    f"{parts2:.6f} vs {d2['today']['cost']}")
+chk("老账按 token 权重分摊", abs(float(b2["learn"]["cost"]) - 0.7) < 1e-3,
+    str(b2["learn"]["cost"]))
+
 # 老日文件里只有 learn/bot/search，读进来要能补齐新键而不是丢掉当天数据
 old = {
     "date": "2026-01-01",

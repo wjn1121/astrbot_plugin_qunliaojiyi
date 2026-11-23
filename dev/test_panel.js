@@ -83,7 +83,7 @@ const f = new Function(
     " setLastStatus: (v) => { lastStatus = v; }," +
     " sumUsageDays, usageSummaryOf, renderTotals," +
     " setUsageRange: (v) => { usageRange = v; }," +
-    " renderStickerGrid, stickerAllItems};",
+    " renderStickerGrid, renderSticker, stickerAllItems};",
 );
 
 let api;
@@ -321,6 +321,9 @@ chk("开着的群标「开着」", activeHtml.includes("arow-tag on"));
 chk("默认按今日降序", activeHtml.indexOf("群 333") < activeHtml.indexOf("群 111"));
 chk("统计里有总开关和群数", activeStatsHtml.includes("总开关") && activeStatsHtml.includes("2 / 3"));
 chk("统计里有每人每日上限", activeStatsHtml.includes("6 次"));
+chk("统计里有此刻放出", activeStatsHtml.includes("此刻放出"));
+chk("列表里放出额度小于日限时写出来",
+  activeHtml.includes("此刻放出") || activeHtml.includes("今日 3/8"));
 
 // 搜索过滤：走的是列头同一份 state
 api.ACTIVE_GF.state.text.who = "111";
@@ -821,6 +824,36 @@ chk("30 天柱子一根不少", (thirtyHtml.match(/class="bar-col"/g) || []).len
 
 
 document.getElementById = origGetById2;
+
+// ── 表情包统计条：发图占回复的比例 ──
+document.getElementById = (id) => {
+  if (!boxes[id]) boxes[id] = mkBox();
+  return boxes[id];
+};
+
+api.setSticker({
+  labels: [{ key: "laugh", name: "笑", count: 1, items: [] }],
+  total: 1,
+  today_total: 16,
+  today_replies: 53,
+  reply_ratio: 30,
+});
+api.renderSticker();
+const statsHtml = boxes.stickerStats ? boxes.stickerStats.innerHTML : "";
+chk("统计条有占回复比", statsHtml.includes("占回复比"), statsHtml.slice(0, 60));
+chk("占比按 16/53 算成 30%", statsHtml.includes("30%"), statsHtml.slice(0, 160));
+
+api.setSticker({
+  labels: [{ key: "laugh", name: "笑", count: 1, items: [] }],
+  total: 1,
+  today_total: 2,
+  today_replies: 0,
+  reply_ratio: 0,
+});
+api.renderSticker();
+const statsHtml2 = boxes.stickerStats ? boxes.stickerStats.innerHTML : "";
+chk("还没回复时占比显示破折号", statsHtml2.includes("—"), statsHtml2.slice(0, 160));
+chk("比例关掉时说清楚", statsHtml2.includes("比例闸已关"), statsHtml2.slice(0, 200));
 
 console.log("\n" + (ok ? "全部通过" : "有失败项"));
 process.exit(ok ? 0 : 1);

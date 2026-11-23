@@ -1400,6 +1400,7 @@ const USAGE_SOURCE_META = {
   learn: ["📚 学习风格", "定时提炼群聊风格的后台请求"],
   profile: ["🪞 人物画像", "给某个人重写「他是谁」的那次请求"],
   judge: ["🔎 插话判定", "让模型判断这轮该不该插话"],
+  sticker: ["🎨 配图判断", "回复发完后判断配哪张表情包的那次请求"],
 };
 
 const USAGE_BLOCKS = [
@@ -1413,7 +1414,7 @@ const USAGE_BLOCKS = [
     key: "back",
     title: "🧠 后台",
     hint: "插件自己发起的请求，跟聊天无关，可以整块关掉",
-    sources: ["learn", "profile", "judge"],
+    sources: ["learn", "profile", "judge", "sticker"],
   },
 ];
 
@@ -1719,7 +1720,20 @@ const SETTING_GROUPS = [
     items: [
       { key: "enabled", label: "启用群聊记忆", type: "bool", default: true, hint: "总开关。关掉后不收集、不学习、不注入，完全静默。影响：token 0。" },
       { key: "inject_enabled", label: "启用风格注入", type: "bool", default: true, hint: "关闭后不再注入风格，字数上限也一起失效（两者在同一个钩子里）。学习照常、仍有消耗。影响：token ↓↓（关掉后每条回复少几十到一百多字，这是最大的单项开销）。" },
-      { key: "analysis_interval_seconds", label: "学习间隔（秒）", type: "int", min: 60, max: 604800, step: 60, default: 21600, hint: "默认 21600（6 小时）≈ 一天最多 4 次，这是「几乎零消耗」的核心。影响：token ↑↑（调小等于按倍数变贵）。" },
+      { key: "history_trim_enabled", label: "单次请求只带最近的会话历史", type: "bool", default: false, hint: "默认关。打开后能省掉「缓存过期后整段重付」的钱（未命中价是命中价的 30 倍），代价是模型看不到更早的原话——记忆变短了。只裁这一次请求，不动存储里的历史，翻聊天记录还是完整的。想省钱再开。" },
+      { key: "history_trim_messages", label: "带多少条历史", type: "int", min: 0, max: 200, step: 5, default: 30, hint: "约 15 轮对话。接话看最近几句就够，更早的事由学习库、事实和画像补。设 0 等于不裁。影响：token ↑（调大）。" },
+      { key: "analysis_interval_seconds", label: "兜底学习间隔（秒）", type: "int", min: 60, max: 604800, step: 60, default: 21600, hint: "攒不够增量时，多久强制学一次。默认 21600（6 小时）：安静的群一天学四次，也能跟上它的变化。影响：token ↑↑（调小等于按倍数变贵）。" },
+      { key: "learn_increment_messages", label: "攒够多少条新消息学一次", type: "int", min: 5, max: 500, step: 5, default: 60, hint: "增量学习的真正触发线。30 → 60 后请求数大约减到三分之一，学到的东西几乎一样——「群怎么说话」是慢变量。影响：token ↓↓（调大）。" },
+      { key: "learn_min_interval", label: "两次学习的最小间隔（秒）", type: "int", min: 60, max: 86400, step: 300, default: 3600, hint: "群里再热闹也隔这么久才学第二次，防刷屏。默认 3600（1 小时）。影响：token ↓（调大）。" },
+      { key: "learn_candidate_max", label: "单次最多提炼几条", type: "int", min: 1, max: 30, step: 1, default: 8, hint: "每轮让模型最多吐几条候选。特征是累积的，这次没学到的下次还会遇到，没必要一次要满。影响：token ↓（调小，输出价是输入的 3 倍）。" },
+      {
+        key: "learn_time_mode", label: "什么时候学", type: "select", default: "off_peak",
+        options: [
+          ["off_peak", "低谷时间统一学（省一半）"],
+          ["anytime", "随时学（学得快、贵一倍）"],
+        ],
+        hint: "off_peak 只在非高峰学：工作日 9-12、14-18 是 DeepSeek 的 2 倍价，推迟两小时学到的东西一模一样，消息都先攒着不会丢。anytime 攒够就学，梗学得更快，白天费用翻倍。影响：默认那项 token ↓↓。",
+      },
       { key: "min_history_for_analysis", label: "触发学习的最少消息数", type: "int", min: 1, max: 1000, step: 1, default: 30, hint: "攒够这么多条新消息才送去提炼，不够直接跳过不发请求。默认 30：10 条太容易学到「嗯」「哈」这类噪音。影响：token ↓（调大）。" },
       { key: "max_messages_per_learn", label: "单次提炼最多消息数", type: "int", min: 1, max: 500, step: 10, default: 80, hint: "单次最多带多少条消息进 prompt。影响：token ↑↑（学一次的钱几乎全在这里）。" },
       { key: "max_stable_inject", label: "最多注入学习风格", type: "int", min: 0, max: 20, step: 1, default: 5, hint: "每轮按熟练度取前 N 条学习风格注入。影响：token ↑↑（每加一条就多一段文本，且每轮都带）。" },
@@ -1856,7 +1870,8 @@ const SETTING_GROUPS = [
         hint: "仅 probability 模式。0.15 ≈ 一天约 7 次，正好落在日限 8 以内。骰子按窗口掷，不按消息——否则群越热闹越容易被插话。影响：token ↑↑（每次插话都是一次完整请求）。",
       },
       { key: "active_reply_cooldown_seconds", label: "冷却时间（秒）", type: "int", min: 60, max: 86400, step: 60, default: 1800, hint: "两次评估至少隔多久，默认 1800 ≈ 一天 48 个窗口。影响：token ↓（调大）。" },
-      { key: "active_reply_daily_limit", label: "每日上限（每群）", type: "int", min: 0, max: 100, step: 1, default: 8, hint: "每群每天最多主动说几次，自然日重置，**这是最硬的一道闸门**——概率写得再高也超不过它。每次约 1500 token：8 次 ≈ 1.2 万、40 次 ≈ 6 万、70 次 ≈ 10 万 token/天。30 以上要留意平台风控和被嫌吵。影响：token ↑↑（每多一次就是一次完整请求）。" },
+      { key: "active_reply_pace_enabled", label: "日限按全天平均解冻", type: "bool", default: true, hint: "配 20 次时上午只放出十来个，随可说话时段的时间进度解冻，晚上才给满，免得一群人多的上午就把额度说完、晚上干看着。关掉就回到「0 点一次性给满」。影响：token 0（总数不变，只是摊开）。" },
+      { key: "active_reply_daily_limit", label: "每日上限（每群）", type: "int", min: 0, max: 100, step: 1, default: 8, hint: "每群每天最多主动说几次，自然日重置，这是最硬的一道闸门——概率写得再高也超不过它。额度按当天可说话时段的时间进度解冻：配 20 次，上午只放出十来个，晚上才给满，免得一上午说完、晚上干看着。每次约 1500 token：8 次 ≈ 1.2 万、40 次 ≈ 6 万、70 次 ≈ 10 万 token/天。影响：token ↑↑（每多一次就是一次完整请求）。" },
       { key: "active_reply_per_user_limit", label: "单人每日上限", type: "int", min: 0, max: 100, step: 1, default: 6, hint: "同一个人一天最多被主动搭话几次。群日限管「这个群今天还能说几次」，这个管「别把额度全花在一个人身上」。默认 6 次；0 = 不限。影响：token ↓（跳过的那次不发请求）。" },
       { key: "active_reply_quiet_hours", label: "静默时段", type: "text", default: "01:00-08:00", hint: "格式 01:00-08:00，支持跨天（如 22:00-06:00）。这段时间零消耗。留空 = 不静默。影响：token ↓（静默时段完全不发请求）。" },
       { key: "active_reply_min_messages", label: "冷清阈值", type: "int", min: 0, max: 100, step: 1, default: 3, hint: "最近 10 分钟少于这么多条就不插话，避免对着空气说话。0 = 关闭检测。影响：token ↓。" },
@@ -1882,7 +1897,7 @@ const SETTING_GROUPS = [
     // 参数和档位、图库放在同一页：调完立刻能看图
     pane: "sticker",
     title: "🤣 表情包",
-    sub: "命中关键词或群友发图时甩一张。本地判定，不发请求，token 0",
+    sub: "该接梗的时候甩一张。本地判定，不发请求，token 0",
     items: [
       {
         key: "sticker_mood_mode", label: "情绪从哪来", type: "select", default: "keyword",
@@ -1905,8 +1920,8 @@ const SETTING_GROUPS = [
         hint: "「哈哈」这种词群里一分钟能出现十次，每句都甩图就成了刷屏机器人。25 大致是偶尔接得住梗。marker / analyze 模式下模型已经判断过一次，这里可以放到 100。影响：token 0。",
       },
       {
-        key: "sticker_follow_image", label: "群友发图时跟着发一张", type: "bool", default: true,
-        hint: "斗图的本体。不判断对方发的是什么图——那要视觉模型，每张都要钱，而斗图本来也不需要对上意思。影响：token 0。",
+        key: "sticker_follow_image", label: "群友发图时跟着发一张", type: "bool", default: false,
+        hint: "别人发图就甩一张，属于斗图行为，默认关。想要「它在接梗」那种感觉，交给上面的情绪模式更自然。影响：token 0。",
       },
       {
         key: "sticker_follow_probability", label: "跟图 / 连发的概率", type: "slider",
@@ -1915,11 +1930,11 @@ const SETTING_GROUPS = [
       },
       {
         key: "sticker_chain", label: "连发：发完一张再补一张", type: "bool", default: false,
-        hint: "刚甩完一张图，按上面的概率再补一张同类的。纯本地，0 成本。影响：token 0。",
+        hint: "刚甩完一张图，按上面的概率再补一张同类的。斗图打法，七个档位都不预设开启，想玩再手动打开。影响：token 0。",
       },
       {
         key: "sticker_formation", label: "队形：群友刷图时跟着刷", type: "bool", default: false,
-        hint: "30 秒内群里有 3 张图，跟着甩一张。这是「大家都在发我也发」的从众，不判断该不该发。纯本地，0 成本。影响：token 0。",
+        hint: "30 秒内群里有 3 张图，跟着甩一张，不判断该不该发。斗图打法，七个档位都不预设开启。影响：token 0。",
       },
       {
         key: "sticker_cooldown_seconds", label: "同群两次发图的最小间隔", type: "int",
@@ -1930,6 +1945,15 @@ const SETTING_GROUPS = [
         key: "sticker_daily_limit", label: "每天最多发几张", type: "int",
         min: 0, max: 500, step: 5, default: 40,
         hint: "所有群合计，最硬的那道闸——概率写得再高也超不过它。0 = 当天不发。影响：token 0。",
+      },
+      {
+        key: "sticker_reply_ratio", label: "发图最多占当天回复的百分比", type: "int",
+        min: 0, max: 100, step: 5, default: 30,
+        hint: "张数之外的密度限制：一天发的图不超过当天回复总数的这个比例。安静群一天才回 20 句，40 张图等于把聊天框刷成表情包展览。30% 接近真人发图的密度。0 = 关掉这道闸。影响：token 0。",
+      },
+      {
+        key: "sticker_pace_enabled", label: "发图额度按全天平均解冻", type: "bool", default: true,
+        hint: "配 60 张时不是 0 点一次性给满，而是随一天的时间进度慢慢放出，晚上才给完。关掉就回到「一次性给满」，容易在群里刷图的那一小时集中发完。影响：token 0。",
       },
       {
         key: "sticker_analyze_provider_id", label: "分析模式用的模型 ID", type: "text", default: "",
@@ -2271,6 +2295,11 @@ function renderActiveStats() {
     ["今日主动发言", `${total} 次`, "所有群加起来，今天 bot 自己插了几次话"],
     ["今天说过话的群", `${spoke} 个`, "今天至少插过一次话的群数"],
     ["每群每日上限", limit > 0 ? `${limit} 次` : "不限", "单个群每天最多主动说几次，自然日重置。这是最硬的一道闸门"],
+    [
+      "此刻放出",
+      limit > 0 ? `${items.length ? (items[0].quota ?? limit) : limit} 次` : "不限",
+      "额度按当天的时间进度解冻，不是 0 点一次性给满——免得上午就说完，晚上干看着",
+    ],
     [
       "每人每日上限",
       activePerUserLimit > 0 ? `${activePerUserLimit} 次` : "不限",
@@ -2817,7 +2846,14 @@ function sessionCard(s) {
   const rollText = rollIn === null || rollIn === undefined || rollIn <= 0
     ? "待评估"
     : `下次评估 ${fmtDuration(rollIn)}后`;
-  const activeLine = `今日 ${act.today_count ?? 0}/${act.daily_limit ?? "?"} · ${rollText}`;
+  // 日限是按时间解冻的：早上配了 20 次也只放出十来个，
+  // 两个数都写出来，用户才不会以为额度被吞了
+  const quotaNow = act.quota_now;
+  const pacing =
+    quotaNow !== undefined && quotaNow !== null && quotaNow < (act.daily_limit ?? 0)
+      ? `（此刻放出 ${quotaNow}）`
+      : "";
+  const activeLine = `今日 ${act.today_count ?? 0}/${act.daily_limit ?? "?"}${pacing} · ${rollText}`;
 
   const searchAllowed = s.search_allowed;
   const searchValue = searchAllowed === true ? "on" : searchAllowed === false ? "off" : "";
@@ -4117,6 +4153,7 @@ function renderFactsBody() {
   $("factsNote").textContent = enabled
     ? `共 ${stats.alive ?? stats.facts ?? 0} 条，分属 ${stats.people ?? 0} 个人 · 生效 ${stats.active ?? 0} · ` +
       `已归档 ${stats.archived ?? 0} · 按 QQ 号唯一（跨群共享）· 存储上限按好感档位（陌生 20 → 老友 100）` +
+      ` · 存满之后新记的事自动顶掉快忘的那条（钉住的和核心/深层不动）` +
       ` · 三档按熟练度自动分，可手动升降` +
       (ownerFacts ? ` · 主人 ${ownerFacts} 条不受清理影响` : "")
     : "事实记忆没开。开启后会记住「关于某个人的具体事」，按 QQ 号存，A 的私事不会注入到回复 B 里。";
@@ -5449,10 +5486,27 @@ function renderSticker() {
   });
   const filled = labels.filter((l) => l.count > 0).length;
 
+  const todayReplies = Number(data.today_replies || 0);
+  const replyRatio = Number(data.reply_ratio || 0);
+  const share = todayReplies > 0 ? `${Math.floor((todayTotal * 100) / todayReplies)}%` : "—";
+  const ratioTip = replyRatio > 0
+    ? `占当天回复 ${share}，上限 ${replyRatio}%。这个比例是硬闸，发到线就停`
+    : `占当天回复 ${share}，比例闸已关`;
+  // 日限是整天的池子，limitNow 是此刻解冻到第几张（关掉全天平均时两者相等）
+  const dailyLimit = Number(data.daily_limit || 0);
+  const limitNow = Number(data.limit_now || 0) || dailyLimit;
+  const paced = dailyLimit > 0 && limitNow < dailyLimit;
+  const limitTip = dailyLimit > 0
+    ? `今天发了 ${todayTotal} 次，此刻放出 ${limitNow} 张（日限 ${dailyLimit}${
+        paced ? "，按全天平均解冻" : ""
+      }）`
+    : "日限为 0，今天不发图";
+
   $("stickerStats").innerHTML = [
     ["图库总数", `${total} 张`, "各分类加起来。空分类不会被触发"],
     ["有图分类", `${filled} / ${labels.length}`, "至少放过一张图的分类数"],
-    ["今日发出", `${todayTotal} 次`, "所有群合计，上限在「参数」页调"],
+    ["今日发出", dailyLimit > 0 ? `${todayTotal} / ${limitNow}` : `${todayTotal} 次`, limitTip],
+    ["占回复比", todayReplies > 0 ? `${share}` : "—", ratioTip],
     ["今天最多", topCount ? `${topLabel} ${topCount} 次` : "—", "今天发得最多的分类"],
   ]
     .map(

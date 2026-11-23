@@ -25,7 +25,7 @@ from .core.injector import Injector, override_roll
 from .core.learn_gate import learn_enabled
 from .core.search import BUILTIN_SEARCH_TOOL_NAMES, build_search_tool
 from .core.tone import clean_text, split_segments
-from .utils import clean_system_prompt
+from .utils import clean_system_prompt, trim_contexts
 
 # 主动回复标记：inject_style 靠它区分「这轮是插话还是被叫」
 ACTIVE_EXTRA_KEY = "qunliao_active_reply"
@@ -596,6 +596,33 @@ def apply_admin_tool(plugin, event, req, session_id: str) -> None:
         logger.warning(f"[群聊记忆] 挂载管理员工具失败: {e}")
 
 
+def trim_history(plugin, req) -> None:
+    """把本次请求带的历史裁到最近 N 条（规则见 ``utils.trim_contexts``）。
+
+    AstrBot 的会话历史只增不减，每轮都全量带上：历史越长每轮越贵，
+    而缓存隔几小时就会失效，那一轮就是整段按未命中价重付（是命中价的
+    30 倍）。这是账单里最大的一笔偶发开销。
+
+    **只改这一次请求，不动存储里的历史**——用户翻聊天记录看到的还是完整的。
+    长期的事由学习库、事实和画像补，所以少带十几轮不等于变笨。
+    """
+    try:
+        if not bool(plugin.settings.get("history_trim_enabled")):
+            return
+        limit = int(plugin.settings.get("history_trim_messages") or 0)
+    except Exception as e:  # noqa: BLE001 - 读不到配置就按不裁处理
+        logger.debug(f"[群聊记忆] 读取历史裁剪配置失败: {e}")
+        return
+    if limit <= 0:
+        return
+    try:
+        trimmed = trim_contexts(getattr(req, "contexts", None), limit)
+        if trimmed is not None:
+            req.contexts = trimmed
+    except Exception as e:  # noqa: BLE001 - 裁坏了不能用，宁可原样发出去
+        logger.debug(f"[群聊记忆] 裁剪历史失败（跳过）: {e}")
+
+
 def _append_temp(req, text: str) -> None:
     """挂一段临时内容。``mark_as_temp`` 保证它不进对话历史。"""
     try:
@@ -889,6 +916,15 @@ async def _emit_sticker(plugin, event, session_id: str, hit: tuple[str, object])
 
     if store is not None:
         store.record(session_id, label, getattr(path, "name", ""))
+        # 图也是一次发言：主动插话那一轮补记一次，日限和单人日限都算上。
+        # 不补的话「今日已回」永远比实际少，日限等于被悄悄放宽
+        try:
+            if event.get_extra(ACTIVE_EXTRA_KEY):
+                plugin.active.note_extra_reply(
+                    session_id, str(event.get_sender_id() or "")
+                )
+        except Exception as e:  # noqa: BLE001 - 记账失败不影响已经发出去的图
+            logger.debug(f"[群聊记忆] 补记主动回复次数失败: {e}")
     cat = store.category_of(label) if store is not None else None
     logger.info(
         f"[群聊记忆] 表情包 · {session_id} · "
@@ -965,6 +1001,31 @@ async def extract_sticker_mood(plugin, event: AstrMessageEvent, response) -> Non
         event.set_extra(STICKER_MOOD_EXTRA, hits[0])
     except Exception:  # noqa: BLE001
         pass
+
+
+BOT_REPLY_EXTRA = "_qunliao_reply_counted"
+
+
+def note_bot_reply(plugin, event: AstrMessageEvent) -> None:
+    """记一条「bot 说出去了」。
+
+    只给表情包的比例闸当分母用，所以不需要精度到字，每轮一次就行。
+    分段回复会让 ``after_message_sent`` 触发好几遍，用 extra 标记去重；
+    发图本身在 ``store.record`` 里另记一次，两条加起来才是当天总发言数。
+    """
+    store = getattr(plugin, "sticker", None)
+    if store is None:
+        return
+    try:
+        if event.get_extra(BOT_REPLY_EXTRA):
+            return
+        event.set_extra(BOT_REPLY_EXTRA, True)
+    except Exception:  # noqa: BLE001 - 标记设不上就这轮不记，不影响回复
+        return
+    try:
+        store.note_reply()
+    except Exception as e:  # noqa: BLE001
+        logger.debug(f"[群聊记忆] 记录回复条数失败: {e}")
 
 
 async def send_sticker_after_reply(plugin, event: AstrMessageEvent) -> None:

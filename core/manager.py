@@ -18,6 +18,7 @@ from .learn_gate import learn_enabled
 from .learner import Learner
 from .settings import Settings
 from .storage import Storage
+from ..utils import defer_learning
 
 
 class Manager:
@@ -65,6 +66,16 @@ class Manager:
         mode = str(self.settings.get("learn_mode") or "accumulate").strip().lower()
         return "replace" if mode == "replace" else "accumulate"
 
+    def _defer_for_peak(self) -> bool:
+        """现在要不要因为高峰价把学习往后推。规则见 ``utils.defer_learning``。"""
+        try:
+            return defer_learning(
+                str(self.settings.get("learn_time_mode") or "off_peak"),
+                bool(self.settings.get("token_price_peak_enabled")),
+            )
+        except Exception:  # noqa: BLE001 - 读不到配置就当不推迟
+            return False
+
     async def _loop(self) -> None:
         while self._running:
             try:
@@ -92,6 +103,16 @@ class Manager:
                 "sessions": 0,
                 "ok": 0,
                 "skipped": "今日预算已用完，学习暂停",
+            }
+            return
+
+        # 高峰计价时段把后台提炼往后挪：学习不是实时需求，晚两小时学到的东西
+        # 一模一样，但同样一次请求要按 2 倍价付。消息还在照常攒，恢复后一次学完
+        if self._defer_for_peak():
+            self.last_run_result = {
+                "sessions": 0,
+                "ok": 0,
+                "skipped": "高峰计价时段，按设置推迟到空闲价",
             }
             return
 

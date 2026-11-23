@@ -55,9 +55,11 @@ from .hooks import (
     inject_style,
     maybe_active_reply,
     maybe_send_sticker,
+    note_bot_reply,
     record_llm_usage,
     send_sticker_after_reply,
     touch_relation,
+    trim_history,
     truncate_result,
 )
 
@@ -191,12 +193,17 @@ class QunliaoJiyi(Star):
         # 喂食要在关系之后：touch 可能因为冷却/刷屏提前放行，
         # 而投喂有自己的一套限制（每日次数），不该被它挡掉
         await record_feed(self, event)
+        # 「bot 说了句话」——表情包的比例闸拿它当分母，必须在发图之前记
+        note_bot_reply(self, event)
         # 表情包放最后：marker 模式的标签在 on_llm_response 已经剥好，
         # analyze 模式要读这一轮的最终正文
         await send_sticker_after_reply(self, event)
 
     @filter.on_llm_request(priority=17)
     async def on_llm_request(self, event: AstrMessageEvent, req):
+        # 先裁历史再注入：注入段是每轮新增的内容，裁完再接在后面，
+        # 前缀里稳定的部分越长，缓存命中越划算
+        trim_history(self, req)
         await inject_style(self, event, req)
         # marker 模式：掷骰命中才告诉模型「这轮你可以发表情」
         inject_sticker_rule(self, event, req)
@@ -222,16 +229,26 @@ class QunliaoJiyi(Star):
         """看表情包图库的状态：各分类几张、今天发了多少。"""
         cfg = self.sticker.config()
         counts = self.sticker.counts()
+        sent = self.sticker.today_total()
+        replies = self.sticker.today_replies()
+        ratio = int(cfg.get("reply_ratio", 30) or 0)
+        share = f"{sent * 100 // replies}%" if replies else "—"
+        limit_now = self.sticker.paced_limit()
+        daily = int(cfg.get("daily_limit", 40) or 0)
         lines = [
-            f"表情包：{self.sticker.total()} 张，今天发了 {self.sticker.today_total()} 次"
-            f"（上限 {int(cfg.get('daily_limit', 40) or 0)}）"
+            f"表情包：{self.sticker.total()} 张，今天发了 {sent} 次"
+            f"（此刻放出 {limit_now} 张 / 日限 {daily}）"
         ]
+        lines.append(
+            f"当天回复 {replies} 条，发图占 {share}"
+            + (f"，比例上限 {ratio}%" if ratio > 0 else "，未限制比例")
+        )
         detail = " · ".join(
             f"{c['name']} {counts.get(c['key'], 0)}" for c in self.sticker.categories
         )
         lines.append(detail)
         lines.append(
-            "已开启，命中关键词或跟图时会发。" if cfg.get("enabled")
+            f"已开启（{cfg.get('mode')}），按当前档位判断该不该发。" if cfg.get("enabled")
             else "斗图还没开。管理员可在插件配置的「表情包」里打开。"
         )
         yield event.plain_result("\n".join(lines))

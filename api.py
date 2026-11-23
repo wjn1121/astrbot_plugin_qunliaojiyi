@@ -1253,6 +1253,12 @@ def _active_group_rows(plugin) -> list[dict]:
         | set(plugin.storage.active)
     )
     limit = int(plugin.settings.get("active_reply_daily_limit") or 0)
+    # 额度是按时间解冻的，此刻能用到第几次和日限不是一回事：
+    # 早上 10 点配了 20 次也只放出十来个，面板上要显示这个数
+    try:
+        quota = plugin.active.paced_quota(limit)
+    except Exception:  # noqa: BLE001
+        quota = limit
     # 「今天说了几次」要自己比一下日期：ActiveStore 的按天重置只在读状态时
     # 内存里做，不写回存储，所以这里直接读原值会拿到前几天的计数
     today = feed_today()
@@ -1284,7 +1290,8 @@ def _active_group_rows(plugin) -> list[dict]:
                 "enabled": enabled,
                 "today": count,
                 "limit": limit,
-                "full": limit > 0 and count >= limit,
+                "quota": quota,
+                "full": limit > 0 and count >= quota,
                 "last_at": float(state.get("last_at") or 0.0) or None,
                 # 距离下次评估还有多久；没排过队就给 None（面板写「待评估」）
                 "next_roll_in": (

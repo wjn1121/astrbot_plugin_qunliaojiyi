@@ -20,6 +20,17 @@ from astrbot.api import logger
 DEFAULTS: dict[str, Any] = {
     "enabled": True,
     "inject_enabled": True,
+    # ── 单次请求带多少会话历史 ──────────────────────────────────────────
+    #
+    # AstrBot 的会话历史只增不减，每轮都全量带上。历史越长每轮越贵，
+    # 而且缓存一旦过期（隔几小时没人说话），下一轮就是整段按未命中价重付——
+    # 未命中价是命中价的 30 倍，这是账单里最大的偶发项。
+    #
+    # **默认关**：裁剪会让模型看不到更早的原话，虽然长期的事有画像和事实兜底，
+    # 但那是另一回事——「上周他说过这句」和「这个人说话带点自嘲」不是一个量级。
+    # 想省钱的人可以自己打开，代价明确写在这里。
+    "history_trim_enabled": False,
+    "history_trim_messages": 30,
     # ── 全局：主人 QQ ────────────────────────────────────────────────────
     # 以前填在 bond.owner_ids 里，但「主人」其实影响四个模块：
     # 关系（不封顶 + 记忆配额最高）、事实（上限 300）、学习（私聊默认开启）、
@@ -43,13 +54,25 @@ DEFAULTS: dict[str, Any] = {
     # accumulate = 增量累积（新链路，upsert + 权重 + 时效 + 审核）
     # replace    = 1.3.x 旧行为（每轮整表重写），出问题时一键回滚
     "learn_mode": "accumulate",
-    # 新增多少条消息就学一次。比「固定 6 小时一大锅」更接近持续学习，
-    # 也只处理新消息，token 更省。
-    "learn_increment_messages": 30,
+    # 新增多少条消息就学一次。
+    #
+    # 30 → 60：学习是这一环最贵的一项，而「群怎么说话」是慢变量——
+    # 半小时学一次和两小时学一次，第二次多半只是在重复已有特征，
+    # 但每次都要付一笔完整的输出钱（输出价是输入的 3 倍）。
+    # 60 条 + 最小间隔 1 小时，请求数大约减到三分之一，学到的内容几乎一样。
+    "learn_increment_messages": 60,
     # 两次学习的最小间隔，防止群里刷屏时高频烧钱
-    "learn_min_interval": 1800,
-    # 每轮候选上限。只是候选数，不等于库存上限
-    "learn_candidate_max": 12,
+    "learn_min_interval": 3600,
+    # 什么时候学：off_peak（默认，只在非高峰学）/ anytime（攒够就学）。
+    #
+    # 工作日 9-12、14-18 是 DeepSeek 的高峰价（2 倍）。学习不是实时需求，
+    # 推迟到空闲价学到的东西一模一样、价格一半；但有人更在意「梗要马上学会」，
+    # 所以做成选项，默认把它放在省钱那一侧。
+    "learn_time_mode": "off_peak",
+    # 每轮候选上限。只是候选数，不等于库存上限。
+    # 12 → 8：特征是累积的，这次没学到的下次还会遇到；
+    # 但每一轮多吐 4 条就是多 500 来 token 的输出钱
+    "learn_candidate_max": 8,
     # 候选必须给出本轮聊天的原文证据，对不上就丢弃（防 LLM 编造）
     "learn_require_evidence": True,
     # 入库自检：让 LLM 判断候选是不是「可复用的说话习惯」
@@ -117,10 +140,18 @@ DEFAULTS: dict[str, Any] = {
     "sticker_enabled": False,
     # 「哈哈」群里一分钟能出现十次，100% 就是刷屏机器人
     "sticker_probability": 25,
-    "sticker_follow_image": True,
+    "sticker_follow_image": False,
     "sticker_follow_probability": 15,
     "sticker_cooldown_seconds": 120,
     "sticker_daily_limit": 40,
+    # 一天发出去的图，最多占当天回复总数的百分之几。
+    # 日限是绝对数（40~150），但一个安静的群一天才回 20 句，
+    # 40 张图足以把聊天框刷成表情包展览；反过来热闹的群 40 张又太少。
+    # 用比例兜住「图不能比话多」这件事，30% 大约是真人发图的密度上限
+    "sticker_reply_ratio": 30,
+    # 发图额度按全天平均解冻：配 60 张，上午只放出二十来张，
+    # 晚上才给满。关掉就是「0 点一次性给满」，靠日限和比例闸兜着
+    "sticker_pace_enabled": True,
     # 情绪从哪来。off 不发；keyword 本地词表；analyze 回复后另调小模型；
     # marker 让模型在回复末尾打标记、发送前剥掉
     "sticker_mood_mode": "keyword",
@@ -201,6 +232,9 @@ DEFAULTS: dict[str, Any] = {
     "active_reply_chance": 0.15,
     "active_reply_cooldown_seconds": 1800,
     "active_reply_daily_limit": 8,
+    # 日限按全天平均解冻：配 20 次，上午只放出十来个，晚上才给满。
+    # 关掉就回到「0 点一次性给满」——早上热闹的群容易两小时说完一天的额度
+    "active_reply_pace_enabled": True,
     # 单人每日上限：同一个人一天最多被 bot 主动搭话几次。
     # 群日限管「这个群今天还能说几次」，这个管「别在一个人身上用完」。
     # 默认 6：一天被主动搭话 6 次已经算密切，再多就烦人
@@ -630,6 +664,7 @@ STICKER_PROFILES: list[dict[str, Any]] = [
             "sticker_mood_mode": "off",
             "sticker_mood_rate": 0,
             "sticker_probability": 0,
+            "sticker_follow_image": False,
             "sticker_follow_probability": 0,
             "sticker_chain": False,
             "sticker_formation": False,
@@ -645,6 +680,7 @@ STICKER_PROFILES: list[dict[str, Any]] = [
             "sticker_mood_mode": "keyword",
             "sticker_mood_rate": 0,
             "sticker_probability": 25,
+            "sticker_follow_image": False,
             "sticker_follow_probability": 15,
             "sticker_chain": False,
             "sticker_formation": False,
@@ -654,16 +690,17 @@ STICKER_PROFILES: list[dict[str, Any]] = [
     },
     {
         "id": "follow",
-        "label": "👥 跟风",
-        "desc": "关键词 + 会跟队形、会连发。群友刷图时跟着刷一张",
+        "label": "👥 顺手",
+        "desc": "关键词命中得更勤快：概率三成、冷却 90 秒。像群里手快的那个人",
         "values": {
             "sticker_enabled": True,
             "sticker_mood_mode": "keyword",
             "sticker_mood_rate": 0,
             "sticker_probability": 30,
+            "sticker_follow_image": False,
             "sticker_follow_probability": 20,
-            "sticker_chain": True,
-            "sticker_formation": True,
+            "sticker_chain": False,
+            "sticker_formation": False,
             "sticker_cooldown_seconds": 90,
             "sticker_daily_limit": 60,
         },
@@ -677,9 +714,10 @@ STICKER_PROFILES: list[dict[str, Any]] = [
             "sticker_mood_mode": "analyze",
             "sticker_mood_rate": 15,
             "sticker_probability": 100,
+            "sticker_follow_image": False,
             "sticker_follow_probability": 20,
-            "sticker_chain": True,
-            "sticker_formation": True,
+            "sticker_chain": False,
+            "sticker_formation": False,
             "sticker_cooldown_seconds": 90,
             "sticker_daily_limit": 60,
         },
@@ -693,9 +731,10 @@ STICKER_PROFILES: list[dict[str, Any]] = [
             "sticker_mood_mode": "marker",
             "sticker_mood_rate": 30,
             "sticker_probability": 100,
+            "sticker_follow_image": False,
             "sticker_follow_probability": 20,
-            "sticker_chain": True,
-            "sticker_formation": True,
+            "sticker_chain": False,
+            "sticker_formation": False,
             "sticker_cooldown_seconds": 90,
             "sticker_daily_limit": 60,
         },
@@ -709,9 +748,10 @@ STICKER_PROFILES: list[dict[str, Any]] = [
             "sticker_mood_mode": "marker",
             "sticker_mood_rate": 60,
             "sticker_probability": 100,
+            "sticker_follow_image": False,
             "sticker_follow_probability": 25,
-            "sticker_chain": True,
-            "sticker_formation": True,
+            "sticker_chain": False,
+            "sticker_formation": False,
             "sticker_cooldown_seconds": 60,
             "sticker_daily_limit": 100,
         },
@@ -725,9 +765,10 @@ STICKER_PROFILES: list[dict[str, Any]] = [
             "sticker_mood_mode": "marker",
             "sticker_mood_rate": 100,
             "sticker_probability": 100,
+            "sticker_follow_image": False,
             "sticker_follow_probability": 30,
-            "sticker_chain": True,
-            "sticker_formation": True,
+            "sticker_chain": False,
+            "sticker_formation": False,
             "sticker_cooldown_seconds": 45,
             "sticker_daily_limit": 150,
         },
@@ -746,6 +787,8 @@ GROUP_PROFILES: dict[str, list[dict[str, Any]]] = {
 RUNTIME_KEYS = {
     "enabled",
     "inject_enabled",
+    "history_trim_enabled",
+    "history_trim_messages",
     # 事实三档遗忘天数（面板可调，改完下一轮就按新曲线算）
     "fact_shallow_days",
     "fact_deep_days",
@@ -760,6 +803,8 @@ RUNTIME_KEYS = {
     # 表情包斗图：6 项都能面板热调，改完下一轮生效
     "sticker_enabled",
     "sticker_probability",
+    "sticker_reply_ratio",
+    "sticker_pace_enabled",
     "sticker_follow_image",
     "sticker_follow_probability",
     "sticker_cooldown_seconds",
@@ -803,6 +848,7 @@ RUNTIME_KEYS = {
     "learn_mode",
     "learn_increment_messages",
     "learn_min_interval",
+    "learn_time_mode",
     "learn_candidate_max",
     "learn_require_evidence",
     "learn_self_check",
@@ -828,6 +874,7 @@ RUNTIME_KEYS = {
     "active_reply_chance",
     "active_reply_cooldown_seconds",
     "active_reply_daily_limit",
+    "active_reply_pace_enabled",
     "active_reply_per_user_limit",
     "active_reply_quiet_hours",
     "active_reply_min_messages",

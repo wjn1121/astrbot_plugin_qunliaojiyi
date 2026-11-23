@@ -37,17 +37,86 @@ SYSTEM_PROMPT = (
     "你只输出 JSON，不输出解释。"
 )
 
+# 学习请求的固定规则部分。
+#
+# **为什么整段常量放 system_prompt 而不是 prompt**：DeepSeek 的前缀缓存只认
+# 开头相同的部分。prompt 里放「指令 → 聊天记录 → 要求」，中间那段记录每轮都不同，
+# 后面的指令就永远命中不了；把它整段挪到 system，同一个插件进程里的几十次学习
+# 共享同一段前缀，第二次起这部分几乎不花钱（0.05 对 1.5，差 30 倍）。
+#
+# 规则本身一个字没删，只是换了位置。
+LEARN_RULES = """你是一个群聊文化分析师，擅长从聊天记录里提炼这个群的说话风格和语言习惯。
+你只输出 JSON，不输出解释，不要代码围栏。
+
+输出格式：
+{"expressions": [{"situation": "当……时", "style": "怎么说", "evidence": "原话片段", "dimension": "语气词", "triggers": ["触发词"]}]}
+
+字段说明：
+- situation：什么时候适用。任何场合都成立的语气、句式特征填空字符串
+- style：具体怎么说，10-30 字，要能直接照做。不要写「说话随意」这类放到任何群都成立的空话
+- evidence：从聊天记录里**原样复制**一小段，不超过 24 字，挑最能体现这条风格的那句。
+  找不到对应原话就不要输出这一条，这是硬性要求
+- dimension：只能取 语气词 / 句式节奏 / 互动方式 / 话题偏好 / 黑话梗
+- triggers：只给场景化表达，1-3 个「群友消息里出现就该接这个梗」的短词（2-6 字）。
+  不要用「哈哈」「好」这类到处都有的词；稳定风格给空数组
+- 一次性玩梗、某一件具体的事不要收录，只收「以后还会反复出现的说话习惯」
+- 描述里不要出现英文双引号
+
+示例输出（只示范格式，实际条数以记录里的情况为准）：
+{"expressions": [{"situation": "有人报抽卡结果时", "style": "用「出货了？」反问，或直接骂欧", "evidence": "出货了属于是", "dimension": "互动方式", "triggers": ["出货", "抽卡"]}]}"""
+
+# 事实抽取的规则同样固定。单独一段是为了 facts 关掉时不带这段，
+# 免得模型为一个已经关掉的功能白吐 token
+FACTS_RULES = """
+
+另外，从同一批记录里找出值得长期记住的、关于某个具体人的事，一起放进 "facts" 字段。
+只记：稳定的个人信息、明确的安排、重要事件、明确说过的偏好或边界。
+不记：寒暄、临时情绪、评价别人的话、能从上下文直接推回去的内容。
+绝不记：密码、证件号、银行卡、验证码、住址、手机号。
+每条必须有 evidence 且必须是记录里的原话片段，对不上就不要输出。
+最多 3 条，只挑最值得长期记住的；这批记录里没有值得记的就返回 []。
+
+fact 的字段：
+- text：一句话说清，不超过 30 字。写「下周三要交论文初稿」，不写「他提到了论文」
+- kind：fact（长期事实）/ event（有时间的安排）/ preference（偏好）/ boundary（明确说过的边界，如「别叫我老弟」）
+- importance：1-5，5 最重要
+- subject：这件事属于谁，填后面给出的代号；分不清就留空字符串
+- evidence：从记录里原样复制的原话片段，不超过 24 字
+
+带上事实时的完整格式：
+{"expressions": [...], "facts": [{"text": "下周三要交论文初稿", "kind": "event", "importance": 4, "subject": "U1", "evidence": "我下周三得交论文初稿"}]}"""
+
+
+# 入库自检的规则。同样是固定内容，放 system 里让候选列表变成唯一变量
+SELF_CHECK_SYSTEM = """判断给出的说话习惯候选，哪些值得长期保留。
+
+淘汰标准（满足任意一条就淘汰）：
+- 只在某一次具体事件里出现，不是可复用的说话习惯
+- 过于笼统，放到任何群都成立（如「说话比较随意」「喜欢用表情」这类空话）
+- 只是某个人偶尔的说法，不是这个群的普遍习惯
+
+只输出 JSON，不要解释，不要代码围栏：{"keep": [1, 3], "drop": [2]}
+编号必须覆盖全部候选。"""
+
+
+def learn_system_prompt(with_facts: bool) -> str:
+    """拼出学习请求的 system_prompt。
+
+    两个版本来回切只会让缓存重建一次，比每次都带上那段用不上的规则划算。
+    """
+    return LEARN_RULES + (FACTS_RULES if with_facts else "")
+
 # 单条消息进 prompt 的最大字数。几百字的长文对「这个群怎么说话」贡献很低，
 # 截断几乎不损失信息，但能省下大量输入 token。
 LEARN_MSG_CHARS = 200
 
 # 单次学习喂进 prompt 的总字符预算。正常群聊 80 条也就一两千字，碰不到上限；
 # 它是给「有人贴长文 / 转长消息」兜底的——没有这层，一次学习可能贵十倍。
-LEARN_CHARS_BUDGET = 4000
+LEARN_CHARS_BUDGET = 3500
 
 # 候选少于这个数就不做入库自检：为 1-2 条候选再发一次请求，
 # 省下的请求比丢掉的那点精度值钱。
-SELF_CHECK_MIN_CANDIDATES = 4
+SELF_CHECK_MIN_CANDIDATES = 6
 
 # 人格档案「已更新」日志的节流窗口（秒）。批量审核时这个事件会连着触发，
 # 全打 INFO 只会把日志刷满。
@@ -197,9 +266,15 @@ class Learner:
             if settings.is_debug():
                 logger.info(f"[群聊记忆] 调试 · 学习请求 · {session_id}\n{prompt[:2000]}")
 
+            # 规则走 system、素材走 prompt：同一进程里几十次学习共享同一段前缀，
+            # 第二次起规则那部分按缓存价算（0.05 对 1.5）。replace 是回退路径，
+            # 它的规则本来就写在 prompt 里，保持原样
+            learn_system = (
+                SYSTEM_PROMPT if mode == "replace" else learn_system_prompt(self._facts_on())
+            )
             resp = await asyncio.wait_for(
                 provider.text_chat(
-                    prompt=prompt, contexts=[], system_prompt=SYSTEM_PROMPT
+                    prompt=prompt, contexts=[], system_prompt=learn_system
                 ),
                 timeout=180,
             )
@@ -415,72 +490,36 @@ class Learner:
                 situation = str(t.get("context") or "").strip() or "（任何场合）"
                 rows.append(f"- 情境：{situation}｜表达：{t.get('content')}｜权重 {t.get('proficiency', 0)}")
             hint = (
-                "\n\n已有的表达习惯（权重越高越是这个群的稳定风格。"
-                "不要重复输出这些内容；如果某个已有说法不够准确，可以给更准确的新说法）：\n"
-                + "\n".join(rows)
+                "【本群已有的表达习惯】权重越高越稳定，不要重复输出；"
+                "已有的说法不够准确时，可以给更准的新说法：\n" + "\n".join(rows)
             )
 
         manual = self.storage.manual_of(session_id)
         if manual:
             manual_lines = [f"- {t.get('content')}" for t in manual[:20]]
             hint += (
-                "\n\n以下内容已由管理员手动指定，不要重复输出，也不要输出与之矛盾的条目：\n"
+                "\n\n【管理员手动指定】不要重复，也不要输出与之矛盾的内容：\n"
                 + "\n".join(manual_lines)
             )
 
         limit = int(self.plugin.settings.get("learn_candidate_max") or 12)
 
         # 事实抽取合并进同一次请求：同一批消息，一次让它同时输出风格候选和事实候选。
-        # 单独再抽一次等于同一批数据付两遍钱。facts 关着就整段不出现，
-        # 模型也就不会为它多吐 token。
-        facts_block = ""
-        if self._facts_on() and code_map:
+        # 单独再抽一次等于同一批数据付两遍钱。规则部分在 system 里，
+        # 这里只放本批变化的「代号表」。
+        facts_on = self._facts_on() and bool(code_map)
+        names_line = ""
+        if facts_on:
             names = "、".join(f"{c}={m}" for c, m in list(code_map.items())[:12])
-            facts_block = f"""
+            names_line = f"\n本批出现的代号（subject 只能填这些）：{names}\n"
 
-另外，从同一批记录里找出值得长期记住的、关于某个具体人的事，放进 "facts" 字段。
-只记：稳定的个人信息、明确的安排、重要事件、明确说过的偏好或边界。
-不记：寒暄、临时情绪、评价别人的话、能从上下文直接推回去的内容。
-绝不记：密码、证件号、银行卡、验证码、住址、手机号。
-每条必须有 evidence 且必须是记录里的原话片段，对不上就不要输出。没有就返回 []。
-
-fact 的字段：
-- text：一句话说清，不超过 30 字。写「下周三要交论文初稿」，不写「他提到了论文」
-- kind：fact（长期事实）/ event（有时间的安排）/ preference（偏好）/ boundary（明确说过的边界，如「别叫我老弟」）
-- importance：1-5，5 最重要
-- subject：这件事属于谁，填上面的代号（{names}）。分不清就留空字符串
-- evidence：从记录里原样复制的原话片段，不超过 24 字
-
-格式：
-{{"facts": [{{"text": "下周三要交论文初稿", "kind": "event", "importance": 4, "subject": "U1", "evidence": "我下周三得交论文初稿"}}]}}"""
-
-        return f"""分析以下群聊记录，提炼这个群「在什么情况下、用什么方式说话」。
-
-聊天记录：
-```
-{history_str}
-```{hint}
-
-要求：
-1. 只返回有效 JSON，不要解释，不要代码围栏。
-2. 格式：
-   {{"expressions": [{{"situation": "当……时", "style": "怎么说", "evidence": "本轮聊天里的原话片段", "dimension": "语气词", "triggers": ["触发词"]}}]}}
-3. situation 写「什么时候适用」，可以是空字符串（表示任何场合都成立的语气、句式特征）。
-   style 写「具体怎么说」，要是能直接照做的表达习惯，10-30 字，不要写「说话随意」这类放到任何群都成立的空话。
-4. evidence 必须从上面的聊天记录里原样复制一小段（不超过 24 字，挑最能体现这条风格的那句）。
-   找不到对应原话就不要输出这一条。这一条是硬性要求。
-5. dimension 只能取：语气词 / 句式节奏 / 互动方式 / 话题偏好 / 黑话梗。
-6. triggers 只给场景化表达：1-3 个「群友消息里出现就该接这个梗」的短词（2-6 字）。
-   不要用「哈哈」「好」这类到处都有的词；稳定风格不需要 triggers，给空数组。
-7. 最多 {limit} 条。宁可少而准，不要凑数。
-8. 一次性玩梗、某一件具体的事不要收录，只收「以后还会反复出现的说话习惯」。
-9. 描述里不要出现英文双引号。
-
-示例输出：
-{{"expressions": [
-  {{"situation": "", "style": "句末常带喵、qwq 等语气词卖萌", "evidence": "我又歪了喵", "dimension": "语气词", "triggers": []}},
-  {{"situation": "有人报抽卡结果时", "style": "用「出货了？」反问，或直接骂欧", "evidence": "出货了属于是", "dimension": "互动方式", "triggers": ["出货", "抽卡"]}}
-]}}{facts_block}""", code_map
+        # 变化的部分全放这里：已有特征、手动记忆、代号表、聊天记录。
+        # 顺序按「先告诉它别重复什么、再给素材」，模型看到素材时脑子里已经有排除项。
+        # 用列表拼再 join，空段落自然消失——以前空 hint 会在开头留两个空行
+        parts = [seg for seg in (hint.strip(), names_line.strip()) if seg]
+        parts.append("聊天记录：\n```\n" + history_str + "\n```")
+        parts.append(f"最多 {limit} 条。宁可少而准，不要凑数。")
+        return "\n\n".join(parts), code_map
 
     def _build_prompt(self, session_id: str, history: list[ChatMessage]) -> str:
         lines = []
@@ -774,21 +813,12 @@ fact 的字段：
             rows.append(
                 f"{idx}. 情境：{situation}｜表达：{cand['content']}｜证据：{cand.get('evidence') or '无'}"
             )
-        prompt = f"""以下是刚从群聊记录里提炼出的说话习惯候选，判断每一条是否值得长期保留。
-
-候选：
-{chr(10).join(rows)}
-
-淘汰标准（满足任意一条就淘汰）：
-- 只在某一次具体事件里出现，不是可复用的说话习惯
-- 过于笼统，放到任何群都成立（如「说话比较随意」「喜欢用表情」这类空话）
-- 只是某个人偶尔的说法，不是这个群的普遍习惯
-
-只输出 JSON，不要解释，不要代码围栏：{{"keep": [1, 3], "drop": [2]}}
-编号必须覆盖全部候选。"""
+        prompt = "候选：\n" + chr(10).join(rows)
         try:
             resp = await asyncio.wait_for(
-                provider.text_chat(prompt=prompt, contexts=[], system_prompt=SYSTEM_PROMPT),
+                provider.text_chat(
+                    prompt=prompt, contexts=[], system_prompt=SELF_CHECK_SYSTEM
+                ),
                 timeout=60,
             )
             try:

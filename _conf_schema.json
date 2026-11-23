@@ -11,6 +11,18 @@
     "default": true,
     "hint": "开启后每条回复都会带上风格参考文本。关闭后仍会按间隔学习（学习本身有消耗），只是不再注入。影响：token ↓（每条回复少几十字）。只想省钱不想丢学习能力，优先考虑关这个。"
   },
+  "history_trim_enabled": {
+    "description": "单次请求只带最近的会话历史",
+    "type": "bool",
+    "default": false,
+    "hint": "默认关。打开后单次请求只带最近 N 条历史，能省掉「缓存过期后整段重付」的钱（未命中价是命中价的 30 倍），代价是模型看不到更早的原话。想省钱再开，效果优先就别动。"
+  },
+  "history_trim_messages": {
+    "description": "带多少条历史",
+    "type": "int",
+    "default": 30,
+    "hint": "打开上面的开关后生效，默认 30 条约 15 轮。设 0 等于不裁。影响：token ↑（调大）。"
+  },
   "owner_ids": {
     "description": "👑 主人 QQ（全局生效）",
     "type": "string",
@@ -226,8 +238,8 @@
   "sticker_follow_image": {
     "description": "群友发图时跟着发一张",
     "type": "bool",
-    "default": true,
-    "hint": "斗图的本体。不判断对方发的是什么图——那要视觉模型，每张都要钱，而斗图本来也不需要对上意思。影响：token 0。"
+    "default": false,
+    "hint": "别人发图就甩一张，属于斗图行为，默认关。想要「它在接梗」那种感觉，用上面的情绪模式更自然。影响：token 0。"
   },
   "sticker_follow_probability": {
     "description": "跟图的概率（%）",
@@ -246,6 +258,18 @@
     "type": "int",
     "default": 40,
     "hint": "所有群合计，最硬的那道闸——概率写得再高也超不过它。设 0 等于当天不发。影响：token 0。"
+  },
+  "sticker_reply_ratio": {
+    "description": "发图最多占当天回复的百分比",
+    "type": "int",
+    "default": 30,
+    "hint": "张数上限之外再加一道密度限制：一天发的图不超过当天回复总数的这个比例。安静群一天回 20 句，40 张图会把聊天框刷成表情包展览。设 0 关掉这道闸。影响：token 0。"
+  },
+  "sticker_pace_enabled": {
+    "description": "发图额度按全天平均解冻",
+    "type": "bool",
+    "default": true,
+    "hint": "配 60 张时不是 0 点一次性给满，而是随一天的时间进度慢慢放出，晚上才给完。关掉就回到「一次性给满」，容易在群里刷图的那一小时集中发完。影响：token 0。"
   },
   "sticker_mood_mode": {
     "description": "情绪从哪来",
@@ -281,13 +305,13 @@
     "description": "连发：发完一张再补一张",
     "type": "bool",
     "default": false,
-    "hint": "刚甩完一张图，按跟图概率再补一张同类的。纯本地，0 成本。影响：token 0。"
+    "hint": "刚甩完一张图，按跟图概率再补一张同类的。属于斗图打法，默认关，七个档位也不预设开启。影响：token 0。"
   },
   "sticker_formation": {
     "description": "队形：群友刷图时跟着刷",
     "type": "bool",
     "default": false,
-    "hint": "30 秒内群里有 3 张图，跟着甩一张。这是「大家都在发我也发」的从众行为，不判断该不该发。纯本地，0 成本。影响：token 0。"
+    "hint": "30 秒内群里有 3 张图，跟着甩一张。属于斗图打法，默认关，七个档位也不预设开启。影响：token 0。"
   },
   "sticker_analyze_provider_id": {
     "description": "分析模式用的模型 ID",
@@ -471,20 +495,36 @@
   "learn_increment_messages": {
     "description": "[累积] 攒够多少条新消息就学一次",
     "type": "int",
-    "default": 30,
-    "hint": "增量学习的触发线。消息攒够这么多就单独给这个群学一次，只处理新消息。影响：token ↑（调小，学得勤）/ ↓（调大，如 60 可减半）。"
+    "default": 60,
+    "hint": "增量学习的触发线：消息攒够这么多就单独给这个群学一次，只处理新消息。「群怎么说话」是慢变量，半小时学一次和两小时学一次学到的东西几乎一样，但每次都要付一笔完整的输出钱。影响：token ↑（调小，学得勤）/ ↓（调大）。"
   },
   "learn_min_interval": {
     "description": "[累积] 两次学习的最小间隔（秒）",
     "type": "int",
-    "default": 1800,
-    "hint": "防止群里刷屏时高频学习烧钱。默认 1800（30 分钟），与「攒够 30 条」共同决定触发时机。影响：token ↑（调小）/ ↓（调大，如 3600）。"
+    "default": 3600,
+    "hint": "防刷屏：群里再热闹，两次学习之间也隔这么久。默认 3600（1 小时），和「攒够 60 条」一起决定节奏。影响：token ↑（调小）/ ↓（调大）。"
+  },
+  "learn_time_mode": {
+    "description": "什么时候学",
+    "type": "string",
+    "default": "off_peak",
+    "options": [
+      [
+        "off_peak",
+        "低谷时间统一学（省一半）"
+      ],
+      [
+        "anytime",
+        "随时学（学得快、贵一倍）"
+      ]
+    ],
+    "hint": "off_peak（默认）只在非高峰学：工作日 9-12、14-18 是 DeepSeek 的 2 倍价，推迟两小时学到的东西一模一样。anytime 攒够就学，梗学得更快，白天费用翻倍。消息都先攒着，不会丢。影响：token ↓↓（默认）。"
   },
   "learn_candidate_max": {
     "description": "[累积] 单次提炼的候选上限",
     "type": "int",
-    "default": 12,
-    "hint": "每轮最多让模型产出多少条候选。这只是「候选数」，不等于库里能存多少（见 trait_max_total）。影响：token ↑（调大）。"
+    "default": 8,
+    "hint": "每轮最多让模型产出多少条候选。这只是候选数，不等于库里能存多少（见 trait_max_total）。特征是累积的，这次没学到的下次还会遇到，所以没必要一次要满。影响：token ↑（调大）。"
   },
   "learn_require_evidence": {
     "description": "[累积] 候选必须带本轮原文证据",
@@ -768,6 +808,12 @@
     "type": "int",
     "default": 8,
     "hint": "每个群每天最多主动说几次，按自然日重置。默认 8 ≈ 1.2 万 token/天（按每次回复 1500 token 估）。不建议调到 20 以上：QQ 平台对高频主动发言有风控风险，也容易招人烦。影响：token ↑（调大）。"
+  },
+  "active_reply_pace_enabled": {
+    "description": "日限按全天平均解冻",
+    "type": "bool",
+    "default": true,
+    "hint": "配 20 次时上午只放出十来个，随可说话时段的时间进度解冻，晚上给满。关掉就回到「0 点一次性给满」——早上热闹的群容易两小时说完一天的额度。影响：token 0（只是把额度摊开，总数不变）。"
   },
   "active_reply_per_user_limit": {
     "description": "🗣 单人每日上限",

@@ -23,11 +23,20 @@ import re
 import shutil
 import time
 import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from astrbot.api import logger
 
 from .feed import today_str
+
+# 容器时区通常是 UTC，「几点」是给用户作息看的，必须显式用北京时间
+BEIJING_TZ = timezone(timedelta(hours=8))
+
+# 额度解冻的提前量：允许比时间进度多跑两小时。
+# 和 core/active.py 的 PACE_LEAD_HOURS 取同一个值——两处口径一致，
+# 用户在面板上不需要记两套规则
+PACE_LEAD_HOURS = 2.0
 
 # 内置分类。用户可以在面板改描述和关键词，也可以自己加新的。
 #
@@ -491,7 +500,7 @@ class StickerStore:
     # ── 配置 ────────────────────────────────────────────────────────────
 
     def _cfg(self) -> dict:
-        """读 11 个扁平配置项。
+        """读全部扁平配置项。
 
         做成扁平而不是分组，是为了让面板的参数页能热调——那边的热调
         写 runtime.json，只认扁平 key。settings.get 会先看 runtime 再回落
@@ -514,12 +523,14 @@ class StickerStore:
             "mode": mode,
             "mood_rate": read("sticker_mood_rate", 30),
             "probability": read("sticker_probability", 25),
-            "follow_image": read("sticker_follow_image", True),
+            "follow_image": read("sticker_follow_image", False),
             "follow_probability": read("sticker_follow_probability", 15),
             "chain": read("sticker_chain", False),
             "formation": read("sticker_formation", False),
             "cooldown_seconds": read("sticker_cooldown_seconds", 120),
             "daily_limit": read("sticker_daily_limit", 40),
+            "reply_ratio": read("sticker_reply_ratio", 30),
+            "pace_enabled": read("sticker_pace_enabled", True),
             "analyze_provider_id": str(read("sticker_analyze_provider_id", "") or ""),
             "search_first": read("sticker_search_first", True),
             "search_threshold": read("sticker_search_threshold", 1.0),
@@ -602,15 +613,94 @@ class StickerStore:
         return best
 
     def _today(self) -> dict:
-        """今天的记账槽。跨天自动换新，旧的不留。"""
+        """今天的记账槽。跨天自动换新，旧的不留。
+
+        ``replies`` 是当天 bot 发出去的消息条数（文字回复 + 表情包），
+        用来卡「图不能比话多」那个比例闸。
+
+        升级当天的老文件没有 ``replies``：这时候按「已经发出去的图数」
+        补一个值，并打上 ``ratio_legacy`` 让比例闸今天不参与——
+        否则分母是 0，比例闸会把当天剩下的时间一路锁死到零点。
+        明天换新槽就正常了。
+        """
         day = today_str()
         if self._stats.get("date") != day:
-            self._stats = {"date": day, "total": 0, "by_label": {}, "by_session": {}}
+            self._stats = {
+                "date": day,
+                "total": 0,
+                "replies": 0,
+                "by_label": {},
+                "by_session": {},
+            }
+            self._dirty = True
+        elif "replies" not in self._stats:
+            self._stats["replies"] = int(self._stats.get("total") or 0)
+            self._stats["ratio_legacy"] = True
             self._dirty = True
         return self._stats
 
     def today_total(self) -> int:
         return int(self._today().get("total") or 0)
+
+    def today_replies(self) -> int:
+        return int(self._today().get("replies") or 0)
+
+    def paced_limit(self, now: datetime | None = None) -> int:
+        """此刻允许发到第几张。日限按全天的进度解冻。
+
+        日限是整天的池子，0 点一次性给满时，赶上群里刷图的那一小时
+        可能把 60 张全交代了，之后一整天不再动。这里按「过了几小时」
+        解冻，和主动回复的 `paced_quota` 是同一套思路（提前量也一样）。
+
+        表情包没有静默时段的概念，分母固定 24 小时。关掉
+        `sticker_pace_enabled` 就直接返回日限。
+        """
+        cfg = self._cfg()
+        limit = int(cfg.get("daily_limit", 40) or 0)
+        if limit <= 0:
+            return 0
+        if not bool(cfg.get("pace_enabled", True)):
+            return limit
+        moment = now or datetime.now(BEIJING_TZ)
+        passed = moment.hour + moment.minute / 60
+        ratio = min(1.0, (passed + PACE_LEAD_HOURS) / 24)
+        return max(1, min(limit, math.ceil(limit * ratio)))
+
+    def note_reply(self) -> None:
+        """记一条「bot 说了句话」。
+
+        由 ``after_message_sent`` 调用，分段回复靠调用方去重，
+        一条回复只算一次。发图也走这里（``record`` 里调），
+        因为图本身也是一条发言，分母里不包含它的话比例会虚高。
+        """
+        stats = self._today()
+        stats["replies"] = int(stats.get("replies") or 0) + 1
+        self._mark_dirty()
+
+    def ratio_ok(self) -> bool:
+        """按「发图 ≤ 总回复 × ratio%」再判一次。
+
+        日限管的是绝对张数，比例管的是密度：安静群一天回 20 句，
+        40 张图就等于把聊天框变成表情包展览。分子分母都 +1 是给
+        「这一轮还没落账」留的位置——先发图再记回复的话，
+        严格判等会让第一张图永远差一个分母。
+
+        当天还没发过图时直接放行：群里第一句回复就配张图是正常的，
+        一开始就卡在 1/1 > 30% 会让人觉得「这功能根本不发图」。
+        """
+        cfg = self._cfg()
+        ratio = int(cfg.get("reply_ratio", 30) or 0)
+        if ratio <= 0:
+            return True
+        stats = self._today()
+        # 升级当天的老账没有回复数，判不了密度，这一天放过
+        if stats.get("ratio_legacy"):
+            return True
+        sent = int(stats.get("total") or 0)
+        if sent == 0:
+            return True
+        replies = int(stats.get("replies") or 0)
+        return (sent + 1) * 100 <= (replies + 1) * ratio
 
     def _cooling(self, session_id: str, cooldown: float) -> bool:
         if cooldown <= 0:
@@ -713,7 +803,7 @@ class StickerStore:
         return self._pack(idx, label)
 
     def _gate(self, session_id: str):
-        """总开关 / 模式 / 图库 / 日限 / 冷却。过了返回 (cfg, index)。"""
+        """总开关 / 模式 / 图库 / 日限 / 比例 / 冷却。过了返回 (cfg, index)。"""
         if not self.enabled():
             return None
         cfg = self._cfg()
@@ -722,7 +812,11 @@ class StickerStore:
         idx = self.index()
         if not idx:
             return None
-        if self.today_total() >= int(cfg.get("daily_limit", 40) or 0):
+        # 日限按全天进度解冻，不是 0 点一次性给满
+        if self.today_total() >= self.paced_limit():
+            return None
+        # 张数够了不代表密度合适：这个闸是「图不能比话多」
+        if not self.ratio_ok():
             return None
         if self._cooling(session_id, float(cfg.get("cooldown_seconds", 120) or 0)):
             return None
@@ -893,7 +987,10 @@ class StickerStore:
         rate = float(cfg.get("mood_rate", 30) or 0)
         if rate <= 0:
             return False
-        if self.today_total() >= int(cfg.get("daily_limit", 40) or 0):
+        if self.today_total() >= self.paced_limit():
+            return False
+        # 发不出去就别告诉模型可以发：这句规则本身也要花钱
+        if not self.ratio_ok():
             return False
         return random.random() * 100 < rate
 
@@ -908,14 +1005,22 @@ class StickerStore:
         rate = float(cfg.get("mood_rate", 30) or 0)
         if rate <= 0:
             return False
-        if self.today_total() >= int(cfg.get("daily_limit", 40) or 0):
+        if self.today_total() >= self.paced_limit():
+            return False
+        # 比例闸放在花请求之前：判断出来也发不出去，不如不花
+        if not self.ratio_ok():
             return False
         return random.random() * 100 < rate
 
     def record(self, session_id: str, label: str, name: str = "") -> None:
-        """发出去之后记账：今日总数、按标签、按会话，以及这张图用了第几次。"""
+        """发出去之后记账：今日总数、按标签、按会话，以及这张图用了第几次。
+
+        同时把这一张算进「今天说了几句话」——图也是一条发言。
+        分母漏掉它的话，连着发几张之后比例会越算越松。
+        """
         stats = self._today()
         stats["total"] = int(stats.get("total") or 0) + 1
+        stats["replies"] = int(stats.get("replies") or 0) + 1
         by_label = stats.setdefault("by_label", {})
         by_label[label] = int(by_label.get(label) or 0) + 1
         by_session = stats.setdefault("by_session", {})
@@ -1433,7 +1538,17 @@ class StickerStore:
         if n == 0:
             return "图库是空的，先往分类里放几张。"
         used = sum(1 for k, v in self.counts().items() if v > 0)
-        return f"{n} 张图 / {used} 个分类有内容，今天发了 {self.today_total()} 次。"
+        stats = self._today()
+        sent = int(stats.get("total") or 0)
+        replies = int(stats.get("replies") or 0)
+        share = f"{sent * 100 // replies}%" if replies else "—"
+        note = (
+            f"{n} 张图 / {used} 个分类有内容，今天发了 {sent} 次"
+            f"（当天回复 {replies} 条，占 {share}）。"
+        )
+        if stats.get("ratio_legacy"):
+            note += " 比例闸从明天起生效——今天这份记账是升级前写的，没有回复数。"
+        return note
 
     # ── 统计持久化 ──────────────────────────────────────────────────────
 
@@ -1609,6 +1724,12 @@ class StickerStore:
             ],
             "total": sum(len(v) for v in idx.values()),
             "today_total": int(stats.get("total") or 0),
+            "today_replies": int(stats.get("replies") or 0),
+            "reply_ratio": int(self._cfg().get("reply_ratio", 30) or 0),
+            # 日限是整天的，limit_now 是此刻解冻到第几张；
+            # 面板两个都显示，用户才不会以为额度被吞了
+            "daily_limit": int(self._cfg().get("daily_limit", 40) or 0),
+            "limit_now": self.paced_limit(),
             "today_by_label": stats.get("by_label") or {},
             "keywords": {c["name"]: list(c["keywords"]) for c in self.categories},
             "rule_tokens": self.rule_tokens(),
